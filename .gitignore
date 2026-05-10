@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+accounts_*.txt
+mail_credentials.txt
+
+config.json
+config.local.json
+
+*.log
