@@ -1,0 +1,14 @@
+services:
+  grok-reg:
+    image: ghcr.io/jeck5001/grok_reg:latest
+    container_name: grok-reg
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      GROK_REG_DATA_DIR: /app/data
+      GROK_REG_HEADLESS: "1"
+      CHROME_BIN: /usr/bin/chromium
+    volumes:
+      - ./data:/app/data
+    shm_size: "1gb"

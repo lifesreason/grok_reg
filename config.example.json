@@ -1,6 +1,6 @@
-{
+﻿{
   "duckmail_api_key": "",
-  "cloudflare_api_base": "https://fe71fc44.temp-email-pages-56d.pages.dev",
+  "cloudflare_api_base": "",
   "cloudflare_api_key": "",
   "cloudflare_auth_mode": "none",
   "cloudflare_path_domains": "/api/domains",
@@ -17,7 +17,13 @@
   "grok2api_auto_add_remote": false,
   "grok2api_remote_base": "",
   "grok2api_remote_app_key": "",
-  "defaultDomains": "298997309.xyz",
+  "register_threads": 1,
+  "thread_start_interval": 0.8,
+  "show_tutorial_on_start": true,
+  "cloudmail_url": "",
+  "cloudmail_admin_email": "",
+  "cloudmail_password": "",
+  "defaultDomains": "",
   "email_provider": "cloudflare",
   "yyds_api_key": "",
   "yyds_jwt": ""

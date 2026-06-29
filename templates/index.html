@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Grok Register Console</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">NAS Web Console</p>
+          <h1>Grok Register</h1>
+          <p class="subtitle">配置邮箱后端，启动批量注册任务，并在浏览器中追踪实时日志。</p>
+        </div>
+        <div class="status-panel">
+          <span id="statusText">就绪</span>
+          <strong id="statsText">成功 0 / 失败 0</strong>
+        </div>
+      </section>
+
+      <section class="workspace">
+        <form id="configForm" class="config-grid">
+          <label>
+            邮箱服务商
+            <select name="email_provider">
+              <option value="duckmail">duckmail</option>
+              <option value="yyds">yyds</option>
+              <option value="cloudflare">cloudflare</option>
+              <option value="cloudmail">cloudmail</option>
+            </select>
+          </label>
+          <label>
+            注册数量
+            <input name="register_count" type="number" min="1" max="100" value="1" />
+          </label>
+          <label>
+            并发线程
+            <input name="register_threads" type="number" min="1" max="10" value="1" />
+          </label>
+          <label>
+            代理
+            <input name="proxy" placeholder="http://127.0.0.1:7890" />
+          </label>
+          <label>
+            DuckMail API Key
+            <input name="duckmail_api_key" type="password" autocomplete="off" />
+          </label>
+          <label>
+            Cloudflare API Base
+            <input name="cloudflare_api_base" placeholder="https://example.workers.dev" />
+          </label>
+          <label>
+            Cloudflare API Key
+            <input name="cloudflare_api_key" type="password" autocomplete="off" />
+          </label>
+          <label>
+            Cloudflare 鉴权模式
+            <select name="cloudflare_auth_mode">
+              <option value="none">none</option>
+              <option value="bearer">bearer</option>
+              <option value="x-api-key">x-api-key</option>
+              <option value="query-key">query-key</option>
+            </select>
+          </label>
+          <label class="wide">
+            CF 路径
+            <input name="cloudflare_paths" placeholder="/api/domains,/api/new_address,/api/token,/api/mails" />
+          </label>
+          <label>
+            CloudMail URL
+            <input name="cloudmail_url" placeholder="https://mail.example.workers.dev" />
+          </label>
+          <label>
+            CloudMail 管理员邮箱
+            <input name="cloudmail_admin_email" />
+          </label>
+          <label>
+            CloudMail 管理员密码
+            <input name="cloudmail_password" type="password" autocomplete="off" />
+          </label>
+          <label>
+            默认域名
+            <input name="defaultDomains" placeholder="a.com,b.com" />
+          </label>
+          <label>
+            grok2api 池名
+            <select name="grok2api_pool_name">
+              <option value="ssoBasic">ssoBasic</option>
+              <option value="ssoSuper">ssoSuper</option>
+            </select>
+          </label>
+          <label class="check">
+            <input name="enable_nsfw" type="checkbox" />
+            注册后开启 NSFW
+          </label>
+          <label class="check">
+            <input name="grok2api_auto_add_local" type="checkbox" />
+            grok2api 本地自动入池
+          </label>
+          <label class="wide">
+            grok2api 本地 token.json
+            <input name="grok2api_local_token_file" />
+          </label>
+          <label>
+            grok2api 远端 Base
+            <input name="grok2api_remote_base" />
+          </label>
+          <label>
+            grok2api 远端 app_key
+            <input name="grok2api_remote_app_key" type="password" autocomplete="off" />
+          </label>
+        </form>
+
+        <aside class="control-panel">
+          <button id="saveBtn" type="button">保存配置</button>
+          <button id="startBtn" type="button" class="primary">开始注册</button>
+          <button id="stopBtn" type="button" class="danger" disabled>停止任务</button>
+          <p id="message" class="message"></p>
+        </aside>
+      </section>
+
+      <section class="logs">
+        <div class="logs-head">
+          <h2>实时日志</h2>
+          <span id="jobIdText">无任务</span>
+        </div>
+        <pre id="logBox"></pre>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
