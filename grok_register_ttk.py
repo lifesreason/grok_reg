@@ -475,6 +475,15 @@ def sleep_with_cancel(seconds, cancel_callback=None):
         time.sleep(min(0.2, remaining))
 
 
+def detect_cloudflare_block_page(page_html):
+    html = str(page_html or "").lower()
+    return (
+        "attention required! | cloudflare" in html
+        or "sorry, you have been blocked" in html
+        or "cf-error-code" in html
+    )
+
+
 def _parse_positive_int(value, default, minimum=1, maximum=None):
     try:
         parsed = int(value)
@@ -1812,9 +1821,11 @@ return true;
 
         sleep_with_cancel(1, cancel_callback)
 
+    page_html = page.html[:500] if page else "no page"
     if log_callback:
-        page_html = page.html[:500] if page else "no page"
         log_callback(f"[Debug] 页面内容片段: {page_html}")
+    if detect_cloudflare_block_page(page_html):
+        raise Exception("Cloudflare 已拦截当前浏览器环境，请使用 Xvfb 非 headless 模式或更换出口 IP")
 
     raise Exception("未找到「使用邮箱注册」按钮")
 

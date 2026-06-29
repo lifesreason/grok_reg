@@ -7,7 +7,7 @@ services:
       - "8787:8787"
     environment:
       GROK_REG_DATA_DIR: /app/data
-      GROK_REG_HEADLESS: "1"
+      GROK_REG_HEADLESS: "0"
       CHROME_BIN: /usr/bin/chromium
     volumes:
       - ./data:/app/data

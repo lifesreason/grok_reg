@@ -3,7 +3,7 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     GROK_REG_DATA_DIR=/app/data \
-    GROK_REG_HEADLESS=1 \
+    GROK_REG_HEADLESS=0 \
     CHROME_BIN=/usr/bin/chromium
 
 WORKDIR /app
@@ -33,4 +33,4 @@ RUN mkdir -p /app/data
 
 EXPOSE 8787
 
-CMD ["uvicorn", "web_app:app", "--host", "0.0.0.0", "--port", "8787"]
+CMD ["xvfb-run", "-a", "-s", "-screen 0 1365x900x24", "uvicorn", "web_app:app", "--host", "0.0.0.0", "--port", "8787"]

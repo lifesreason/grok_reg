@@ -117,3 +117,23 @@ def test_optional_tkinter_import_handles_missing_shared_library():
     source = Path(reg.__file__).read_text(encoding="utf-8")
 
     assert "except ImportError:" in source
+
+
+def test_cloudflare_block_page_is_detected():
+    html = """
+    <html>
+      <head><title>Attention Required! | Cloudflare</title></head>
+      <body>Sorry, you have been blocked</body>
+    </html>
+    """
+
+    assert reg.detect_cloudflare_block_page(html) is True
+
+
+def test_docker_runs_visible_chromium_under_xvfb_by_default():
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+    compose = Path("docker-compose.yml").read_text(encoding="utf-8")
+
+    assert 'GROK_REG_HEADLESS=0' in dockerfile
+    assert 'xvfb-run' in dockerfile
+    assert 'GROK_REG_HEADLESS: "0"' in compose
