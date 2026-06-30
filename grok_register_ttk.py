@@ -18,6 +18,7 @@ import re
 import string
 import json
 import uuid
+import subprocess
 
 try:
     import tkinter as tk
@@ -198,6 +199,34 @@ def should_run_headless():
 
 def should_apply_container_chrome_flags():
     return _env_truthy("GROK_REG_IN_DOCKER") or sys.platform.startswith("linux")
+
+
+def ensure_virtual_display(log_callback=None):
+    global _xvfb_process
+    if should_run_headless():
+        return False
+    if not should_apply_container_chrome_flags():
+        return False
+    if os.environ.get("DISPLAY"):
+        return False
+
+    with _xvfb_lock:
+        if _xvfb_process is not None and _xvfb_process.poll() is None:
+            os.environ["DISPLAY"] = os.environ.get("GROK_REG_DISPLAY", ":99")
+            return False
+
+        display = os.environ.get("GROK_REG_DISPLAY", ":99")
+        cmd = ["Xvfb", display, "-screen", "0", "1365x900x24", "-nolisten", "tcp"]
+        _xvfb_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        os.environ["DISPLAY"] = display
+        if log_callback:
+            log_callback(f"[Debug] 已自动启动 Xvfb: DISPLAY={display}")
+        time.sleep(0.5)
+        return True
 
 
 def get_duckmail_api_key():
@@ -1734,6 +1763,8 @@ SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 
 _thread_ctx = threading.local()
 _browser_launch_semaphore = threading.Semaphore(2)
+_xvfb_process = None
+_xvfb_lock = threading.Lock()
 
 
 def _get_browser():
@@ -1758,6 +1789,7 @@ def start_browser(log_callback=None):
         try:
             # 高并发下限制同时启动浏览器数量，降低 auto_port/user_data 竞争
             with _browser_launch_semaphore:
+                ensure_virtual_display(log_callback=log_callback)
                 browser = Chromium(create_browser_options())
                 tabs = browser.get_tabs()
                 page = tabs[-1] if tabs else browser.new_tab()

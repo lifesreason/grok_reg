@@ -225,3 +225,27 @@ def test_headless_can_only_be_forced_with_explicit_override(monkeypatch):
     monkeypatch.setenv("GROK_REG_ALLOW_HEADLESS", "1")
 
     assert reg.should_run_headless() is True
+
+
+def test_visible_docker_starts_xvfb_when_display_is_missing(monkeypatch):
+    calls = []
+
+    class FakeProcess:
+        def poll(self):
+            return None
+
+    def fake_popen(args, stdout=None, stderr=None):
+        calls.append(args)
+        return FakeProcess()
+
+    monkeypatch.setenv("GROK_REG_IN_DOCKER", "1")
+    monkeypatch.setenv("GROK_REG_HEADLESS", "0")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.setattr(reg.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(reg, "_xvfb_process", None)
+
+    started = reg.ensure_virtual_display()
+
+    assert started is True
+    assert calls == [["Xvfb", ":99", "-screen", "0", "1365x900x24", "-nolisten", "tcp"]]
+    assert reg.os.environ["DISPLAY"] == ":99"
