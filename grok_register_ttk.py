@@ -891,25 +891,50 @@ const score = (node) => {
 const ranked = clickables.map((node) => ({ node, score: score(node), text: textOf(node) }))
   .filter((item) => item.score >= 0)
   .sort((a, b) => b.score - a.score);
-const target = ranked.find((item) => item.score >= 100)?.node || buttons[buttons.length - 1];
+const buttonDiagnostics = ranked.slice(0, 8).map((item) => ({
+  text: item.text,
+  score: item.score,
+  tag: String(item.node.tagName || '').toLowerCase(),
+  type: String(item.node.getAttribute?.('type') || '').toLowerCase(),
+  role: String(item.node.getAttribute?.('role') || '').toLowerCase()
+}));
+const target = ranked.find((item) => item.score >= 100)?.node;
 if (target) {
   target.scrollIntoView?.({ block: 'center', inline: 'center' });
   const rect = target.getBoundingClientRect();
   const centerX = Math.round(rect.left + rect.width / 2);
   const centerY = Math.round(rect.top + rect.height / 2);
   target.click();
-  return { clicked: true, text: textOf(target), count: clickables.length, isConsentPage, centerX, centerY };
+  const form = target.closest?.('form');
+  if (form) {
+    try {
+      form.requestSubmit ? form.requestSubmit(target) : form.submit();
+    } catch (e) {
+      try { form.submit(); } catch (ignored) {}
+    }
+  }
+  return {
+    clicked: true,
+    text: textOf(target),
+    count: clickables.length,
+    isConsentPage,
+    centerX,
+    centerY,
+    submitted: !!form,
+    buttonDiagnostics
+  };
 }
 const forms = Array.from(document.querySelectorAll('form'));
 if (forms.length) {
   const form = forms[forms.length - 1];
   form.requestSubmit ? form.requestSubmit() : form.submit();
-  return { clicked: true, submitted: true, count: clickables.length, isConsentPage };
+  return { clicked: false, submitted: true, count: clickables.length, isConsentPage, buttonDiagnostics };
 }
 return {
   clicked: false,
   count: clickables.length,
   isConsentPage,
+  buttonDiagnostics,
   text: document.body ? String(document.body.innerText || '').slice(0, 300) : ''
 };
 """
@@ -939,6 +964,13 @@ def _click_xai_oauth_consent_if_present(page):
                     button="left",
                     clickCount=1,
                 )
+                try:
+                    page.run_cdp("Input.dispatchKeyEvent", type="keyDown", key="Enter", code="Enter", windowsVirtualKeyCode=13)
+                    page.run_cdp("Input.dispatchKeyEvent", type="keyUp", key="Enter", code="Enter", windowsVirtualKeyCode=13)
+                    page.run_cdp("Input.dispatchKeyEvent", type="keyDown", key=" ", code="Space", windowsVirtualKeyCode=32)
+                    page.run_cdp("Input.dispatchKeyEvent", type="keyUp", key=" ", code="Space", windowsVirtualKeyCode=32)
+                except Exception:
+                    pass
                 result["nativeClicked"] = True
             except Exception as exc:
                 result["nativeClickError"] = str(exc)[:160]

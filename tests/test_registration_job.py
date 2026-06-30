@@ -426,7 +426,9 @@ def test_xai_oauth_consent_click_script_has_deep_fallbacks():
     assert "shadowRoot" in script
     assert "querySelectorAll('*')" in script
     assert "form.submit()" in script
-    assert "buttons[buttons.length - 1]" in script
+    assert "requestSubmit" in script
+    assert "buttonDiagnostics" in script
+    assert "buttons[buttons.length - 1]" not in script
     assert "centerX" in script
     assert "centerY" in script
     assert "oauth2/consent" in script
@@ -445,11 +447,12 @@ def test_click_xai_oauth_consent_uses_cdp_mouse_events():
     result = reg._click_xai_oauth_consent_if_present(FakePage())
 
     assert result["nativeClicked"] is True
-    assert [item[0] for item in events] == [
+    assert [item[0] for item in events[:3]] == [
         "Input.dispatchMouseEvent",
         "Input.dispatchMouseEvent",
         "Input.dispatchMouseEvent",
     ]
+    assert [item[0] for item in events[3:]] == ["Input.dispatchKeyEvent"] * 4
     assert events[0][1]["x"] == 123
     assert events[0][1]["y"] == 456
 
