@@ -419,6 +419,16 @@ def test_exchange_xai_oauth_code_for_token_posts_pkce_form(monkeypatch):
     assert calls[0][1]["data"]["redirect_uri"] == reg.XAI_GROK_OAUTH_REDIRECT_URI
 
 
+def test_xai_oauth_consent_click_script_has_deep_fallbacks():
+    script = reg.build_xai_oauth_consent_click_script()
+
+    assert "shadowRoot" in script
+    assert "querySelectorAll('*')" in script
+    assert "form.submit()" in script
+    assert "buttons[buttons.length - 1]" in script
+    assert "oauth2/consent" in script
+
+
 def test_should_log_cloudflare_wait_throttles_repeated_same_length(monkeypatch):
     now = [1000.0]
     monkeypatch.setattr(reg.time, "time", lambda: now[0])

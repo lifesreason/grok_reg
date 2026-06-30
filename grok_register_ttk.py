@@ -827,29 +827,85 @@ def parse_xai_oauth_callback_url(url):
     return {"code": code, "state": state, "error": error, "url": str(url or "")}
 
 
+def build_xai_oauth_consent_click_script():
+    return r"""
+const isConsentPage = String(location.href || '').includes('oauth2/consent');
+const denyWords = ['cancel', 'deny', 'decline', 'reject', '拒绝', '取消'];
+const allowWords = [
+  'allow', 'authorize', 'authorise', 'continue', 'approve', 'accept',
+  'agree', 'yes', 'confirm', 'submit', '同意', '授权', '继续', '允许', '确认'
+];
+const textOf = (node) => String(
+  node.innerText || node.textContent || node.value ||
+  node.getAttribute?.('aria-label') || node.getAttribute?.('title') || ''
+).replace(/\s+/g, ' ').trim().toLowerCase();
+const visible = (node) => {
+  try {
+    const rect = node.getBoundingClientRect();
+    const style = getComputedStyle(node);
+    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+  } catch (e) {
+    return true;
+  }
+};
+const disabled = (node) => !!(node.disabled || node.getAttribute?.('disabled') !== null || node.getAttribute?.('aria-disabled') === 'true');
+const allNodes = [];
+const visit = (root) => {
+  if (!root) return;
+  try {
+    const nodes = Array.from(root.querySelectorAll('*'));
+    for (const node of nodes) {
+      allNodes.push(node);
+      if (node.shadowRoot) visit(node.shadowRoot);
+    }
+  } catch (e) {}
+};
+visit(document);
+const clickables = allNodes.filter((node) => {
+  const tag = String(node.tagName || '').toLowerCase();
+  const role = String(node.getAttribute?.('role') || '').toLowerCase();
+  const type = String(node.getAttribute?.('type') || '').toLowerCase();
+  return tag === 'button' || tag === 'a' || role === 'button' || type === 'submit' || node.onclick;
+}).filter((node) => visible(node) && !disabled(node));
+const buttons = clickables;
+const score = (node) => {
+  const text = textOf(node);
+  if (denyWords.some((word) => text.includes(word))) return -100;
+  let value = 0;
+  if (allowWords.some((word) => text.includes(word))) value += 100;
+  const cls = String(node.className || '').toLowerCase();
+  if (cls.includes('primary') || cls.includes('submit') || cls.includes('continue')) value += 10;
+  const rect = node.getBoundingClientRect?.();
+  if (rect) value += Math.min(20, Math.max(0, rect.left / 100));
+  return value;
+};
+const ranked = clickables.map((node) => ({ node, score: score(node), text: textOf(node) }))
+  .filter((item) => item.score >= 0)
+  .sort((a, b) => b.score - a.score);
+const target = ranked.find((item) => item.score >= 100)?.node || buttons[buttons.length - 1];
+if (target) {
+  target.scrollIntoView?.({ block: 'center', inline: 'center' });
+  target.click();
+  return { clicked: true, text: textOf(target), count: clickables.length, isConsentPage };
+}
+const forms = Array.from(document.querySelectorAll('form'));
+if (forms.length) {
+  const form = forms[forms.length - 1];
+  form.requestSubmit ? form.requestSubmit() : form.submit();
+  return { clicked: true, submitted: true, count: clickables.length, isConsentPage };
+}
+return {
+  clicked: false,
+  count: clickables.length,
+  isConsentPage,
+  text: document.body ? String(document.body.innerText || '').slice(0, 300) : ''
+};
+"""
+
+
 def _click_xai_oauth_consent_if_present(page):
     try:
-        return page.run_js(
-            r"""
-const buttons = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="submit"]'));
-const denyWords = ['cancel', 'deny', 'decline', '拒绝', '取消'];
-const allowWords = ['allow', 'authorize', 'continue', 'approve', '同意', '授权', '继续', '允许'];
-const textOf = (node) => String(node.innerText || node.textContent || node.value || node.getAttribute('aria-label') || '')
-  .replace(/\s+/g, ' ').trim().toLowerCase();
-const target = buttons.find((node) => {
-  const text = textOf(node);
-  return allowWords.some((word) => text.includes(word)) && !denyWords.some((word) => text.includes(word));
-}) || buttons.filter((node) => {
-  const text = textOf(node);
-  return !denyWords.some((word) => text.includes(word));
-}).slice(-1)[0];
-if (target && !target.disabled && target.getAttribute('aria-disabled') !== 'true') {
-  target.click();
-  return true;
-}
-return false;
-            """
-        )
+        return page.run_js(build_xai_oauth_consent_click_script())
     except Exception:
         return False
 
@@ -904,6 +960,7 @@ def fetch_xai_oauth_refresh_token(sso, timeout=90, log_callback=None, cancel_cal
 
     deadline = time.time() + timeout
     last_url = ""
+    next_diag_at = 0
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
         current_url = str(getattr(page, "url", "") or "")
@@ -919,7 +976,10 @@ def fetch_xai_oauth_refresh_token(sso, timeout=90, log_callback=None, cancel_cal
             if log_callback:
                 log_callback(f"[*] 已获取 xAI OAuth Refresh Token，长度={len(refresh_token)}")
             return refresh_token
-        _click_xai_oauth_consent_if_present(page)
+        click_result = _click_xai_oauth_consent_if_present(page)
+        if log_callback and time.time() >= next_diag_at:
+            log_callback(f"[Debug] xAI OAuth consent 点击结果: {click_result}")
+            next_diag_at = time.time() + 5
         sleep_with_cancel(0.8, cancel_callback)
     raise Exception(f"xAI OAuth 未在 {timeout}s 内返回 code，最后URL: {last_url}")
 
