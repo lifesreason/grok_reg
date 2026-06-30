@@ -171,7 +171,7 @@
             <button id="importSub2apiBtn" type="button" class="primary">创建 sub2api 账号</button>
           </div>
         </div>
-        <p class="hint">账号来自 data 目录下的 accounts_*.txt。页面只显示 token 摘要。当前注册机保存的是 x.ai sso cookie，sub2api 当前 Grok 调度读取 OAuth access_token，创建后请在 sub2api 侧测试可用性。</p>
+        <p class="hint">账号来自 data 目录下的 accounts_*.txt。页面只显示 token 摘要。导入 sub2api 时会使用现有 x.ai sso cookie 打开 Grok OAuth 授权页，换取 sub2api 可刷新的 access_token/refresh_token。</p>
         <div class="table-wrap">
           <table>
             <thead>

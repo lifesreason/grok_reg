@@ -285,24 +285,47 @@ def test_list_registered_accounts_reads_accounts_files(monkeypatch, tmp_path):
     assert accounts[1]["line_no"] == 3
 
 
-def test_import_accounts_to_sub2api_creates_grok_accounts(monkeypatch):
+def test_import_accounts_to_sub2api_uses_grok_oauth_flow(monkeypatch):
     calls = []
 
     class FakeResponse:
-        status_code = 200
-        text = '{"success":true}'
+        def __init__(self, payload):
+            self.payload = payload
+            self.status_code = 200
+            self.text = "{}"
 
         def raise_for_status(self):
             return None
 
         def json(self):
-            return {"success": True, "data": {"created": 2}}
+            return self.payload
 
     def fake_post(url, **kwargs):
         calls.append((url, kwargs))
-        return FakeResponse()
+        if url.endswith("/admin/grok/oauth/auth-url"):
+            index = len([item for item in calls if item[0].endswith("/admin/grok/oauth/auth-url")])
+            return FakeResponse(
+                {
+                    "code": 0,
+                    "data": {
+                        "auth_url": f"https://auth.x.ai/oauth2/authorize?state=state-{index}",
+                        "session_id": f"session-{index}",
+                        "state": f"state-{index}",
+                    },
+                }
+            )
+        if url.endswith("/admin/grok/oauth/create-from-oauth"):
+            return FakeResponse({"code": 0, "data": {"id": 100 + len(calls)}})
+        raise AssertionError(f"unexpected URL: {url}")
+
+    oauth_calls = []
+
+    def fake_complete(auth_url, sso, expected_state="", log_callback=None, cancel_callback=None):
+        oauth_calls.append((auth_url, sso, expected_state))
+        return {"code": f"code-for-{expected_state}", "state": expected_state}
 
     monkeypatch.setattr(reg, "http_post", fake_post)
+    monkeypatch.setattr(reg, "complete_sub2api_grok_oauth_in_browser", fake_complete)
 
     result = reg.import_accounts_to_sub2api(
         [
@@ -322,17 +345,22 @@ def test_import_accounts_to_sub2api_creates_grok_accounts(monkeypatch):
 
     assert result["imported"] is True
     assert result["total"] == 2
-    assert calls[0][0] == "https://sub2api.example/api/v1/admin/accounts"
+    assert calls[0][0] == "https://sub2api.example/api/v1/admin/grok/oauth/auth-url"
     assert calls[0][1]["headers"]["x-api-key"] == "admin-key"
-    assert calls[0][1]["json"]["name"] == "Grok Auto - user1@example.com"
-    assert calls[0][1]["json"]["platform"] == "grok"
-    assert calls[0][1]["json"]["type"] == "oauth"
-    assert calls[0][1]["json"]["credentials"]["access_token"] == "sso-token-1"
-    assert calls[0][1]["json"]["credentials"]["source_token_type"] == "xai_sso_cookie"
-    assert calls[0][1]["json"]["group_ids"] == [1, 2]
-    assert calls[0][1]["json"]["concurrency"] == 5
-    assert calls[0][1]["json"]["priority"] == 40
-    assert len(calls) == 2
+    assert calls[1][0] == "https://sub2api.example/api/v1/admin/grok/oauth/create-from-oauth"
+    assert calls[1][1]["json"]["session_id"] == "session-1"
+    assert calls[1][1]["json"]["code"] == "code-for-state-1"
+    assert calls[1][1]["json"]["state"] == "state-1"
+    assert calls[1][1]["json"]["name"] == "Grok Auto - user1@example.com"
+    assert calls[1][1]["json"]["group_ids"] == [1, 2]
+    assert calls[1][1]["json"]["concurrency"] == 5
+    assert calls[1][1]["json"]["priority"] == 40
+    assert len([item for item in calls if item[0].endswith("/admin/accounts")]) == 0
+    assert oauth_calls[0] == (
+        "https://auth.x.ai/oauth2/authorize?state=state-1",
+        "sso-token-1",
+        "state-1",
+    )
 
 
 def test_should_log_cloudflare_wait_throttles_repeated_same_length(monkeypatch):

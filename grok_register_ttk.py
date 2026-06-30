@@ -20,6 +20,7 @@ import json
 import uuid
 import subprocess
 import hashlib
+import urllib.parse
 
 try:
     import tkinter as tk
@@ -448,30 +449,57 @@ def _optional_positive_int(value, default=None):
     return parsed if parsed > 0 else default
 
 
-def build_sub2api_account_payload(account, settings=None, index=1):
-    settings = {**config, **dict(settings or {})}
-    token = _normalize_sso_token((account or {}).get("sso", ""))
+def _sub2api_api_base(settings):
+    base = str(settings.get("sub2api_base") or "").strip().rstrip("/")
+    if not base:
+        raise ValueError("sub2api Base 未配置")
+    if not base.endswith("/api/v1"):
+        base = f"{base}/api/v1"
+    return base
+
+
+def _sub2api_headers(settings):
+    token = str(settings.get("sub2api_admin_token") or "").strip()
     if not token:
-        raise ValueError("账号缺少 token")
+        raise ValueError("sub2api 管理 Token 未配置")
+    auth_mode = str(settings.get("sub2api_auth_mode") or "x-api-key").strip().lower()
+    headers = {"Content-Type": "application/json"}
+    if auth_mode == "bearer":
+        headers["Authorization"] = f"Bearer {token}"
+    else:
+        headers["x-api-key"] = token
+    return headers
+
+
+def _sub2api_response_data(resp):
+    resp.raise_for_status()
+    try:
+        payload = resp.json()
+    except Exception:
+        return {"raw": resp.text[:1000]}
+    if isinstance(payload, dict) and "data" in payload:
+        return payload.get("data")
+    return payload
+
+
+def _sub2api_account_name(account, settings=None, index=1):
+    settings = {**config, **dict(settings or {})}
     email = str((account or {}).get("email") or "").strip()
     base_name = str(settings.get("sub2api_account_name") or "Grok Auto").strip() or "Grok Auto"
-    name = f"{base_name} - {email}" if email else f"{base_name} #{index}"
+    return f"{base_name} - {email}" if email else f"{base_name} #{index}"
+
+
+def build_sub2api_grok_oauth_create_payload(account, oauth_result, auth_session, settings=None, index=1):
+    settings = {**config, **dict(settings or {})}
     payload = {
-        "name": name,
-        "platform": "grok",
-        "type": "oauth",
-        "credentials": {
-            # sub2api 当前 Grok 调度只读取 access_token；这里保留来源标记，便于后续排查。
-            "access_token": token,
-            "source_token_type": "xai_sso_cookie",
-            "email": email,
-        },
-        "extra": {
-            "import_source": "grok_reg",
-            "source_file": str((account or {}).get("source_file") or ""),
-            "source_line": (account or {}).get("line_no") or 0,
-        },
+        "session_id": str(auth_session.get("session_id") or "").strip(),
+        "code": str(oauth_result.get("code") or "").strip(),
+        "state": str(oauth_result.get("state") or auth_session.get("state") or "").strip(),
+        "name": _sub2api_account_name(account, settings, index=index),
     }
+    redirect_uri = str(auth_session.get("redirect_uri") or settings.get("sub2api_grok_redirect_uri") or "").strip()
+    if redirect_uri:
+        payload["redirect_uri"] = redirect_uri
     group_ids = _parse_int_list(settings.get("sub2api_group_ids", ""))
     if group_ids:
         payload["group_ids"] = group_ids
@@ -481,49 +509,160 @@ def build_sub2api_account_payload(account, settings=None, index=1):
     priority = _optional_positive_int(settings.get("sub2api_priority"), None)
     if priority is not None:
         payload["priority"] = priority
+    if not payload["session_id"] or not payload["code"]:
+        raise ValueError("sub2api Grok OAuth 缺少 session_id/code")
     return payload
+
+
+def _parse_oauth_callback_url(url):
+    parsed = urllib.parse.urlparse(str(url or ""))
+    values = urllib.parse.parse_qs(parsed.query)
+    code = (values.get("code") or [""])[0].strip()
+    state = (values.get("state") or [""])[0].strip()
+    error = (values.get("error") or [""])[0].strip()
+    if not code and parsed.fragment:
+        fragment_values = urllib.parse.parse_qs(parsed.fragment)
+        code = (fragment_values.get("code") or [""])[0].strip()
+        state = state or (fragment_values.get("state") or [""])[0].strip()
+        error = error or (fragment_values.get("error") or [""])[0].strip()
+    return {"code": code, "state": state, "error": error, "url": str(url or "")}
+
+
+def _set_xai_sso_cookies(page, sso):
+    token = _normalize_sso_token(sso)
+    if not page or not token:
+        return False
+    cookies = [
+        {"name": "sso", "value": token, "domain": ".x.ai", "path": "/", "secure": True, "httpOnly": True},
+        {"name": "sso-rw", "value": token, "domain": ".x.ai", "path": "/", "secure": True, "httpOnly": True},
+    ]
+    ok = False
+    for cookie in cookies:
+        try:
+            page.run_cdp("Network.setCookie", **cookie)
+            ok = True
+        except Exception:
+            pass
+    try:
+        setter = getattr(getattr(page, "set", None), "cookies", None)
+        if setter:
+            setter(cookies)
+            ok = True
+    except Exception:
+        pass
+    return ok
+
+
+def complete_sub2api_grok_oauth_in_browser(
+    auth_url,
+    sso,
+    expected_state="",
+    timeout=90,
+    log_callback=None,
+    cancel_callback=None,
+):
+    token = _normalize_sso_token(sso)
+    if not token:
+        raise ValueError("账号缺少 sso cookie")
+    browser = _get_browser()
+    page = _get_page()
+    if browser is None or page is None:
+        browser, page = start_browser(log_callback=log_callback)
+    try:
+        page = browser.new_tab("https://auth.x.ai")
+        _set_page(page)
+    except Exception:
+        page = refresh_active_page()
+        try:
+            page.get("https://auth.x.ai")
+        except Exception:
+            pass
+    _set_xai_sso_cookies(page, token)
+    page.get(auth_url)
+    deadline = time.time() + timeout
+    last_url = ""
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        current_url = str(getattr(page, "url", "") or "")
+        last_url = current_url or last_url
+        parsed = _parse_oauth_callback_url(current_url)
+        if parsed.get("error"):
+            raise Exception(f"xAI OAuth 返回错误: {parsed['error']}")
+        if parsed.get("code"):
+            if expected_state and parsed.get("state") and parsed.get("state") != expected_state:
+                raise Exception("xAI OAuth state 不匹配")
+            return parsed
+        try:
+            page.run_js(
+                r"""
+const buttons = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="submit"]'));
+const target = buttons.find((node) => {
+  const text = String(node.innerText || node.textContent || node.value || node.getAttribute('aria-label') || '')
+    .replace(/\s+/g, '').toLowerCase();
+  return text.includes('allow') || text.includes('authorize') || text.includes('continue') ||
+    text.includes('approve') || text.includes('同意') || text.includes('授权') || text.includes('继续');
+});
+if (target && !target.disabled && target.getAttribute('aria-disabled') !== 'true') {
+  target.click();
+  return true;
+}
+return false;
+                """
+            )
+        except Exception:
+            pass
+        sleep_with_cancel(0.8, cancel_callback)
+    raise Exception(f"xAI OAuth 未在 {timeout}s 内返回 code，最后URL: {last_url}")
 
 
 def import_accounts_to_sub2api(accounts, settings=None, log_callback=None):
     settings = {**config, **dict(settings or {})}
-    base = str(settings.get("sub2api_base") or "").strip().rstrip("/")
-    token = str(settings.get("sub2api_admin_token") or "").strip()
-    if not base:
-        raise ValueError("sub2api Base 未配置")
-    if not token:
-        raise ValueError("sub2api 管理 Token 未配置")
-    if not base.endswith("/api/v1"):
-        base = f"{base}/api/v1"
-
-    auth_mode = str(settings.get("sub2api_auth_mode") or "x-api-key").strip().lower()
-    headers = {"Content-Type": "application/json"}
-    if auth_mode == "bearer":
-        headers["Authorization"] = f"Bearer {token}"
-    else:
-        headers["x-api-key"] = token
+    base = _sub2api_api_base(settings)
+    headers = _sub2api_headers(settings)
 
     valid_accounts = [account for account in (accounts or []) if _normalize_sso_token(account.get("sso", ""))]
     if not valid_accounts:
         raise ValueError("没有可导入的账号 token")
 
-    url = f"{base}/admin/accounts"
     items = []
     for index, account in enumerate(valid_accounts, start=1):
-        payload = build_sub2api_account_payload(account, settings, index=index)
-        resp = http_post(url, headers=headers, json=payload, timeout=30, proxies={})
-        resp.raise_for_status()
-        try:
-            response_payload = resp.json()
-        except Exception:
-            response_payload = {"raw": resp.text[:1000]}
-        items.append({"email": account.get("email", ""), "response": response_payload})
+        auth_data = _sub2api_response_data(
+            http_post(
+                f"{base}/admin/grok/oauth/auth-url",
+                headers=headers,
+                json={},
+                timeout=30,
+                proxies={},
+            )
+        )
+        if not isinstance(auth_data, dict) or not auth_data.get("auth_url") or not auth_data.get("session_id"):
+            raise Exception(f"sub2api Grok OAuth auth-url 返回异常: {auth_data}")
+        oauth_result = complete_sub2api_grok_oauth_in_browser(
+            auth_data["auth_url"],
+            account.get("sso", ""),
+            expected_state=str(auth_data.get("state") or ""),
+            log_callback=log_callback,
+        )
+        payload = build_sub2api_grok_oauth_create_payload(
+            account, oauth_result, auth_data, settings, index=index
+        )
+        created = _sub2api_response_data(
+            http_post(
+                f"{base}/admin/grok/oauth/create-from-oauth",
+                headers=headers,
+                json=payload,
+                timeout=60,
+                proxies={},
+            )
+        )
+        items.append({"email": account.get("email", ""), "response": created})
     if log_callback:
-        log_callback(f"[+] 已导入 sub2api 账号管理: {len(items)} 个账号")
+        log_callback(f"[+] 已通过 sub2api Grok OAuth 创建账号: {len(items)} 个")
     return {
         "imported": True,
         "total": len(items),
         "items": items,
-        "warning": "当前注册机产物是 x.ai sso cookie；sub2api Grok 调度读取 OAuth access_token，导入后需在 sub2api 侧测试账号可用性。",
+        "warning": "已通过 sub2api Grok OAuth 换取 access_token/refresh_token；如单个账号失败，请确认 x.ai sso cookie 仍有效。",
     }
 
 
