@@ -700,6 +700,106 @@ return true;
 """
 
 
+def build_email_submission_state_script():
+    return r"""
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+function textOf(node) {
+    return String(node?.innerText || node?.textContent || node?.value || '').replace(/\s+/g, ' ').trim();
+}
+const inputs = Array.from(document.querySelectorAll('input')).filter(isVisible);
+const buttons = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]')).filter(isVisible);
+const bodyText = textOf(document.body).slice(0, 1000);
+const otpInput = inputs.find((node) => {
+    const attrs = [
+        node.getAttribute('name'),
+        node.getAttribute('autocomplete'),
+        node.getAttribute('inputmode'),
+        node.getAttribute('aria-label'),
+        node.getAttribute('data-input-otp'),
+        node.getAttribute('placeholder'),
+    ].join(' ').toLowerCase();
+    return attrs.includes('one-time-code') ||
+        attrs.includes('otp') ||
+        attrs.includes('code') ||
+        attrs.includes('verification') ||
+        attrs.includes('验证码') ||
+        attrs.includes('numeric') ||
+        node.getAttribute('data-input-otp') === 'true';
+});
+const resendButton = buttons.find((node) => {
+    const text = textOf(node).toLowerCase();
+    return text.includes('resend') || text.includes('重新发送') || text.includes('再次发送');
+});
+const errorNode = Array.from(document.querySelectorAll('[role="alert"], [aria-live], .error, [data-testid*="error" i]'))
+    .filter(isVisible)
+    .map(textOf)
+    .find(Boolean) || '';
+let step = 'unknown';
+if (otpInput || resendButton || /verification code|enter code|验证码|確認コード/i.test(bodyText)) {
+    step = 'otp';
+} else if (inputs.some((node) => {
+    const attrs = [
+        node.getAttribute('name'),
+        node.getAttribute('type'),
+        node.getAttribute('autocomplete'),
+        node.getAttribute('placeholder'),
+        node.getAttribute('aria-label'),
+    ].join(' ').toLowerCase();
+    return attrs.includes('email') || attrs.includes('identifier') || attrs.includes('邮箱');
+})) {
+    step = 'email';
+}
+return JSON.stringify({
+    step,
+    url: location.href,
+    title: document.title,
+    errorText: errorNode,
+    bodySnippet: bodyText.slice(0, 240),
+    inputs: inputs.slice(0, 6).map((node) => ({
+        type: node.getAttribute('type') || '',
+        name: node.getAttribute('name') || '',
+        autocomplete: node.getAttribute('autocomplete') || '',
+        placeholder: node.getAttribute('placeholder') || '',
+        aria: node.getAttribute('aria-label') || '',
+    })),
+    buttons: buttons.slice(0, 6).map(textOf),
+});
+"""
+
+
+def wait_for_email_verification_step(
+    page, email, timeout=20, log_callback=None, cancel_callback=None
+):
+    deadline = time.time() + timeout
+    last_state = {}
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        raw = page.run_js(build_email_submission_state_script(), email)
+        try:
+            state = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+        except Exception:
+            state = {"step": "unknown", "raw": str(raw)}
+        last_state = state
+        if state.get("step") == "otp":
+            return "otp"
+        error_text = str(state.get("errorText") or "").strip()
+        if error_text:
+            raise Exception(f"x.ai 未接受该邮箱: {error_text}")
+        sleep_with_cancel(0.8, cancel_callback)
+    if log_callback:
+        log_callback(
+            "[Debug] 邮箱提交后页面状态: "
+            + json.dumps(last_state, ensure_ascii=False)[:1200]
+        )
+    raise Exception("邮箱已提交，但未进入验证码页面，x.ai 可能未发送验证码")
+
+
 def _parse_positive_int(value, default, minimum=1, maximum=None):
     try:
         parsed = int(value)
@@ -1148,7 +1248,7 @@ def yyds_create_account(address=None, domain=None, api_key=None, jwt=None):
     data = resp.json()
     if data.get("success"):
         return data.get("data", {})
-    raise Exception(f"YYDS 鍒涘缓閭澶辫触: {data}")
+    raise Exception(f"YYDS 创建邮箱失败: {data}")
 
 
 def yyds_get_token(address, api_key=None, jwt=None):
@@ -1166,7 +1266,7 @@ def yyds_get_token(address, api_key=None, jwt=None):
     data = resp.json()
     if data.get("success"):
         return data.get("data", {}).get("token")
-    raise Exception(f"YYDS 鑾峰彇token澶辫触: {data}")
+    raise Exception(f"YYDS 获取 token 失败: {data}")
 
 
 def yyds_get_messages(address, token=None, api_key=None, jwt=None):
@@ -1202,7 +1302,7 @@ def yyds_get_message_detail(message_id, token=None, api_key=None, jwt=None):
     data = resp.json()
     if data.get("success"):
         return data.get("data", {})
-    raise Exception(f"YYDS 鑾峰彇閭欢璇︽儏澶辫触: {data}")
+    raise Exception(f"YYDS 获取邮件详情失败: {data}")
 
 
 def yyds_generate_username(length=10):
@@ -1213,7 +1313,7 @@ def yyds_generate_username(length=10):
 def yyds_pick_domain(api_key=None, jwt=None):
     domains = yyds_get_domains(api_key=api_key, jwt=jwt)
     if not domains:
-        raise Exception("YYDS 娌℃湁杩斿洖浠讳綍鍙敤鍩熷悕")
+        raise Exception("YYDS 没有返回任何可用域名")
     private = [d for d in domains if d.get("isVerified") and not d.get("isPublic")]
     if private:
         return private[0]["domain"]
@@ -1223,7 +1323,7 @@ def yyds_pick_domain(api_key=None, jwt=None):
     verified = [d for d in domains if d.get("isVerified")]
     if verified:
         return verified[0]["domain"]
-    raise Exception("YYDS 鏃犲凡楠岃瘉鍩熷悕鍙敤")
+    raise Exception("YYDS 无已验证域名可用")
 
 
 def yyds_get_email_and_token(api_key=None, jwt=None):
@@ -1241,8 +1341,8 @@ def yyds_get_email_and_token(api_key=None, jwt=None):
     if not temp_token:
         temp_token = yyds_get_token(address, api_key=key, jwt=token)
     if not temp_token:
-        raise Exception("鑾峰彇 YYDS token 澶辫触")
-    print(f"[*] 宸插垱寤?YYDS 閭: {address}")
+        raise Exception("获取 YYDS token 失败")
+    print(f"[*] 已创建 YYDS 邮箱: {address}")
     return address, temp_token
 
 
@@ -1254,16 +1354,27 @@ def yyds_get_oai_code(
     log_callback=None,
     jwt=None,
     cancel_callback=None,
+    resend_callback=None,
 ):
     deadline = time.time() + timeout
     seen_ids = set()
+    next_resend_at = time.time() + 60
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
+        if resend_callback and time.time() >= next_resend_at:
+            try:
+                resend_callback()
+                if log_callback:
+                    log_callback("[*] 已触发重新发送验证码")
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[Debug] 触发重发验证码失败: {exc}")
+            next_resend_at = time.time() + 60
         try:
             messages = yyds_get_messages(address, token=token, jwt=jwt)
         except Exception as exc:
             if log_callback:
-                log_callback(f"[Debug] YYDS 鎷夊彇閭欢鍒楄〃澶辫触: {exc}")
+                log_callback(f"[Debug] YYDS 拉取邮件列表失败: {exc}")
             sleep_with_cancel(poll_interval, cancel_callback)
             continue
         for msg in messages:
@@ -1278,7 +1389,7 @@ def yyds_get_oai_code(
                 detail = yyds_get_message_detail(msg_id, token=token, jwt=jwt)
             except Exception as exc:
                 if log_callback:
-                    log_callback(f"[Debug] YYDS 鑾峰彇閭欢璇︽儏澶辫触: {exc}")
+                    log_callback(f"[Debug] YYDS 获取邮件详情失败: {exc}")
                 continue
             parts = []
             text_body = detail.get("text") or ""
@@ -1290,11 +1401,11 @@ def yyds_get_oai_code(
             combined = "\n".join(parts)
             subject = detail.get("subject", "")
             if log_callback:
-                log_callback(f"[Debug] YYDS 鏀跺埌閭欢: {subject}")
+                log_callback(f"[Debug] YYDS 收到邮件: {subject}")
             code = extract_verification_code(combined, subject)
             if code:
                 if log_callback:
-                    log_callback(f"[*] YYDS 浠庨偖浠朵腑鎻愬彇鍒伴獙璇佺爜: {code}")
+                    log_callback(f"[*] YYDS 从邮件中提取到验证码: {code}")
                 return code
         sleep_with_cancel(poll_interval, cancel_callback)
     raise Exception(f"YYDS 在 {timeout}s 内未收到验证码邮件")
@@ -1603,6 +1714,7 @@ def get_oai_code(
             log_callback=log_callback,
             jwt=get_yyds_jwt(),
             cancel_callback=cancel_callback,
+            resend_callback=resend_callback,
         )
     if provider == "cloudmail":
         return cloudmail_get_oai_code(
@@ -2142,6 +2254,12 @@ def fill_email_and_submit(timeout=30, log_callback=None, cancel_callback=None):
         )
         last_state = str(clicked)
         if clicked is True:
+            wait_for_email_verification_step(
+                page,
+                email,
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+            )
             if log_callback:
                 log_callback(f"[*] 已填写邮箱并点击注册: {email}")
             return email, dev_token

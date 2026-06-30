@@ -144,6 +144,44 @@ def test_email_form_script_supports_identifier_input_and_continue_button():
     assert 'action = "submit"' in submit_script
 
 
+def test_wait_for_email_verification_step_waits_until_otp(monkeypatch):
+    class FakePage:
+        def __init__(self):
+            self.states = ['{"step":"email","errorText":"","url":"https://accounts.x.ai/sign-up"}', '{"step":"otp","errorText":"","url":"https://accounts.x.ai/sign-up"}']
+
+        def run_js(self, script, *args):
+            return self.states.pop(0)
+
+    sleeps = []
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda seconds, cancel_callback=None: sleeps.append(seconds))
+
+    assert reg.wait_for_email_verification_step(FakePage(), "user@example.com", timeout=5) == "otp"
+    assert sleeps == [0.8]
+
+
+def test_yyds_code_polling_triggers_resend_callback(monkeypatch):
+    now = [0.0]
+    resend_calls = []
+
+    monkeypatch.setattr(reg.time, "time", lambda: now[0])
+    monkeypatch.setattr(reg, "yyds_get_messages", lambda address, token=None, jwt=None: [])
+
+    def fake_sleep(seconds, cancel_callback=None):
+        now[0] += 61
+
+    monkeypatch.setattr(reg, "sleep_with_cancel", fake_sleep)
+
+    with pytest.raises(Exception, match="未收到验证码"):
+        reg.yyds_get_oai_code(
+            "token",
+            "user@example.com",
+            timeout=120,
+            resend_callback=lambda: resend_calls.append("resent"),
+        )
+
+    assert resend_calls
+
+
 def test_docker_runs_visible_chromium_under_xvfb_by_default():
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
     compose = Path("docker-compose.yml").read_text(encoding="utf-8")
