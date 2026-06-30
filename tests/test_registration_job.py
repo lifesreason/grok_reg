@@ -299,6 +299,25 @@ def test_list_registered_accounts_reads_accounts_files(monkeypatch, tmp_path):
     assert accounts[1]["line_no"] == 3
 
 
+def test_list_registered_accounts_merges_persisted_sub2api_status(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    tmp_path.joinpath("accounts_20260630_140000_job.txt").write_text(
+        "user@example.com----Pass----sso-token----refresh-token\n",
+        encoding="utf-8",
+    )
+    account = reg.list_registered_accounts()[0]
+
+    reg.persist_sub2api_push_status(
+        [account],
+        {"items": [{"email": account["email"], "response": {"id": 101, "name": "Grok Auto"}}]},
+    )
+
+    refreshed = reg.list_registered_accounts()[0]
+    assert refreshed["sub2api_status"] == "pushed"
+    assert refreshed["sub2api_status_text"] == "已推送"
+    assert refreshed["sub2api_response"]["id"] == 101
+
+
 def test_import_accounts_to_sub2api_requires_refresh_token(monkeypatch):
     calls = []
     monkeypatch.setattr(reg, "http_post", lambda *args, **kwargs: calls.append((args, kwargs)))

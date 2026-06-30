@@ -155,6 +155,8 @@ function renderAccounts() {
     const refreshStatus = account.has_refresh_token
       ? `已保存 ${account.refresh_token_preview || ""}`.trim()
       : "缺少";
+    const persistedPushStatus = account.sub2api_status_text || (account.sub2api_status === "pushed" ? "已推送" : "未推送");
+    const pushStatus = accountPushStatus[account.id] || persistedPushStatus;
     for (const value of [
       account.email,
       account.sso_preview || "",
@@ -162,7 +164,7 @@ function renderAccounts() {
       account.source_file || "",
       account.line_no || "",
       account.password ? "已保存" : "-",
-      accountPushStatus[account.id] || "未推送",
+      pushStatus,
     ]) {
       const cell = document.createElement("td");
       cell.textContent = String(value ?? "");
@@ -204,6 +206,10 @@ async function importSelectedToSub2api() {
     accountIds.forEach((id) => {
       accountPushStatus[id] = "已推送";
     });
+    if (Array.isArray(result.accounts)) {
+      const returned = new Map(result.accounts.map((account) => [account.id, account]));
+      accounts = accounts.map((account) => returned.get(account.id) || account);
+    }
     setMessage(`${result.message || `已推送到 sub2api：${result.total} 个账号`}。${result.warning || ""}`);
   } catch (error) {
     accountIds.forEach((id) => {

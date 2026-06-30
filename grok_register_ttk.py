@@ -61,6 +61,10 @@ def get_config_file():
     return os.path.join(get_data_dir(), "config.json")
 
 
+def get_account_status_file():
+    return os.path.join(get_data_dir(), "account_status.json")
+
+
 CONFIG_FILE = get_config_file()
 
 DEFAULT_CONFIG = {
@@ -409,8 +413,64 @@ def parse_registered_account_line(line, source="", line_no=0, include_sso=True):
     return account
 
 
+def load_account_statuses():
+    path = get_account_status_file()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    accounts = data.get("accounts") if isinstance(data.get("accounts"), dict) else data
+    return accounts if isinstance(accounts, dict) else {}
+
+
+def save_account_statuses(statuses):
+    path = get_account_status_file()
+    payload = {
+        "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "accounts": statuses if isinstance(statuses, dict) else {},
+    }
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+    os.replace(tmp_path, path)
+
+
+def account_status_text(status):
+    value = str(status or "").strip().lower()
+    if value == "pushed":
+        return "已推送"
+    if value == "failed":
+        return "推送失败"
+    if value == "pushing":
+        return "推送中"
+    return "未推送"
+
+
+def attach_account_status(account, statuses=None):
+    if not isinstance(account, dict):
+        return account
+    statuses = load_account_statuses() if statuses is None else statuses
+    record = statuses.get(str(account.get("id") or ""), {})
+    if not isinstance(record, dict):
+        record = {}
+    status = str(record.get("sub2api_status") or record.get("status") or "not_pushed").strip() or "not_pushed"
+    account["sub2api_status"] = status
+    account["sub2api_status_text"] = str(record.get("sub2api_status_text") or account_status_text(status))
+    if record.get("sub2api_pushed_at"):
+        account["sub2api_pushed_at"] = record.get("sub2api_pushed_at")
+    if "sub2api_response" in record:
+        account["sub2api_response"] = record.get("sub2api_response")
+    if record.get("sub2api_error"):
+        account["sub2api_error"] = record.get("sub2api_error")
+    return account
+
+
 def list_registered_accounts(include_sso=True):
     data_dir = get_data_dir()
+    statuses = load_account_statuses()
     accounts = []
     for name in sorted(os.listdir(data_dir), reverse=True):
         if not (name.startswith("accounts_") and name.endswith(".txt")):
@@ -425,10 +485,35 @@ def list_registered_accounts(include_sso=True):
                         line, source=name, line_no=line_no, include_sso=include_sso
                     )
                     if account:
+                        attach_account_status(account, statuses)
                         accounts.append(account)
         except Exception:
             continue
     return accounts
+
+
+def persist_sub2api_push_status(accounts, result):
+    statuses = load_account_statuses()
+    items = result.get("items") if isinstance(result, dict) else []
+    if not isinstance(items, list):
+        items = []
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    for index, account in enumerate(accounts or []):
+        account_id = str(account.get("id") or "").strip()
+        if not account_id:
+            continue
+        item = items[index] if index < len(items) and isinstance(items[index], dict) else {}
+        statuses[account_id] = {
+            "sub2api_status": "pushed",
+            "sub2api_status_text": "已推送",
+            "sub2api_pushed_at": now,
+            "sub2api_response": item.get("response", item),
+            "email": account.get("email", ""),
+            "source_file": account.get("source_file", ""),
+            "line_no": account.get("line_no", ""),
+        }
+    save_account_statuses(statuses)
+    return statuses
 
 
 def find_registered_accounts(account_ids):

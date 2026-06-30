@@ -104,6 +104,8 @@ def import_accounts_to_sub2api(payload: dict):
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"导入 sub2api 失败: {exc}")
+    reg.persist_sub2api_push_status(accounts, result)
+    accounts = reg.find_registered_accounts(account_ids)
     total = int(result.get("total") or len(accounts))
     return {
         **result,

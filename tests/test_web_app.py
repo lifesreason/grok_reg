@@ -160,6 +160,42 @@ def test_import_selected_accounts_to_sub2api(monkeypatch, tmp_path):
     assert calls[0][1]["sub2api_auth_mode"] == "bearer"
 
 
+def test_import_selected_accounts_persists_sub2api_status(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    tmp_path.joinpath("accounts_20260630_140000_job.txt").write_text(
+        "user@example.com----Pass----sso-token----refresh-token\n",
+        encoding="utf-8",
+    )
+
+    def fake_import(accounts, settings, log_callback=None):
+        return {
+            "imported": True,
+            "total": len(accounts),
+            "items": [{"email": accounts[0]["email"], "response": {"id": 101}}],
+        }
+
+    monkeypatch.setattr(reg, "import_accounts_to_sub2api", fake_import)
+    from web_app import app
+
+    client = TestClient(app)
+    account = client.get("/api/accounts").json()["accounts"][0]
+
+    response = client.post(
+        "/api/accounts/import/sub2api",
+        json={
+            "account_ids": [account["id"]],
+            "sub2api_base": "https://sub2api.example/api/v1",
+            "sub2api_admin_token": "admin-key",
+        },
+    )
+
+    assert response.status_code == 200
+    refreshed = client.get("/api/accounts").json()["accounts"][0]
+    assert refreshed["sub2api_status"] == "pushed"
+    assert refreshed["sub2api_status_text"] == "已推送"
+    assert refreshed["sub2api_response"]["id"] == 101
+
+
 def test_start_job_rejects_duplicate_active_job(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(reg, "start_browser", lambda log_callback=None: (object(), object()))
