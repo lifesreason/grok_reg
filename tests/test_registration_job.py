@@ -249,3 +249,10 @@ def test_visible_docker_starts_xvfb_when_display_is_missing(monkeypatch):
     assert started is True
     assert calls == [["Xvfb", ":99", "-screen", "0", "1365x900x24", "-nolisten", "tcp"]]
     assert reg.os.environ["DISPLAY"] == ":99"
+
+
+def test_web_form_exposes_yyds_credentials():
+    html = Path("templates/index.html").read_text(encoding="utf-8")
+
+    assert 'name="yyds_api_key"' in html
+    assert 'name="yyds_jwt"' in html

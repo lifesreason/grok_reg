@@ -52,6 +52,31 @@ def test_config_round_trip_masks_sensitive_values(monkeypatch, tmp_path):
     assert response.json()["cloudmail_password"] == "********"
 
 
+def test_yyds_config_round_trip_masks_sensitive_values(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    from web_app import app
+
+    client = TestClient(app)
+    response = client.put(
+        "/api/config",
+        json={
+            "email_provider": "yyds",
+            "yyds_api_key": "api-key-value",
+            "yyds_jwt": "jwt-value",
+            "register_count": 1,
+            "register_threads": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["yyds_api_key"] == "********"
+    assert response.json()["yyds_jwt"] == "********"
+
+    saved = tmp_path.joinpath("config.json").read_text(encoding="utf-8")
+    assert "api-key-value" in saved
+    assert "jwt-value" in saved
+
+
 def test_start_job_rejects_duplicate_active_job(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(reg, "start_browser", lambda log_callback=None: (object(), object()))
