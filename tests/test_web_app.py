@@ -104,7 +104,7 @@ def test_sub2api_config_round_trip_masks_sensitive_values(monkeypatch, tmp_path)
 def test_accounts_endpoint_lists_registered_accounts(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     tmp_path.joinpath("accounts_20260630_140000_job.txt").write_text(
-        "user@example.com----Pass----sso-token\n",
+        "user@example.com----Pass----sso-token----refresh-token\n",
         encoding="utf-8",
     )
     from web_app import app
@@ -117,13 +117,16 @@ def test_accounts_endpoint_lists_registered_accounts(monkeypatch, tmp_path):
     assert payload["total"] == 1
     assert payload["accounts"][0]["email"] == "user@example.com"
     assert "sso" not in payload["accounts"][0]
+    assert "refresh_token" not in payload["accounts"][0]
     assert payload["accounts"][0]["sso_preview"] == "sso-to...-token"
+    assert payload["accounts"][0]["has_refresh_token"] is True
+    assert payload["accounts"][0]["refresh_token_preview"] == "refres...-token"
 
 
 def test_import_selected_accounts_to_sub2api(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     tmp_path.joinpath("accounts_20260630_140000_job.txt").write_text(
-        "user@example.com----Pass----sso-token\n",
+        "user@example.com----Pass----sso-token----refresh-token\n",
         encoding="utf-8",
     )
     calls = []
@@ -153,6 +156,7 @@ def test_import_selected_accounts_to_sub2api(monkeypatch, tmp_path):
     assert "已推送" in response.json()["message"]
     assert calls[0][0][0]["email"] == "user@example.com"
     assert calls[0][0][0]["sso"] == "sso-token"
+    assert calls[0][0][0]["refresh_token"] == "refresh-token"
     assert calls[0][1]["sub2api_auth_mode"] == "bearer"
 
 

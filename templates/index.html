@@ -171,7 +171,7 @@
             <button id="importSub2apiBtn" type="button" class="primary">推送到 sub2api</button>
           </div>
         </div>
-        <p class="hint">账号来自 data 目录下的 accounts_*.txt。页面只显示 token 摘要。导入 sub2api 时会使用现有 x.ai sso cookie 打开 Grok OAuth 授权页，换取 sub2api 可刷新的 access_token/refresh_token。</p>
+        <p class="hint">账号来自 data 目录下的 accounts_*.txt。导入 sub2api 需要账号行包含第四段 Refresh Token，格式为 email----password----sso----refresh_token；历史仅有 sso 的账号会显示但不能推送。</p>
         <div class="table-wrap">
           <table>
             <thead>
@@ -179,6 +179,7 @@
                 <th>选择</th>
                 <th>邮箱</th>
                 <th>SSO 摘要</th>
+                <th>Refresh Token</th>
                 <th>来源文件</th>
                 <th>行号</th>
                 <th>密码</th>

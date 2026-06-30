@@ -270,7 +270,7 @@ def test_list_registered_accounts_reads_accounts_files(monkeypatch, tmp_path):
     tmp_path.joinpath("accounts_20260630_140000_job.txt").write_text(
         "user1@example.com----Pass-1----sso-token-1\n"
         "bad line\n"
-        "user2@example.com----Pass-2----sso=sso-token-2\n",
+        "user2@example.com----Pass-2----sso=sso-token-2----refresh-token-2\n",
         encoding="utf-8",
     )
 
@@ -280,12 +280,32 @@ def test_list_registered_accounts_reads_accounts_files(monkeypatch, tmp_path):
     assert accounts[0]["password"] == "Pass-1"
     assert accounts[0]["sso_preview"] == "sso-to...oken-1"
     assert accounts[0]["sso"] == "sso-token-1"
+    assert accounts[0]["has_refresh_token"] is False
     assert accounts[1]["sso"] == "sso-token-2"
+    assert accounts[1]["has_refresh_token"] is True
+    assert accounts[1]["refresh_token"] == "refresh-token-2"
+    assert accounts[1]["refresh_token_preview"] == "refres...oken-2"
     assert accounts[0]["line_no"] == 1
     assert accounts[1]["line_no"] == 3
 
 
-def test_import_accounts_to_sub2api_uses_grok_oauth_flow(monkeypatch):
+def test_import_accounts_to_sub2api_requires_refresh_token(monkeypatch):
+    calls = []
+    monkeypatch.setattr(reg, "http_post", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    with pytest.raises(ValueError, match="缺少 refresh_token"):
+        reg.import_accounts_to_sub2api(
+            [{"email": "user1@example.com", "sso": "sso-token-1"}],
+            {
+                "sub2api_base": "https://sub2api.example/api/v1",
+                "sub2api_admin_token": "admin-key",
+            },
+        )
+
+    assert calls == []
+
+
+def test_import_accounts_to_sub2api_posts_grok_refresh_token(monkeypatch):
     calls = []
 
     class FakeResponse:
@@ -302,35 +322,30 @@ def test_import_accounts_to_sub2api_uses_grok_oauth_flow(monkeypatch):
 
     def fake_post(url, **kwargs):
         calls.append((url, kwargs))
-        if url.endswith("/admin/grok/oauth/auth-url"):
-            index = len([item for item in calls if item[0].endswith("/admin/grok/oauth/auth-url")])
+        if url.endswith("/admin/grok/oauth/refresh-token"):
+            refresh_token = kwargs["json"]["refresh_token"]
             return FakeResponse(
                 {
                     "code": 0,
                     "data": {
-                        "auth_url": f"https://auth.x.ai/oauth2/authorize?state=state-{index}",
-                        "session_id": f"session-{index}",
-                        "state": f"state-{index}",
+                        "access_token": f"access-for-{refresh_token}",
+                        "refresh_token": f"rotated-{refresh_token}",
+                        "token_type": "Bearer",
+                        "expires_at": 1790000000,
+                        "email": kwargs["json"].get("email", ""),
                     },
                 }
             )
-        if url.endswith("/admin/grok/oauth/create-from-oauth"):
+        if url.endswith("/admin/accounts"):
             return FakeResponse({"code": 0, "data": {"id": 100 + len(calls)}})
         raise AssertionError(f"unexpected URL: {url}")
 
-    oauth_calls = []
-
-    def fake_complete(auth_url, sso, expected_state="", log_callback=None, cancel_callback=None):
-        oauth_calls.append((auth_url, sso, expected_state))
-        return {"code": f"code-for-{expected_state}", "state": expected_state}
-
     monkeypatch.setattr(reg, "http_post", fake_post)
-    monkeypatch.setattr(reg, "complete_sub2api_grok_oauth_in_browser", fake_complete)
 
     result = reg.import_accounts_to_sub2api(
         [
-            {"email": "user1@example.com", "sso": "sso-token-1"},
-            {"email": "user2@example.com", "sso": "sso=sso-token-2"},
+            {"email": "user1@example.com", "sso": "sso-token-1", "refresh_token": "refresh-token-1"},
+            {"email": "user2@example.com", "sso": "sso=sso-token-2", "refresh_token": "refresh-token-2"},
         ],
         {
             "sub2api_base": "https://sub2api.example/api/v1",
@@ -345,22 +360,23 @@ def test_import_accounts_to_sub2api_uses_grok_oauth_flow(monkeypatch):
 
     assert result["imported"] is True
     assert result["total"] == 2
-    assert calls[0][0] == "https://sub2api.example/api/v1/admin/grok/oauth/auth-url"
+    assert calls[0][0] == "https://sub2api.example/api/v1/admin/grok/oauth/refresh-token"
     assert calls[0][1]["headers"]["x-api-key"] == "admin-key"
-    assert calls[1][0] == "https://sub2api.example/api/v1/admin/grok/oauth/create-from-oauth"
-    assert calls[1][1]["json"]["session_id"] == "session-1"
-    assert calls[1][1]["json"]["code"] == "code-for-state-1"
-    assert calls[1][1]["json"]["state"] == "state-1"
+    assert calls[0][1]["json"]["refresh_token"] == "refresh-token-1"
+    assert calls[1][0] == "https://sub2api.example/api/v1/admin/accounts"
     assert calls[1][1]["json"]["name"] == "Grok Auto - user1@example.com"
+    assert calls[1][1]["json"]["platform"] == "grok"
+    assert calls[1][1]["json"]["type"] == "oauth"
+    assert calls[1][1]["json"]["credentials"]["access_token"] == "access-for-refresh-token-1"
+    assert calls[1][1]["json"]["credentials"]["refresh_token"] == "rotated-refresh-token-1"
+    assert calls[1][1]["json"]["credentials"]["token_type"] == "Bearer"
+    assert calls[1][1]["json"]["credentials"]["expires_at"] == 1790000000
+    assert calls[1][1]["json"]["credentials"]["client_id"]
+    assert calls[1][1]["json"]["credentials"]["base_url"] == "https://api.x.ai/v1"
     assert calls[1][1]["json"]["group_ids"] == [1, 2]
     assert calls[1][1]["json"]["concurrency"] == 5
     assert calls[1][1]["json"]["priority"] == 40
-    assert len([item for item in calls if item[0].endswith("/admin/accounts")]) == 0
-    assert oauth_calls[0] == (
-        "https://auth.x.ai/oauth2/authorize?state=state-1",
-        "sso-token-1",
-        "state-1",
-    )
+    assert "sso-token-1" not in str(calls[1][1]["json"])
 
 
 def test_should_log_cloudflare_wait_throttles_repeated_same_length(monkeypatch):

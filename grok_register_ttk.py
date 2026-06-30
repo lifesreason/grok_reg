@@ -20,7 +20,6 @@ import json
 import uuid
 import subprocess
 import hashlib
-import urllib.parse
 
 try:
     import tkinter as tk
@@ -95,6 +94,9 @@ DEFAULT_CONFIG = {
     "cloudmail_admin_email": "",
     "cloudmail_password": "",
 }
+
+XAI_GROK_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
+XAI_GROK_API_BASE_URL = "https://api.x.ai/v1"
 
 config = DEFAULT_CONFIG.copy()
 _cf_domain_index = 0
@@ -376,10 +378,11 @@ def _account_id(source, line_no, email, sso):
 
 
 def parse_registered_account_line(line, source="", line_no=0, include_sso=True):
-    parts = str(line or "").rstrip("\n").split("----", 2)
-    if len(parts) != 3:
+    parts = str(line or "").rstrip("\n").split("----", 3)
+    if len(parts) not in {3, 4}:
         return None
-    email, password, sso = [part.strip() for part in parts]
+    email, password, sso = [part.strip() for part in parts[:3]]
+    refresh_token = parts[3].strip() if len(parts) == 4 else ""
     sso = _normalize_sso_token(sso)
     if not email or not sso:
         return None
@@ -388,11 +391,15 @@ def parse_registered_account_line(line, source="", line_no=0, include_sso=True):
         "email": email,
         "password": password,
         "sso_preview": _mask_token(sso),
+        "refresh_token_preview": _mask_token(refresh_token) if refresh_token else "",
+        "has_refresh_token": bool(refresh_token),
         "source_file": source,
         "line_no": line_no,
     }
     if include_sso:
         account["sso"] = sso
+        if refresh_token:
+            account["refresh_token"] = refresh_token
     return account
 
 
@@ -477,6 +484,9 @@ def _sub2api_response_data(resp):
         payload = resp.json()
     except Exception:
         return {"raw": resp.text[:1000]}
+    if isinstance(payload, dict) and "code" in payload and payload.get("code") not in (0, 200, "0", "200", None):
+        message = payload.get("message") or payload.get("msg") or payload.get("error") or payload
+        raise Exception(f"sub2api 返回错误: {message}")
     if isinstance(payload, dict) and "data" in payload:
         return payload.get("data")
     return payload
@@ -489,17 +499,43 @@ def _sub2api_account_name(account, settings=None, index=1):
     return f"{base_name} - {email}" if email else f"{base_name} #{index}"
 
 
-def build_sub2api_grok_oauth_create_payload(account, oauth_result, auth_session, settings=None, index=1):
+def build_sub2api_grok_refresh_token_check_payload(account, settings=None):
     settings = {**config, **dict(settings or {})}
+    refresh_token = str((account or {}).get("refresh_token") or "").strip()
+    if not refresh_token:
+        raise ValueError(f"账号 {account.get('email', '') or ''} 缺少 refresh_token，不能推送到 sub2api")
     payload = {
-        "session_id": str(auth_session.get("session_id") or "").strip(),
-        "code": str(oauth_result.get("code") or "").strip(),
-        "state": str(oauth_result.get("state") or auth_session.get("state") or "").strip(),
-        "name": _sub2api_account_name(account, settings, index=index),
+        "refresh_token": refresh_token,
+        "client_id": str(settings.get("sub2api_grok_client_id") or XAI_GROK_OAUTH_CLIENT_ID).strip(),
     }
-    redirect_uri = str(auth_session.get("redirect_uri") or settings.get("sub2api_grok_redirect_uri") or "").strip()
-    if redirect_uri:
-        payload["redirect_uri"] = redirect_uri
+    email = str((account or {}).get("email") or "").strip()
+    if email:
+        payload["email"] = email
+    proxy_id = _optional_positive_int(settings.get("sub2api_proxy_id"), None)
+    if proxy_id is not None:
+        payload["proxy_id"] = proxy_id
+    return payload
+
+
+def build_sub2api_grok_refresh_token_payload(account, token_info=None, settings=None, index=1):
+    settings = {**config, **dict(settings or {})}
+    refresh_token = str((account or {}).get("refresh_token") or "").strip()
+    if not refresh_token:
+        raise ValueError(f"账号 {account.get('email', '') or index} 缺少 refresh_token，不能推送到 sub2api")
+    token_info = token_info if isinstance(token_info, dict) else {}
+    credentials = dict(token_info)
+    credentials["refresh_token"] = str(credentials.get("refresh_token") or refresh_token).strip()
+    credentials["client_id"] = str(credentials.get("client_id") or settings.get("sub2api_grok_client_id") or XAI_GROK_OAUTH_CLIENT_ID).strip()
+    credentials["base_url"] = str(credentials.get("base_url") or settings.get("sub2api_grok_base_url") or XAI_GROK_API_BASE_URL).strip()
+    email = str((account or {}).get("email") or "").strip()
+    if email and not credentials.get("email"):
+        credentials["email"] = email
+    payload = {
+        "name": _sub2api_account_name(account, settings, index=index),
+        "platform": "grok",
+        "type": "oauth",
+        "credentials": credentials,
+    }
     group_ids = _parse_int_list(settings.get("sub2api_group_ids", ""))
     if group_ids:
         payload["group_ids"] = group_ids
@@ -509,110 +545,7 @@ def build_sub2api_grok_oauth_create_payload(account, oauth_result, auth_session,
     priority = _optional_positive_int(settings.get("sub2api_priority"), None)
     if priority is not None:
         payload["priority"] = priority
-    if not payload["session_id"] or not payload["code"]:
-        raise ValueError("sub2api Grok OAuth 缺少 session_id/code")
     return payload
-
-
-def _parse_oauth_callback_url(url):
-    parsed = urllib.parse.urlparse(str(url or ""))
-    values = urllib.parse.parse_qs(parsed.query)
-    code = (values.get("code") or [""])[0].strip()
-    state = (values.get("state") or [""])[0].strip()
-    error = (values.get("error") or [""])[0].strip()
-    if not code and parsed.fragment:
-        fragment_values = urllib.parse.parse_qs(parsed.fragment)
-        code = (fragment_values.get("code") or [""])[0].strip()
-        state = state or (fragment_values.get("state") or [""])[0].strip()
-        error = error or (fragment_values.get("error") or [""])[0].strip()
-    return {"code": code, "state": state, "error": error, "url": str(url or "")}
-
-
-def _set_xai_sso_cookies(page, sso):
-    token = _normalize_sso_token(sso)
-    if not page or not token:
-        return False
-    cookies = [
-        {"name": "sso", "value": token, "domain": ".x.ai", "path": "/", "secure": True, "httpOnly": True},
-        {"name": "sso-rw", "value": token, "domain": ".x.ai", "path": "/", "secure": True, "httpOnly": True},
-    ]
-    ok = False
-    for cookie in cookies:
-        try:
-            page.run_cdp("Network.setCookie", **cookie)
-            ok = True
-        except Exception:
-            pass
-    try:
-        setter = getattr(getattr(page, "set", None), "cookies", None)
-        if setter:
-            setter(cookies)
-            ok = True
-    except Exception:
-        pass
-    return ok
-
-
-def complete_sub2api_grok_oauth_in_browser(
-    auth_url,
-    sso,
-    expected_state="",
-    timeout=90,
-    log_callback=None,
-    cancel_callback=None,
-):
-    token = _normalize_sso_token(sso)
-    if not token:
-        raise ValueError("账号缺少 sso cookie")
-    browser = _get_browser()
-    page = _get_page()
-    if browser is None or page is None:
-        browser, page = start_browser(log_callback=log_callback)
-    try:
-        page = browser.new_tab("https://auth.x.ai")
-        _set_page(page)
-    except Exception:
-        page = refresh_active_page()
-        try:
-            page.get("https://auth.x.ai")
-        except Exception:
-            pass
-    _set_xai_sso_cookies(page, token)
-    page.get(auth_url)
-    deadline = time.time() + timeout
-    last_url = ""
-    while time.time() < deadline:
-        raise_if_cancelled(cancel_callback)
-        current_url = str(getattr(page, "url", "") or "")
-        last_url = current_url or last_url
-        parsed = _parse_oauth_callback_url(current_url)
-        if parsed.get("error"):
-            raise Exception(f"xAI OAuth 返回错误: {parsed['error']}")
-        if parsed.get("code"):
-            if expected_state and parsed.get("state") and parsed.get("state") != expected_state:
-                raise Exception("xAI OAuth state 不匹配")
-            return parsed
-        try:
-            page.run_js(
-                r"""
-const buttons = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="submit"]'));
-const target = buttons.find((node) => {
-  const text = String(node.innerText || node.textContent || node.value || node.getAttribute('aria-label') || '')
-    .replace(/\s+/g, '').toLowerCase();
-  return text.includes('allow') || text.includes('authorize') || text.includes('continue') ||
-    text.includes('approve') || text.includes('同意') || text.includes('授权') || text.includes('继续');
-});
-if (target && !target.disabled && target.getAttribute('aria-disabled') !== 'true') {
-  target.click();
-  return true;
-}
-return false;
-                """
-            )
-        except Exception:
-            pass
-        sleep_with_cancel(0.8, cancel_callback)
-    raise Exception(f"xAI OAuth 未在 {timeout}s 内返回 code，最后URL: {last_url}")
 
 
 def import_accounts_to_sub2api(accounts, settings=None, log_callback=None):
@@ -620,35 +553,33 @@ def import_accounts_to_sub2api(accounts, settings=None, log_callback=None):
     base = _sub2api_api_base(settings)
     headers = _sub2api_headers(settings)
 
-    valid_accounts = [account for account in (accounts or []) if _normalize_sso_token(account.get("sso", ""))]
+    valid_accounts = [account for account in (accounts or []) if str(account.get("refresh_token") or "").strip()]
     if not valid_accounts:
-        raise ValueError("没有可导入的账号 token")
+        raise ValueError("没有可推送的账号：选中账号缺少 refresh_token")
+    missing = [
+        str(account.get("email") or account.get("id") or "").strip()
+        for account in (accounts or [])
+        if not str(account.get("refresh_token") or "").strip()
+    ]
+    missing = [item for item in missing if item]
+    if missing:
+        raise ValueError(f"账号 {', '.join(missing)} 缺少 refresh_token，不能推送到 sub2api")
 
     items = []
     for index, account in enumerate(valid_accounts, start=1):
-        auth_data = _sub2api_response_data(
+        token_info = _sub2api_response_data(
             http_post(
-                f"{base}/admin/grok/oauth/auth-url",
+                f"{base}/admin/grok/oauth/refresh-token",
                 headers=headers,
-                json={},
-                timeout=30,
+                json=build_sub2api_grok_refresh_token_check_payload(account, settings),
+                timeout=60,
                 proxies={},
             )
         )
-        if not isinstance(auth_data, dict) or not auth_data.get("auth_url") or not auth_data.get("session_id"):
-            raise Exception(f"sub2api Grok OAuth auth-url 返回异常: {auth_data}")
-        oauth_result = complete_sub2api_grok_oauth_in_browser(
-            auth_data["auth_url"],
-            account.get("sso", ""),
-            expected_state=str(auth_data.get("state") or ""),
-            log_callback=log_callback,
-        )
-        payload = build_sub2api_grok_oauth_create_payload(
-            account, oauth_result, auth_data, settings, index=index
-        )
+        payload = build_sub2api_grok_refresh_token_payload(account, token_info, settings, index=index)
         created = _sub2api_response_data(
             http_post(
-                f"{base}/admin/grok/oauth/create-from-oauth",
+                f"{base}/admin/accounts",
                 headers=headers,
                 json=payload,
                 timeout=60,
@@ -657,12 +588,12 @@ def import_accounts_to_sub2api(accounts, settings=None, log_callback=None):
         )
         items.append({"email": account.get("email", ""), "response": created})
     if log_callback:
-        log_callback(f"[+] 已通过 sub2api Grok OAuth 创建账号: {len(items)} 个")
+        log_callback(f"[+] 已推送 Refresh Token 到 sub2api: {len(items)} 个")
     return {
         "imported": True,
         "total": len(items),
         "items": items,
-        "warning": "已通过 sub2api Grok OAuth 换取 access_token/refresh_token；如单个账号失败，请确认 x.ai sso cookie 仍有效。",
+        "warning": "已按 Refresh Token 直接导入 sub2api；历史仅有 sso 的账号不能推送。",
     }
 
 

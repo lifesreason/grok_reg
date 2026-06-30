@@ -135,7 +135,7 @@ function renderAccounts() {
   accountsSummary.textContent = `共 ${accounts.length} 个账号`;
   if (!accounts.length) {
     const row = document.createElement("tr");
-    row.innerHTML = '<td colspan="7" class="empty">暂无账号，注册成功后会出现在这里</td>';
+    row.innerHTML = '<td colspan="8" class="empty">暂无账号，注册成功后会出现在这里</td>';
     accountsBody.appendChild(row);
     return;
   }
@@ -146,11 +146,19 @@ function renderAccounts() {
     checkbox.className = "account-check";
     checkbox.type = "checkbox";
     checkbox.value = account.id;
+    checkbox.disabled = !account.has_refresh_token;
+    if (!account.has_refresh_token) {
+      checkbox.title = "缺少 Refresh Token，不能推送到 sub2api";
+    }
     checkCell.appendChild(checkbox);
     row.appendChild(checkCell);
+    const refreshStatus = account.has_refresh_token
+      ? `已保存 ${account.refresh_token_preview || ""}`.trim()
+      : "缺少";
     for (const value of [
       account.email,
       account.sso_preview || "",
+      refreshStatus,
       account.source_file || "",
       account.line_no || "",
       account.password ? "已保存" : "-",
@@ -176,7 +184,7 @@ async function loadAccounts() {
 async function importSelectedToSub2api() {
   const accountIds = selectedAccountIds();
   if (!accountIds.length) {
-    setMessage("请选择要推送的账号");
+    setMessage("请选择带 Refresh Token 的账号再推送");
     return;
   }
   pushingToSub2api = true;
