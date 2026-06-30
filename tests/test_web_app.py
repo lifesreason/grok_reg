@@ -196,6 +196,51 @@ def test_import_selected_accounts_persists_sub2api_status(monkeypatch, tmp_path)
     assert refreshed["sub2api_response"]["id"] == 101
 
 
+def test_import_selected_accounts_persists_sub2api_failure_status(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    tmp_path.joinpath("accounts_20260630_140000_job.txt").write_text(
+        "user@example.com----Pass----sso-token----refresh-token\n",
+        encoding="utf-8",
+    )
+
+    def fake_import(accounts, settings, log_callback=None):
+        return {
+            "imported": False,
+            "total": 0,
+            "failed": 1,
+            "items": [
+                {
+                    "email": accounts[0]["email"],
+                    "status": "failed",
+                    "error": "refresh-token HTTP 502: Bad Gateway",
+                    "step": "refresh-token",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(reg, "import_accounts_to_sub2api", fake_import)
+    from web_app import app
+
+    client = TestClient(app)
+    account = client.get("/api/accounts").json()["accounts"][0]
+
+    response = client.post(
+        "/api/accounts/import/sub2api",
+        json={
+            "account_ids": [account["id"]],
+            "sub2api_base": "https://sub2api.example/api/v1",
+            "sub2api_admin_token": "admin-key",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "partial_failed"
+    refreshed = client.get("/api/accounts").json()["accounts"][0]
+    assert refreshed["sub2api_status"] == "failed"
+    assert refreshed["sub2api_status_text"].startswith("失败")
+    assert "refresh-token HTTP 502" in refreshed["sub2api_error"]
+
+
 def test_start_job_rejects_duplicate_active_job(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(reg, "start_browser", lambda log_callback=None: (object(), object()))

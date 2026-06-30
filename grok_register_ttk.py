@@ -449,6 +449,18 @@ def account_status_text(status):
     return "未推送"
 
 
+def _sub2api_error_text(exc, step=""):
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    text = getattr(response, "text", "") if response is not None else ""
+    message = str(exc)
+    if status_code:
+        message = f"{step + ' ' if step else ''}HTTP {status_code}: {text or message}"
+    elif step:
+        message = f"{step}: {message}"
+    return message[:1000]
+
+
 def attach_account_status(account, statuses=None):
     if not isinstance(account, dict):
         return account
@@ -503,15 +515,28 @@ def persist_sub2api_push_status(accounts, result):
         if not account_id:
             continue
         item = items[index] if index < len(items) and isinstance(items[index], dict) else {}
-        statuses[account_id] = {
-            "sub2api_status": "pushed",
-            "sub2api_status_text": "已推送",
-            "sub2api_pushed_at": now,
-            "sub2api_response": item.get("response", item),
-            "email": account.get("email", ""),
-            "source_file": account.get("source_file", ""),
-            "line_no": account.get("line_no", ""),
-        }
+        item_status = str(item.get("status") or "pushed").strip().lower()
+        if item_status == "failed":
+            statuses[account_id] = {
+                "sub2api_status": "failed",
+                "sub2api_status_text": f"失败：{str(item.get('error') or '')[:220]}",
+                "sub2api_failed_at": now,
+                "sub2api_error": str(item.get("error") or ""),
+                "sub2api_step": str(item.get("step") or ""),
+                "email": account.get("email", ""),
+                "source_file": account.get("source_file", ""),
+                "line_no": account.get("line_no", ""),
+            }
+        else:
+            statuses[account_id] = {
+                "sub2api_status": "pushed",
+                "sub2api_status_text": "已推送",
+                "sub2api_pushed_at": now,
+                "sub2api_response": item.get("response", item),
+                "email": account.get("email", ""),
+                "source_file": account.get("source_file", ""),
+                "line_no": account.get("line_no", ""),
+            }
     save_account_statuses(statuses)
     return statuses
 
@@ -658,31 +683,48 @@ def import_accounts_to_sub2api(accounts, settings=None, log_callback=None):
 
     items = []
     for index, account in enumerate(valid_accounts, start=1):
-        token_info = _sub2api_response_data(
-            http_post(
-                f"{base}/admin/grok/oauth/refresh-token",
-                headers=headers,
-                json=build_sub2api_grok_refresh_token_check_payload(account, settings),
-                timeout=60,
-                proxies={},
+        step = "refresh-token"
+        try:
+            token_info = _sub2api_response_data(
+                http_post(
+                    f"{base}/admin/grok/oauth/refresh-token",
+                    headers=headers,
+                    json=build_sub2api_grok_refresh_token_check_payload(account, settings),
+                    timeout=60,
+                    proxies={},
+                )
             )
-        )
-        payload = build_sub2api_grok_refresh_token_payload(account, token_info, settings, index=index)
-        created = _sub2api_response_data(
-            http_post(
-                f"{base}/admin/accounts",
-                headers=headers,
-                json=payload,
-                timeout=60,
-                proxies={},
+            payload = build_sub2api_grok_refresh_token_payload(account, token_info, settings, index=index)
+            step = "create-account"
+            created = _sub2api_response_data(
+                http_post(
+                    f"{base}/admin/accounts",
+                    headers=headers,
+                    json=payload,
+                    timeout=60,
+                    proxies={},
+                )
             )
-        )
-        items.append({"email": account.get("email", ""), "response": created})
+            items.append({"email": account.get("email", ""), "status": "pushed", "response": created})
+        except Exception as exc:
+            items.append(
+                {
+                    "email": account.get("email", ""),
+                    "status": "failed",
+                    "step": step,
+                    "error": _sub2api_error_text(exc, step=step),
+                }
+            )
+            if log_callback:
+                log_callback(f"[!] 推送 sub2api 失败: {account.get('email', '')} {items[-1]['error']}")
+    success_count = len([item for item in items if item.get("status") == "pushed"])
+    failed_count = len(items) - success_count
     if log_callback:
-        log_callback(f"[+] 已推送 Refresh Token 到 sub2api: {len(items)} 个")
+        log_callback(f"[+] sub2api 推送完成: 成功 {success_count} / 失败 {failed_count}")
     return {
-        "imported": True,
-        "total": len(items),
+        "imported": failed_count == 0,
+        "total": success_count,
+        "failed": failed_count,
         "items": items,
         "warning": "已按 Refresh Token 直接导入 sub2api；历史仅有 sso 的账号不能推送。",
     }

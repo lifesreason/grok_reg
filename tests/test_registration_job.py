@@ -408,6 +408,37 @@ def test_import_accounts_to_sub2api_posts_grok_refresh_token(monkeypatch):
     assert "sso-token-1" not in str(calls[1][1]["json"])
 
 
+def test_import_accounts_to_sub2api_returns_per_account_failure(monkeypatch):
+    class FakeHTTPError(Exception):
+        def __init__(self):
+            super().__init__("HTTP Error 502: Bad Gateway")
+            self.response = type("Response", (), {"status_code": 502, "text": "Bad Gateway"})()
+
+    class FakeResponse:
+        status_code = 502
+        text = "Bad Gateway"
+
+        def raise_for_status(self):
+            raise FakeHTTPError()
+
+    monkeypatch.setattr(reg, "http_post", lambda *args, **kwargs: FakeResponse())
+
+    result = reg.import_accounts_to_sub2api(
+        [{"email": "user@example.com", "sso": "sso-token", "refresh_token": "refresh-token"}],
+        {
+            "sub2api_base": "https://sub2api.example/api/v1",
+            "sub2api_admin_token": "admin-key",
+        },
+    )
+
+    assert result["imported"] is False
+    assert result["total"] == 0
+    assert result["failed"] == 1
+    assert result["items"][0]["status"] == "failed"
+    assert result["items"][0]["step"] == "refresh-token"
+    assert "HTTP 502" in result["items"][0]["error"]
+
+
 def test_exchange_xai_oauth_code_for_token_posts_pkce_form(monkeypatch):
     calls = []
 

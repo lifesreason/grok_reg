@@ -219,12 +219,17 @@ async function importSelectedToSub2api() {
       method: "POST",
       body: JSON.stringify(payload),
     });
-    accountIds.forEach((id) => {
-      accountPushStatus[id] = "已推送";
-    });
     if (Array.isArray(result.accounts)) {
       const returned = new Map(result.accounts.map((account) => [account.id, account]));
       accounts = accounts.map((account) => returned.get(account.id) || account);
+      accountIds.forEach((id) => {
+        const account = returned.get(id);
+        accountPushStatus[id] = account?.sub2api_status_text || (account?.sub2api_status === "pushed" ? "已推送" : "未推送");
+      });
+    } else {
+      accountIds.forEach((id) => {
+        accountPushStatus[id] = result.status === "partial_failed" ? "失败：请刷新查看详情" : "已推送";
+      });
     }
     setMessage(`${result.message || `已推送到 sub2api：${result.total} 个账号`}。${result.warning || ""}`);
   } catch (error) {

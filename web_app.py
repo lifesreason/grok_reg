@@ -107,10 +107,15 @@ def import_accounts_to_sub2api(payload: dict):
     reg.persist_sub2api_push_status(accounts, result)
     accounts = reg.find_registered_accounts(account_ids)
     total = int(result.get("total") or len(accounts))
+    failed = int(result.get("failed") or 0)
+    status = "partial_failed" if failed else "pushed"
+    message = f"已推送到 sub2api：{total} 个账号"
+    if failed:
+        message = f"sub2api 推送完成：成功 {total} 个，失败 {failed} 个"
     return {
         **result,
-        "status": "pushed",
-        "message": f"已推送到 sub2api：{total} 个账号",
+        "status": status,
+        "message": message,
         "accounts": [public_account(account) for account in accounts],
     }
 
