@@ -48,6 +48,8 @@ function formPayload() {
   });
   data.enable_nsfw = form.elements.enable_nsfw.checked;
   data.grok2api_auto_add_local = form.elements.grok2api_auto_add_local.checked;
+  data.grok2api_auto_add_remote = form.elements.grok2api_auto_add_remote.checked;
+  data.sub2api_auto_import_remote = form.elements.sub2api_auto_import_remote.checked;
   data.register_count = Number(data.register_count || 1);
   data.register_threads = Number(data.register_threads || 1);
   data.sub2api_concurrency = Number(data.sub2api_concurrency || 3);

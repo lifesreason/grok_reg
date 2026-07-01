@@ -39,6 +39,21 @@ def test_validate_registration_config_normalizes_counts_and_paths():
     assert settings["cloudflare_path_accounts"] == "/api/new_address"
     assert settings["cloudflare_path_token"] == "/api/token"
     assert settings["cloudflare_path_messages"] == "/api/mails"
+    assert settings["grok2api_auto_add_remote"] is False
+    assert settings["sub2api_auto_import_remote"] is False
+
+
+def test_validate_registration_config_keeps_auto_push_switches():
+    settings = reg.validate_registration_config(
+        {
+            "email_provider": "duckmail",
+            "grok2api_auto_add_remote": True,
+            "sub2api_auto_import_remote": True,
+        }
+    )
+
+    assert settings["grok2api_auto_add_remote"] is True
+    assert settings["sub2api_auto_import_remote"] is True
 
 
 def test_registration_job_runs_successfully(monkeypatch, tmp_path):
@@ -95,6 +110,97 @@ def test_registration_job_runs_successfully(monkeypatch, tmp_path):
         encoding="utf-8"
     )
     assert any("注册成功" in line for line in job.logs())
+
+
+def test_registration_job_auto_pushes_to_remote_services_when_enabled(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(reg, "start_browser", lambda log_callback=None: (object(), object()))
+    monkeypatch.setattr(reg, "restart_browser", lambda log_callback=None: (object(), object()))
+    monkeypatch.setattr(reg, "stop_browser", lambda: None)
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda seconds, cancel_callback=None: None)
+    monkeypatch.setattr(reg, "open_signup_page", lambda log_callback=None, cancel_callback=None: None)
+    monkeypatch.setattr(
+        reg,
+        "fill_email_and_submit",
+        lambda log_callback=None, cancel_callback=None: ("user@example.com", "mail-token"),
+    )
+    monkeypatch.setattr(
+        reg,
+        "fill_code_and_submit",
+        lambda email, token, log_callback=None, cancel_callback=None: "123456",
+    )
+    monkeypatch.setattr(
+        reg,
+        "fill_profile_and_submit",
+        lambda log_callback=None, cancel_callback=None: {
+            "given_name": "Ada",
+            "family_name": "Lovelace",
+            "password": "secret",
+        },
+    )
+    monkeypatch.setattr(reg, "wait_for_sso_cookie", lambda log_callback=None, cancel_callback=None: "sso-token")
+    monkeypatch.setattr(reg, "fetch_xai_oauth_refresh_token", lambda sso, log_callback=None, cancel_callback=None: "refresh-token")
+    monkeypatch.setattr(reg, "add_token_to_grok2api_pools", lambda raw_token, email="", log_callback=None: None)
+    pushed = []
+
+    def fake_grok2api(accounts, settings=None, log_callback=None):
+        pushed.append(("grok2api", accounts[0]["email"], settings["grok2api_remote_base"]))
+        return {"items": [{"response": {"pool": "basic"}}], "total": 1, "failed": 0}
+
+    def fake_sub2api(accounts, settings=None, log_callback=None):
+        pushed.append(("sub2api", accounts[0]["email"], settings["sub2api_base"]))
+        return {"items": [{"response": {"id": 101}}], "total": 1, "failed": 0}
+
+    monkeypatch.setattr(reg, "import_accounts_to_grok2api", fake_grok2api)
+    monkeypatch.setattr(reg, "import_accounts_to_sub2api", fake_sub2api)
+
+    job = reg.RegistrationJob(
+        {
+            "email_provider": "duckmail",
+            "register_count": 1,
+            "register_threads": 1,
+            "grok2api_auto_add_remote": True,
+            "grok2api_remote_base": "http://grok2api.example",
+            "grok2api_remote_app_key": "app-key",
+            "sub2api_auto_import_remote": True,
+            "sub2api_base": "http://sub2api.example",
+            "sub2api_admin_token": "admin-key",
+        }
+    )
+    job.start()
+    status = wait_for_job(job)
+
+    assert status["status"] == "completed"
+    assert pushed == [
+        ("grok2api", "user@example.com", "http://grok2api.example"),
+        ("sub2api", "user@example.com", "http://sub2api.example"),
+    ]
+    account = reg.list_registered_accounts()[0]
+    assert account["grok2api_status"] == "pushed"
+    assert account["sub2api_status"] == "pushed"
+
+
+def test_registration_job_does_not_auto_push_when_switches_disabled(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(reg, "start_browser", lambda log_callback=None: (object(), object()))
+    monkeypatch.setattr(reg, "restart_browser", lambda log_callback=None: (object(), object()))
+    monkeypatch.setattr(reg, "stop_browser", lambda: None)
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda seconds, cancel_callback=None: None)
+    monkeypatch.setattr(reg, "open_signup_page", lambda log_callback=None, cancel_callback=None: None)
+    monkeypatch.setattr(reg, "fill_email_and_submit", lambda log_callback=None, cancel_callback=None: ("user@example.com", "mail-token"))
+    monkeypatch.setattr(reg, "fill_code_and_submit", lambda email, token, log_callback=None, cancel_callback=None: "123456")
+    monkeypatch.setattr(reg, "fill_profile_and_submit", lambda log_callback=None, cancel_callback=None: {"given_name": "Ada", "family_name": "Lovelace", "password": "secret"})
+    monkeypatch.setattr(reg, "wait_for_sso_cookie", lambda log_callback=None, cancel_callback=None: "sso-token")
+    monkeypatch.setattr(reg, "fetch_xai_oauth_refresh_token", lambda sso, log_callback=None, cancel_callback=None: "refresh-token")
+    monkeypatch.setattr(reg, "add_token_to_grok2api_pools", lambda raw_token, email="", log_callback=None: None)
+    monkeypatch.setattr(reg, "import_accounts_to_grok2api", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("grok2api should not run")))
+    monkeypatch.setattr(reg, "import_accounts_to_sub2api", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sub2api should not run")))
+
+    job = reg.RegistrationJob({"email_provider": "duckmail", "register_count": 1, "register_threads": 1})
+    job.start()
+    status = wait_for_job(job)
+
+    assert status["status"] == "completed"
 
 
 def test_registration_job_stop_request_sets_stopped_status(monkeypatch, tmp_path):
@@ -1049,6 +1155,16 @@ def test_web_console_exposes_grok2api_push_action():
     assert "/api/accounts/import/grok2api" in js
     assert "accountGrok2apiPushStatus" in js
     assert "可推送到 grok2api" in js
+
+
+def test_web_console_exposes_auto_push_switches():
+    html = Path("templates/index.html").read_text(encoding="utf-8")
+    js = Path("static/app.js").read_text(encoding="utf-8")
+
+    assert 'name="grok2api_auto_add_remote"' in html
+    assert 'name="sub2api_auto_import_remote"' in html
+    assert "data.grok2api_auto_add_remote" in js
+    assert "data.sub2api_auto_import_remote" in js
 
 
 def test_web_console_uses_roomier_operational_layout():

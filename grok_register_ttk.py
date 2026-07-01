@@ -86,6 +86,7 @@ DEFAULT_CONFIG = {
     "grok2api_auto_add_remote": False,
     "grok2api_remote_base": "",
     "grok2api_remote_app_key": "",
+    "sub2api_auto_import_remote": False,
     "sub2api_base": "",
     "sub2api_auth_mode": "x-api-key",
     "sub2api_admin_token": "",
@@ -953,6 +954,28 @@ def import_accounts_to_sub2api(accounts, settings=None, log_callback=None):
         "items": items,
         "warning": "已按 Refresh Token 直接导入 sub2api；历史仅有 sso 的账号不能推送。",
     }
+
+
+def auto_push_registered_account(account, settings=None, log_callback=None):
+    settings = {**config, **dict(settings or {})}
+    if settings.get("grok2api_auto_add_remote"):
+        try:
+            result = import_accounts_to_grok2api([account], settings, log_callback=log_callback)
+            persist_grok2api_push_status([account], result)
+            if log_callback:
+                log_callback(f"[*] 已自动推送到远程 grok2api: {account.get('email', '')}")
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] 自动推送远程 grok2api 失败: {exc}")
+    if settings.get("sub2api_auto_import_remote"):
+        try:
+            result = import_accounts_to_sub2api([account], settings, log_callback=log_callback)
+            persist_sub2api_push_status([account], result)
+            if log_callback:
+                log_callback(f"[*] 已自动推送到 sub2api: {account.get('email', '')}")
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] 自动推送 sub2api 失败: {exc}")
 
 
 def add_token_to_grok2api_local_pool(raw_token, email="", log_callback=None):
@@ -1924,6 +1947,8 @@ def validate_registration_config(settings):
     )
     auth_mode = str(normalized.get("sub2api_auth_mode") or "x-api-key").strip().lower()
     normalized["sub2api_auth_mode"] = "bearer" if auth_mode == "bearer" else "x-api-key"
+    normalized["grok2api_auto_add_remote"] = bool(normalized.get("grok2api_auto_add_remote"))
+    normalized["sub2api_auto_import_remote"] = bool(normalized.get("sub2api_auto_import_remote"))
 
     raw_paths = normalized.pop("cloudflare_paths", "")
     if raw_paths:
@@ -2086,6 +2111,7 @@ class RegistrationJob:
             sso, log_callback=logf, cancel_callback=self.should_stop
         )
         with self.stats_lock:
+            source_line_no = self.success_count + 1
             self.results.append(
                 {"email": email, "sso": sso, "refresh_token": refresh_token, "profile": profile}
             )
@@ -2100,7 +2126,19 @@ class RegistrationJob:
                     f.write(line)
             except Exception as file_exc:
                 logf(f"[Debug] 保存账号文件失败: {file_exc}")
+        account = parse_registered_account_line(
+            line,
+            source=self.output_file,
+            line_no=source_line_no,
+            include_sso=True,
+        ) or {
+            "email": email,
+            "sso": sso,
+            "refresh_token": refresh_token,
+            "has_refresh_token": bool(refresh_token),
+        }
         add_token_to_grok2api_pools(sso, email=email, log_callback=logf)
+        auto_push_registered_account(account, self.settings, log_callback=logf)
         logf(f"[+] 注册成功: {email}")
 
     def _worker_loop(self, worker_id, total, task_queue):
