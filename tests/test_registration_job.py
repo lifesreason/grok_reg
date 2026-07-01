@@ -932,5 +932,16 @@ def test_web_console_places_menu_on_left_side():
     assert 'class="main-panel"' in html
     assert html.index('class="side-nav"') < html.index('class="main-panel"')
     assert ".app-layout" in css
-    assert "grid-template-columns: 220px minmax(0, 1fr)" in css
+    assert "grid-template-columns: 176px minmax(0, 1fr)" in css
     assert ".side-nav" in css
+
+
+def test_web_console_uses_roomier_operational_layout():
+    css = Path("static/app.css").read_text(encoding="utf-8")
+
+    assert "width: min(1680px, calc(100vw - 24px))" in css
+    assert "grid-template-columns: 176px minmax(0, 1fr)" in css
+    assert "grid-template-columns: minmax(0, 1fr) 220px" in css
+    assert "grid-template-columns: repeat(auto-fit, minmax(240px, 1fr))" in css
+    assert "grid-column: 1 / -1" in css
+    assert "min-width: 1120px" in css
