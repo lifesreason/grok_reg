@@ -120,6 +120,35 @@ def import_accounts_to_sub2api(payload: dict):
     }
 
 
+@app.post("/api/accounts/import/grok2api")
+def import_accounts_to_grok2api(payload: dict):
+    settings = merge_sensitive_values(payload)
+    account_ids = payload.get("account_ids") or []
+    accounts = reg.find_registered_accounts(account_ids)
+    if not accounts:
+        raise HTTPException(status_code=404, detail="未找到选中的账号")
+    try:
+        result = reg.import_accounts_to_grok2api(accounts, settings)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"导入 grok2api 失败: {exc}")
+    reg.persist_grok2api_push_status(accounts, result)
+    accounts = reg.find_registered_accounts(account_ids)
+    total = int(result.get("total") or len(accounts))
+    failed = int(result.get("failed") or 0)
+    status = "partial_failed" if failed else "pushed"
+    message = f"已推送到 grok2api：{total} 个账号"
+    if failed:
+        message = f"grok2api 推送完成：成功 {total} 个，失败 {failed} 个"
+    return {
+        **result,
+        "status": status,
+        "message": message,
+        "accounts": [public_account(account) for account in accounts],
+    }
+
+
 @app.post("/api/jobs/start")
 def start_job(payload: dict):
     global _active_job_id

@@ -318,6 +318,109 @@ def test_list_registered_accounts_merges_persisted_sub2api_status(monkeypatch, t
     assert refreshed["sub2api_response"]["id"] == 101
 
 
+def test_list_registered_accounts_merges_persisted_grok2api_status(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    tmp_path.joinpath("accounts_20260630_140000_job.txt").write_text(
+        "user@example.com----Pass----sso-token----refresh-token\n",
+        encoding="utf-8",
+    )
+    account = reg.list_registered_accounts()[0]
+
+    reg.persist_grok2api_push_status(
+        [account],
+        {"items": [{"email": account["email"], "response": {"pool": "basic"}}]},
+    )
+
+    refreshed = reg.list_registered_accounts()[0]
+    assert refreshed["grok2api_status"] == "pushed"
+    assert refreshed["grok2api_status_text"] == "已推送"
+    assert refreshed["grok2api_response"]["pool"] == "basic"
+
+
+def test_account_push_statuses_do_not_overwrite_each_other(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    tmp_path.joinpath("accounts_20260630_140000_job.txt").write_text(
+        "user@example.com----Pass----sso-token----refresh-token\n",
+        encoding="utf-8",
+    )
+    account = reg.list_registered_accounts()[0]
+
+    reg.persist_grok2api_push_status([account], {"items": [{"response": {"pool": "basic"}}]})
+    reg.persist_sub2api_push_status([account], {"items": [{"response": {"id": 101}}]})
+
+    refreshed = reg.list_registered_accounts()[0]
+    assert refreshed["grok2api_status"] == "pushed"
+    assert refreshed["sub2api_status"] == "pushed"
+    assert refreshed["grok2api_response"]["pool"] == "basic"
+    assert refreshed["sub2api_response"]["id"] == 101
+
+
+def test_import_accounts_to_grok2api_posts_sso_tokens_to_admin_api(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+        text = '{"ok":true}'
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"ok": True}
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs))
+        return FakeResponse()
+
+    monkeypatch.setattr(reg, "http_post", fake_post)
+
+    result = reg.import_accounts_to_grok2api(
+        [
+            {"email": "user1@example.com", "sso": "sso-token-1"},
+            {"email": "user2@example.com", "sso": "sso=sso-token-2"},
+        ],
+        {
+            "grok2api_remote_base": "http://grok2api.example",
+            "grok2api_remote_app_key": "app-key",
+            "grok2api_pool_name": "ssoBasic",
+        },
+    )
+
+    assert result["imported"] is True
+    assert result["total"] == 2
+    assert calls[0][0] == "http://grok2api.example/admin/api/tokens/add"
+    assert calls[0][1]["params"]["app_key"] == "app-key"
+    assert calls[0][1]["json"] == {
+        "tokens": ["sso-token-1", "sso-token-2"],
+        "pool": "basic",
+        "tags": ["auto-register"],
+    }
+
+
+def test_add_token_to_grok2api_remote_pool_uses_admin_api(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+        text = "{}"
+
+        def raise_for_status(self):
+            return None
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs))
+        return FakeResponse()
+
+    monkeypatch.setattr(reg, "http_post", fake_post)
+    monkeypatch.setitem(reg.config, "grok2api_remote_base", "http://grok2api.example")
+    monkeypatch.setitem(reg.config, "grok2api_remote_app_key", "app-key")
+    monkeypatch.setitem(reg.config, "grok2api_pool_name", "ssoSuper")
+
+    assert reg.add_token_to_grok2api_remote_pool("sso=token-value") is True
+    assert calls[0][0] == "http://grok2api.example/admin/api/tokens/add"
+    assert calls[0][1]["json"]["pool"] == "super"
+
+
 def test_import_accounts_to_sub2api_requires_refresh_token(monkeypatch):
     calls = []
     monkeypatch.setattr(reg, "http_post", lambda *args, **kwargs: calls.append((args, kwargs)))
@@ -936,6 +1039,18 @@ def test_web_console_places_menu_on_left_side():
     assert ".side-nav" in css
 
 
+def test_web_console_exposes_grok2api_push_action():
+    html = Path("templates/index.html").read_text(encoding="utf-8")
+    js = Path("static/app.js").read_text(encoding="utf-8")
+
+    assert 'id="importGrok2apiBtn"' in html
+    assert "<th>grok2api</th>" in html
+    assert "<th>sub2api</th>" in html
+    assert "/api/accounts/import/grok2api" in js
+    assert "accountGrok2apiPushStatus" in js
+    assert "可推送到 grok2api" in js
+
+
 def test_web_console_uses_roomier_operational_layout():
     css = Path("static/app.css").read_text(encoding="utf-8")
 
@@ -944,4 +1059,4 @@ def test_web_console_uses_roomier_operational_layout():
     assert "grid-template-columns: minmax(0, 1fr) 220px" in css
     assert "grid-template-columns: repeat(auto-fit, minmax(240px, 1fr))" in css
     assert "grid-column: 1 / -1" in css
-    assert "min-width: 1120px" in css
+    assert "min-width: 1240px" in css

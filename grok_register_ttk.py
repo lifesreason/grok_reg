@@ -482,6 +482,15 @@ def attach_account_status(account, statuses=None):
         account["sub2api_response"] = record.get("sub2api_response")
     if record.get("sub2api_error"):
         account["sub2api_error"] = record.get("sub2api_error")
+    grok2api_status = str(record.get("grok2api_status") or "not_pushed").strip() or "not_pushed"
+    account["grok2api_status"] = grok2api_status
+    account["grok2api_status_text"] = str(record.get("grok2api_status_text") or account_status_text(grok2api_status))
+    if record.get("grok2api_pushed_at"):
+        account["grok2api_pushed_at"] = record.get("grok2api_pushed_at")
+    if "grok2api_response" in record:
+        account["grok2api_response"] = record.get("grok2api_response")
+    if record.get("grok2api_error"):
+        account["grok2api_error"] = record.get("grok2api_error")
     return account
 
 
@@ -550,29 +559,81 @@ def persist_sub2api_push_status(accounts, result):
         account_id = str(account.get("id") or "").strip()
         if not account_id:
             continue
+        record = statuses.get(account_id)
+        if not isinstance(record, dict):
+            record = {}
         item = items[index] if index < len(items) and isinstance(items[index], dict) else {}
         item_status = str(item.get("status") or "pushed").strip().lower()
         if item_status == "failed":
-            statuses[account_id] = {
-                "sub2api_status": "failed",
-                "sub2api_status_text": f"失败：{str(item.get('error') or '')[:220]}",
-                "sub2api_failed_at": now,
-                "sub2api_error": str(item.get("error") or ""),
-                "sub2api_step": str(item.get("step") or ""),
-                "email": account.get("email", ""),
-                "source_file": account.get("source_file", ""),
-                "line_no": account.get("line_no", ""),
-            }
+            record.update(
+                {
+                    "sub2api_status": "failed",
+                    "sub2api_status_text": f"失败：{str(item.get('error') or '')[:220]}",
+                    "sub2api_failed_at": now,
+                    "sub2api_error": str(item.get("error") or ""),
+                    "sub2api_step": str(item.get("step") or ""),
+                    "email": account.get("email", ""),
+                    "source_file": account.get("source_file", ""),
+                    "line_no": account.get("line_no", ""),
+                }
+            )
         else:
-            statuses[account_id] = {
-                "sub2api_status": "pushed",
-                "sub2api_status_text": "已推送",
-                "sub2api_pushed_at": now,
-                "sub2api_response": item.get("response", item),
-                "email": account.get("email", ""),
-                "source_file": account.get("source_file", ""),
-                "line_no": account.get("line_no", ""),
-            }
+            record.update(
+                {
+                    "sub2api_status": "pushed",
+                    "sub2api_status_text": "已推送",
+                    "sub2api_pushed_at": now,
+                    "sub2api_response": item.get("response", item),
+                    "email": account.get("email", ""),
+                    "source_file": account.get("source_file", ""),
+                    "line_no": account.get("line_no", ""),
+                }
+            )
+        statuses[account_id] = record
+    save_account_statuses(statuses)
+    return statuses
+
+
+def persist_grok2api_push_status(accounts, result):
+    statuses = load_account_statuses()
+    items = result.get("items") if isinstance(result, dict) else []
+    if not isinstance(items, list):
+        items = []
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    for index, account in enumerate(accounts or []):
+        account_id = str(account.get("id") or "").strip()
+        if not account_id:
+            continue
+        record = statuses.get(account_id)
+        if not isinstance(record, dict):
+            record = {}
+        item = items[index] if index < len(items) and isinstance(items[index], dict) else {}
+        item_status = str(item.get("status") or "pushed").strip().lower()
+        if item_status == "failed":
+            record.update(
+                {
+                    "grok2api_status": "failed",
+                    "grok2api_status_text": f"失败：{str(item.get('error') or '')[:220]}",
+                    "grok2api_failed_at": now,
+                    "grok2api_error": str(item.get("error") or ""),
+                    "email": account.get("email", ""),
+                    "source_file": account.get("source_file", ""),
+                    "line_no": account.get("line_no", ""),
+                }
+            )
+        else:
+            record.update(
+                {
+                    "grok2api_status": "pushed",
+                    "grok2api_status_text": "已推送",
+                    "grok2api_pushed_at": now,
+                    "grok2api_response": item.get("response", item),
+                    "email": account.get("email", ""),
+                    "source_file": account.get("source_file", ""),
+                    "line_no": account.get("line_no", ""),
+                }
+            )
+        statuses[account_id] = record
     save_account_statuses(statuses)
     return statuses
 
@@ -642,6 +703,114 @@ def _sub2api_response_data(resp):
     if isinstance(payload, dict) and "data" in payload:
         return payload.get("data")
     return payload
+
+
+def _grok2api_admin_base(settings=None):
+    settings = {**config, **dict(settings or {})}
+    base = str(settings.get("grok2api_remote_base") or "").strip().rstrip("/")
+    if not base:
+        raise ValueError("grok2api 远端 Base 未配置")
+    if base.endswith("/admin/api"):
+        return base
+    if base.endswith("/admin"):
+        return f"{base}/api"
+    return f"{base}/admin/api"
+
+
+def _grok2api_pool_name(settings=None):
+    settings = {**config, **dict(settings or {})}
+    pool_name = str(settings.get("grok2api_pool_name", "ssoBasic") or "ssoBasic").strip() or "ssoBasic"
+    pool_map = {"ssoBasic": "basic", "ssoSuper": "super"}
+    return pool_map.get(pool_name, pool_name)
+
+
+def _grok2api_auth(settings=None):
+    settings = {**config, **dict(settings or {})}
+    app_key = str(settings.get("grok2api_remote_app_key") or "").strip()
+    if not app_key:
+        raise ValueError("grok2api 远端 app_key 未配置")
+    return {"Content-Type": "application/json"}, {"app_key": app_key}
+
+
+def _grok2api_response_data(resp):
+    resp.raise_for_status()
+    try:
+        payload = resp.json()
+    except Exception:
+        return {"raw": resp.text[:1000]}
+    if isinstance(payload, dict) and "code" in payload and payload.get("code") not in (0, 200, "0", "200", None):
+        message = payload.get("message") or payload.get("msg") or payload.get("error") or payload
+        raise Exception(f"grok2api 返回错误: {message}")
+    return payload
+
+
+def import_accounts_to_grok2api(accounts, settings=None, log_callback=None):
+    settings = {**config, **dict(settings or {})}
+    base = _grok2api_admin_base(settings)
+    headers, params = _grok2api_auth(settings)
+    pool = _grok2api_pool_name(settings)
+    valid_accounts = []
+    missing = []
+    for account in accounts or []:
+        token = _normalize_sso_token(account.get("sso", ""))
+        if token:
+            item = dict(account)
+            item["sso"] = token
+            valid_accounts.append(item)
+        else:
+            missing.append(str(account.get("email") or account.get("id") or "").strip())
+    if not valid_accounts:
+        raise ValueError("没有可推送的账号：选中账号缺少 sso token")
+    if missing:
+        missing = [item for item in missing if item]
+        raise ValueError(f"账号 {', '.join(missing)} 缺少 sso token，不能推送到 grok2api")
+
+    tokens = [account["sso"] for account in valid_accounts]
+    payload = {"tokens": tokens, "pool": pool, "tags": ["auto-register"]}
+    items = []
+    try:
+        response = _grok2api_response_data(
+            http_post(
+                f"{base}/tokens/add",
+                headers=headers,
+                params=params,
+                json=payload,
+                timeout=30,
+                proxies={},
+            )
+        )
+        for account in valid_accounts:
+            items.append(
+                {
+                    "email": account.get("email", ""),
+                    "status": "pushed",
+                    "response": {"pool": pool, "result": response},
+                }
+            )
+    except Exception as exc:
+        error_text = _sub2api_error_text(exc, step="grok2api")
+        for account in valid_accounts:
+            items.append(
+                {
+                    "email": account.get("email", ""),
+                    "status": "failed",
+                    "error": error_text,
+                }
+            )
+        if log_callback:
+            log_callback(f"[!] 推送 grok2api 失败: {error_text}")
+
+    success_count = len([item for item in items if item.get("status") == "pushed"])
+    failed_count = len(items) - success_count
+    if log_callback:
+        log_callback(f"[+] grok2api 推送完成: 成功 {success_count} / 失败 {failed_count}")
+    return {
+        "imported": failed_count == 0,
+        "total": success_count,
+        "failed": failed_count,
+        "items": items,
+        "warning": "已按 SSO token 导入 grok2api 远端池。",
+    }
 
 
 def _sub2api_account_name(account, settings=None, index=1):
@@ -837,17 +1006,15 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
     token = _normalize_sso_token(raw_token)
     if not token:
         return False
-    base = str(config.get("grok2api_remote_base", "") or "").strip().rstrip("/")
-    app_key = str(config.get("grok2api_remote_app_key", "") or "").strip()
-    pool_name = str(config.get("grok2api_pool_name", "ssoBasic") or "ssoBasic").strip() or "ssoBasic"
-    if not base or not app_key:
+    try:
+        base = _grok2api_admin_base(config)
+        headers, query = _grok2api_auth(config)
+    except ValueError:
         if log_callback:
             log_callback("[Debug] grok2api 远端未配置 base/app_key，跳过")
         return False
-    headers = {"Content-Type": "application/json"}
-    query = {"app_key": app_key}
-    pool_map = {"ssoBasic": "basic", "ssoSuper": "super"}
-    remote_pool = pool_map.get(pool_name, "basic")
+    pool_name = str(config.get("grok2api_pool_name", "ssoBasic") or "ssoBasic").strip() or "ssoBasic"
+    remote_pool = _grok2api_pool_name(config)
     # 优先使用 add 接口，避免全量覆盖远端池
     try:
         add_payload = {"tokens": [token], "pool": remote_pool, "tags": ["auto-register"]}

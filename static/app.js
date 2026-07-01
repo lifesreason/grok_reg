@@ -7,6 +7,7 @@ const logBox = document.querySelector("#logBox");
 const startBtn = document.querySelector("#startBtn");
 const stopBtn = document.querySelector("#stopBtn");
 const refreshAccountsBtn = document.querySelector("#refreshAccountsBtn");
+const importGrok2apiBtn = document.querySelector("#importGrok2apiBtn");
 const importSub2apiBtn = document.querySelector("#importSub2apiBtn");
 const accountsBody = document.querySelector("#accountsBody");
 const accountsSummary = document.querySelector("#accountsSummary");
@@ -18,7 +19,9 @@ let logOffset = 0;
 let pollTimer = null;
 let accounts = [];
 let accountPushStatus = {};
+let accountGrok2apiPushStatus = {};
 let pushingToSub2api = false;
+let pushingToGrok2api = false;
 
 function setMessage(text) {
   message.textContent = text || "";
@@ -151,7 +154,7 @@ function renderAccounts() {
   accountsSummary.textContent = `共 ${accounts.length} 个账号`;
   if (!accounts.length) {
     const row = document.createElement("tr");
-    row.innerHTML = '<td colspan="8" class="empty">暂无账号，注册成功后会出现在这里</td>';
+    row.innerHTML = '<td colspan="9" class="empty">暂无账号，注册成功后会出现在这里</td>';
     accountsBody.appendChild(row);
     return;
   }
@@ -162,17 +165,17 @@ function renderAccounts() {
     checkbox.className = "account-check";
     checkbox.type = "checkbox";
     checkbox.value = account.id;
-    checkbox.disabled = !account.has_refresh_token;
-    if (!account.has_refresh_token) {
-      checkbox.title = "缺少 Refresh Token，不能推送到 sub2api";
-    }
+    checkbox.disabled = false;
+    checkbox.title = account.has_refresh_token ? "" : "可推送到 grok2api；缺少 Refresh Token 时不能推送到 sub2api";
     checkCell.appendChild(checkbox);
     row.appendChild(checkCell);
     const refreshStatus = account.has_refresh_token
       ? `已保存 ${account.refresh_token_preview || ""}`.trim()
       : "缺少";
-    const persistedPushStatus = account.sub2api_status_text || (account.sub2api_status === "pushed" ? "已推送" : "未推送");
-    const pushStatus = accountPushStatus[account.id] || persistedPushStatus;
+    const persistedGrok2apiStatus = account.grok2api_status_text || (account.grok2api_status === "pushed" ? "已推送" : "未推送");
+    const grok2apiStatus = accountGrok2apiPushStatus[account.id] || persistedGrok2apiStatus;
+    const persistedSub2apiStatus = account.sub2api_status_text || (account.sub2api_status === "pushed" ? "已推送" : "未推送");
+    const sub2apiStatus = accountPushStatus[account.id] || persistedSub2apiStatus;
     for (const value of [
       account.email,
       account.sso_preview || "",
@@ -180,7 +183,8 @@ function renderAccounts() {
       account.source_file || "",
       account.line_no || "",
       account.password ? "已保存" : "-",
-      pushStatus,
+      grok2apiStatus,
+      sub2apiStatus,
     ]) {
       const cell = document.createElement("td");
       cell.textContent = String(value ?? "");
@@ -200,7 +204,10 @@ async function loadAccounts() {
 }
 
 async function importSelectedToSub2api() {
-  const accountIds = selectedAccountIds();
+  const accountIds = selectedAccountIds().filter((id) => {
+    const account = accounts.find((item) => item.id === id);
+    return account?.has_refresh_token;
+  });
   if (!accountIds.length) {
     setMessage("请选择带 Refresh Token 的账号再推送");
     return;
@@ -245,6 +252,52 @@ async function importSelectedToSub2api() {
   }
 }
 
+async function importSelectedToGrok2api() {
+  const accountIds = selectedAccountIds();
+  if (!accountIds.length) {
+    setMessage("请选择账号再推送到 grok2api");
+    return;
+  }
+  pushingToGrok2api = true;
+  importGrok2apiBtn.disabled = true;
+  importGrok2apiBtn.textContent = `推送中 ${accountIds.length} 个...`;
+  accountIds.forEach((id) => {
+    accountGrok2apiPushStatus[id] = "推送中";
+  });
+  renderAccounts();
+  setMessage(`开始推送到 grok2api：${accountIds.length} 个账号`);
+  const payload = { ...formPayload(), account_ids: accountIds };
+  try {
+    const result = await requestJson("/api/accounts/import/grok2api", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    if (Array.isArray(result.accounts)) {
+      const returned = new Map(result.accounts.map((account) => [account.id, account]));
+      accounts = accounts.map((account) => returned.get(account.id) || account);
+      accountIds.forEach((id) => {
+        const account = returned.get(id);
+        accountGrok2apiPushStatus[id] = account?.grok2api_status_text || (account?.grok2api_status === "pushed" ? "已推送" : "未推送");
+      });
+    } else {
+      accountIds.forEach((id) => {
+        accountGrok2apiPushStatus[id] = result.status === "partial_failed" ? "失败：请刷新查看详情" : "已推送";
+      });
+    }
+    setMessage(`${result.message || `已推送到 grok2api：${result.total} 个账号`}。${result.warning || ""}`);
+  } catch (error) {
+    accountIds.forEach((id) => {
+      accountGrok2apiPushStatus[id] = `失败：${error.message}`;
+    });
+    setMessage(`推送 grok2api 失败：${error.message}`);
+  } finally {
+    pushingToGrok2api = false;
+    importGrok2apiBtn.disabled = false;
+    importGrok2apiBtn.textContent = "推送到 grok2api";
+    renderAccounts();
+  }
+}
+
 function startPolling() {
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(() => {
@@ -271,6 +324,10 @@ refreshAccountsBtn.addEventListener("click", () => {
 
 importSub2apiBtn.addEventListener("click", () => {
   importSelectedToSub2api().catch((error) => setMessage(error.message));
+});
+
+importGrok2apiBtn.addEventListener("click", () => {
+  importSelectedToGrok2api().catch((error) => setMessage(error.message));
 });
 
 tabButtons.forEach((button) => {
