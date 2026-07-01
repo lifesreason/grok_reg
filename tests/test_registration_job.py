@@ -1184,6 +1184,15 @@ def test_web_console_exposes_account_table_controls():
     assert "renderPagination" in js
 
 
+def test_web_console_displays_continuous_account_row_number():
+    js = Path("static/app.js").read_text(encoding="utf-8")
+
+    assert '{ key: "index", label: "序号" }' in js
+    assert "accountCellValue(account, column.key, rowNumber)" in js
+    assert "index: rowNumber" in js
+    assert "line: account.line_no" not in js
+
+
 def test_web_console_uses_roomier_operational_layout():
     css = Path("static/app.css").read_text(encoding="utf-8")
 

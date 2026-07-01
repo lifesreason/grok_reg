@@ -26,7 +26,7 @@ const ACCOUNT_COLUMNS = [
   { key: "sso", label: "SSO 摘要", className: "token-column" },
   { key: "refresh", label: "Refresh Token", className: "token-column" },
   { key: "source", label: "来源文件", className: "source-column" },
-  { key: "line", label: "行号" },
+  { key: "index", label: "序号" },
   { key: "password", label: "密码" },
   { key: "grok2api", label: "grok2api" },
   { key: "sub2api", label: "sub2api" },
@@ -176,7 +176,9 @@ function loadAccountTablePrefs() {
     const saved = JSON.parse(localStorage.getItem(ACCOUNT_TABLE_PREFS_KEY) || "{}");
     const allowedColumns = new Set(ACCOUNT_COLUMNS.map((column) => column.key));
     const visibleColumns = Array.isArray(saved.visibleColumns)
-      ? saved.visibleColumns.filter((key) => allowedColumns.has(key))
+      ? saved.visibleColumns
+          .map((key) => (key === "line" ? "index" : key))
+          .filter((key) => allowedColumns.has(key))
       : DEFAULT_ACCOUNT_TABLE_PREFS.visibleColumns;
     const pageSize = [10, 20, 50, 100].includes(Number(saved.pageSize))
       ? Number(saved.pageSize)
@@ -245,7 +247,7 @@ function renderAccountsHead() {
   accountsHead.appendChild(row);
 }
 
-function accountCellValue(account, key) {
+function accountCellValue(account, key, rowNumber) {
   const refreshStatus = account.has_refresh_token
     ? `已保存 ${account.refresh_token_preview || ""}`.trim()
     : "缺少";
@@ -258,7 +260,7 @@ function accountCellValue(account, key) {
     sso: account.sso_preview || "",
     refresh: refreshStatus,
     source: account.source_file || "",
-    line: account.line_no || "",
+    index: rowNumber,
     password: account.password ? "已保存" : "-",
     grok2api: grok2apiStatus,
     sub2api: sub2apiStatus,
@@ -331,7 +333,9 @@ function renderAccounts() {
     renderPagination();
     return;
   }
-  for (const account of currentPageAccounts()) {
+  const pageAccounts = currentPageAccounts();
+  for (const [pageIndex, account] of pageAccounts.entries()) {
+    const rowNumber = (accountPage - 1) * accountTablePrefs.pageSize + pageIndex + 1;
     const row = document.createElement("tr");
     for (const column of visibleAccountColumns()) {
       const cell = document.createElement("td");
@@ -352,7 +356,7 @@ function renderAccounts() {
         row.appendChild(cell);
         continue;
       }
-      const value = accountCellValue(account, column.key);
+      const value = accountCellValue(account, column.key, rowNumber);
       cell.textContent = String(value ?? "");
       if (column.className) cell.classList.add(column.className);
       if (value === "已推送") cell.classList.add("push-ok");
