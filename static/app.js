@@ -9,10 +9,10 @@ const stopBtn = document.querySelector("#stopBtn");
 const refreshAccountsBtn = document.querySelector("#refreshAccountsBtn");
 const importGrok2apiBtn = document.querySelector("#importGrok2apiBtn");
 const importSub2apiBtn = document.querySelector("#importSub2apiBtn");
+const selectPageAccounts = document.querySelector("#selectPageAccounts");
 const accountPageSize = document.querySelector("#accountPageSize");
 const accountColumnOptions = document.querySelector("#accountColumnOptions");
-const accountPaginationTop = document.querySelector("#accountPaginationTop");
-const accountPaginationBottom = document.querySelector("#accountPaginationBottom");
+const accountPagination = document.querySelector("#accountPagination");
 const accountsHead = document.querySelector("#accountsHead");
 const accountsBody = document.querySelector("#accountsBody");
 const accountsSummary = document.querySelector("#accountsSummary");
@@ -33,7 +33,7 @@ const ACCOUNT_COLUMNS = [
 ];
 const DEFAULT_ACCOUNT_TABLE_PREFS = {
   visibleColumns: ACCOUNT_COLUMNS.map((column) => column.key),
-  pageSize: 10,
+  pageSize: 20,
 };
 
 let currentJobId = null;
@@ -43,7 +43,6 @@ let accounts = [];
 let accountPage = 1;
 let accountTablePrefs = loadAccountTablePrefs();
 let selectedAccountIdsSet = new Set();
-let selectPageAccounts = null;
 let accountPushStatus = {};
 let accountGrok2apiPushStatus = {};
 let pushingToSub2api = false;
@@ -240,30 +239,12 @@ function renderAccountsHead() {
   const row = document.createElement("tr");
   for (const column of visibleAccountColumns()) {
     const cell = document.createElement("th");
-    if (column.key === "select") {
-      const checkbox = document.createElement("input");
-      checkbox.id = "selectPageAccounts";
-      checkbox.className = "account-check select-page-check";
-      checkbox.type = "checkbox";
-      checkbox.setAttribute("aria-label", "当页全选");
-      checkbox.title = "当页全选";
-      checkbox.addEventListener("change", () => {
-        for (const account of currentPageAccounts()) {
-          if (checkbox.checked) selectedAccountIdsSet.add(account.id);
-          else selectedAccountIdsSet.delete(account.id);
-        }
-        renderAccounts();
-      });
-      cell.appendChild(checkbox);
-    } else {
-      cell.textContent = column.label;
-    }
+    cell.textContent = column.label;
     if (column.className) cell.className = column.className;
     row.appendChild(cell);
   }
   accountsHead.innerHTML = "";
   accountsHead.appendChild(row);
-  selectPageAccounts = document.querySelector("#selectPageAccounts");
 }
 
 function accountCellValue(account, key, rowNumber) {
@@ -296,14 +277,16 @@ function syncSelectPageAccounts() {
   selectPageAccounts.disabled = pageAccounts.length === 0;
 }
 
-function renderPaginationControl(container) {
+function renderPagination() {
+  if (!accountPagination) return;
+  accountPagination.innerHTML = "";
   const totalPages = accountTotalPages();
   const start = accounts.length ? (accountPage - 1) * accountTablePrefs.pageSize + 1 : 0;
   const end = Math.min(accounts.length, accountPage * accountTablePrefs.pageSize);
   const summary = document.createElement("span");
   summary.className = "pagination-summary";
   summary.textContent = `${start}-${end} / ${accounts.length}`;
-  container.appendChild(summary);
+  accountPagination.appendChild(summary);
 
   const prevButton = document.createElement("button");
   prevButton.type = "button";
@@ -314,12 +297,12 @@ function renderPaginationControl(container) {
     accountPage -= 1;
     renderAccounts();
   });
-  container.appendChild(prevButton);
+  accountPagination.appendChild(prevButton);
 
   const pageText = document.createElement("span");
   pageText.className = "page-current";
   pageText.textContent = `${accountPage} / ${totalPages}`;
-  container.appendChild(pageText);
+  accountPagination.appendChild(pageText);
 
   const nextButton = document.createElement("button");
   nextButton.type = "button";
@@ -330,14 +313,7 @@ function renderPaginationControl(container) {
     accountPage += 1;
     renderAccounts();
   });
-  container.appendChild(nextButton);
-}
-
-function renderPagination() {
-  for (const container of [accountPaginationTop, accountPaginationBottom].filter(Boolean)) {
-    container.innerHTML = "";
-    renderPaginationControl(container);
-  }
+  accountPagination.appendChild(nextButton);
 }
 
 function renderAccounts() {
@@ -517,6 +493,14 @@ stopBtn.addEventListener("click", () => {
 
 refreshAccountsBtn.addEventListener("click", () => {
   loadAccounts().catch((error) => setMessage(error.message));
+});
+
+selectPageAccounts.addEventListener("change", () => {
+  for (const account of currentPageAccounts()) {
+    if (selectPageAccounts.checked) selectedAccountIdsSet.add(account.id);
+    else selectedAccountIdsSet.delete(account.id);
+  }
+  renderAccounts();
 });
 
 accountPageSize.addEventListener("change", () => {

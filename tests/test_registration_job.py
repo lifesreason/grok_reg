@@ -1171,35 +1171,17 @@ def test_web_console_exposes_account_table_controls():
     html = Path("templates/index.html").read_text(encoding="utf-8")
     js = Path("static/app.js").read_text(encoding="utf-8")
 
+    assert 'id="selectPageAccounts"' in html
     assert 'id="accountPageSize"' in html
-    assert 'id="accountColumnOptions"' in html
-    assert 'id="accountPaginationTop"' in html
-    assert 'id="accountPaginationBottom"' in html
+    assert 'id="accountColumnsPanel"' in html
+    assert 'id="accountPagination"' in html
     assert 'id="accountsHead"' in html
     assert 'data-column-toggle' in js
-    assert 'id = "selectPageAccounts"' in js
-    assert 'aria-label", "当页全选"' in js
     assert "localStorage" in js
     assert "grok-reg.accounts.table" in js
     assert "ACCOUNT_COLUMNS" in js
     assert "selectedAccountIdsSet" in js
     assert "renderPagination" in js
-    assert "DEFAULT_ACCOUNT_TABLE_PREFS" in js
-    assert "pageSize: 10" in js
-
-
-def test_web_console_column_controls_are_visible_field_toggles():
-    html = Path("templates/index.html").read_text(encoding="utf-8")
-    js = Path("static/app.js").read_text(encoding="utf-8")
-    css = Path("static/app.css").read_text(encoding="utf-8")
-
-    assert "<details" not in html
-    assert "<summary>列显示</summary>" not in html
-    assert "字段显示" in html
-    assert "accountColumnOptions" in html
-    assert "accountColumnsPanel" not in html
-    assert "renderAccountColumns" in js
-    assert ".column-options" in css
 
 
 def test_web_console_displays_continuous_account_row_number():

@@ -340,7 +340,6 @@ button:disabled {
   flex-wrap: wrap;
   gap: 10px;
   align-items: center;
-  justify-content: space-between;
   padding: 0 16px 14px;
 }
 
@@ -369,24 +368,39 @@ label.compact input {
 }
 
 .column-menu {
-  display: flex;
-  flex: 1 1 520px;
-  flex-wrap: wrap;
-  gap: 8px;
-  align-items: center;
-  justify-content: flex-end;
+  position: relative;
 }
 
-.toolbar-label {
-  color: var(--muted);
+.column-menu summary {
+  min-height: 42px;
+  padding: 11px 13px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--text);
+  background: rgba(5, 8, 6, 0.48);
+  cursor: pointer;
   font-size: 13px;
+  font-weight: 700;
+  list-style: none;
+}
+
+.column-menu summary::-webkit-details-marker {
+  display: none;
 }
 
 .column-options {
-  display: flex;
-  flex-wrap: wrap;
+  position: absolute;
+  z-index: 5;
+  top: calc(100% + 8px);
+  right: 0;
+  display: grid;
+  min-width: 210px;
   gap: 8px;
-  align-items: center;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel-strong);
+  box-shadow: var(--shadow);
 }
 
 .table-wrap {
@@ -447,11 +461,6 @@ td.empty {
   width: auto;
 }
 
-.select-page-check {
-  display: block;
-  margin: 0 auto;
-}
-
 .pagination {
   display: flex;
   flex-wrap: wrap;
@@ -460,12 +469,6 @@ td.empty {
   justify-content: flex-end;
   padding: 12px 16px 16px;
   border-top: 1px solid rgba(196, 255, 215, 0.1);
-}
-
-.pagination-top {
-  justify-content: space-between;
-  padding-top: 10px;
-  padding-bottom: 10px;
 }
 
 .pagination-summary,
@@ -590,8 +593,8 @@ td.empty {
     width: 100%;
   }
 
-  .column-menu,
   .column-options {
-    justify-content: flex-start;
+    position: static;
+    margin-top: 8px;
   }
 }
