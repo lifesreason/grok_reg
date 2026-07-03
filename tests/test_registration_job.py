@@ -1279,6 +1279,23 @@ def test_web_console_places_menu_on_left_side():
     assert ".side-nav" in css
 
 
+def test_web_console_exposes_dashboard_tab():
+    html = Path("templates/index.html").read_text(encoding="utf-8")
+    css = Path("static/app.css").read_text(encoding="utf-8")
+    js = Path("static/app.js").read_text(encoding="utf-8")
+
+    assert 'data-tab-target="dashboard"' in html
+    assert 'id="tab-dashboard"' in html
+    assert 'id="dashboardTotalAccounts"' in html
+    assert 'id="dashboardPipeline"' in html
+    assert 'id="dashboardHealthMix"' in html
+    assert 'id="dashboardSources"' in html
+    assert "renderDashboard" in js
+    assert "dashboardMetricValue" in js
+    assert ".dashboard-hero" in css
+    assert ".flow-step" in css
+
+
 def test_web_console_exposes_grok2api_push_action():
     html = Path("templates/index.html").read_text(encoding="utf-8")
     js = Path("static/app.js").read_text(encoding="utf-8")

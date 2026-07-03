@@ -10,6 +10,16 @@ const refreshAccountsBtn = document.querySelector("#refreshAccountsBtn");
 const checkHealthBtn = document.querySelector("#checkHealthBtn");
 const importGrok2apiBtn = document.querySelector("#importGrok2apiBtn");
 const importSub2apiBtn = document.querySelector("#importSub2apiBtn");
+const dashboardStatusText = document.querySelector("#dashboardStatusText");
+const dashboardRunNote = document.querySelector("#dashboardRunNote");
+const dashboardTotalAccounts = document.querySelector("#dashboardTotalAccounts");
+const dashboardRefreshAccounts = document.querySelector("#dashboardRefreshAccounts");
+const dashboardHealthyAccounts = document.querySelector("#dashboardHealthyAccounts");
+const dashboardNeedActionAccounts = document.querySelector("#dashboardNeedActionAccounts");
+const dashboardPipeline = document.querySelector("#dashboardPipeline");
+const dashboardHealthMix = document.querySelector("#dashboardHealthMix");
+const dashboardPushMix = document.querySelector("#dashboardPushMix");
+const dashboardSources = document.querySelector("#dashboardSources");
 const selectPageAccounts = document.querySelector("#selectPageAccounts");
 const accountPageSize = document.querySelector("#accountPageSize");
 const accountColumnOptions = document.querySelector("#accountColumnOptions");
@@ -66,7 +76,7 @@ function activateTab(name) {
   tabPanels.forEach((panel) => {
     panel.classList.toggle("active", panel.dataset.tabPanel === name);
   });
-  if (name === "accounts") {
+  if (name === "accounts" || name === "dashboard") {
     loadAccounts().catch((error) => setMessage(error.message));
   }
 }
@@ -174,6 +184,7 @@ async function pollJob() {
     pollTimer = null;
     loadAccounts().catch((error) => setMessage(error.message));
   }
+  renderDashboard();
 }
 
 function loadAccountTablePrefs() {
@@ -278,6 +289,153 @@ function accountCellValue(account, key, rowNumber) {
     sub2api: sub2apiStatus,
   };
   return values[key] ?? "";
+}
+
+function dashboardMetricValue(element, value) {
+  if (!element) return;
+  element.textContent = String(value);
+}
+
+function isFailedStatus(account, prefix) {
+  const status = String(account[`${prefix}_status`] || "").toLowerCase();
+  const text = String(account[`${prefix}_status_text`] || "");
+  return status === "failed" || text.startsWith("失败");
+}
+
+function accountDashboardStats() {
+  const total = accounts.length;
+  const refresh = accounts.filter((account) => account.has_refresh_token).length;
+  const healthy = accounts.filter((account) => account.health_status === "healthy" || account.health_status_text === "可用").length;
+  const unhealthy = accounts.filter((account) => account.health_status === "unhealthy" || account.health_status_text === "失效").length;
+  const incomplete = accounts.filter((account) => account.health_status === "incomplete" || account.health_status_text === "资料不完整").length;
+  const untested = Math.max(0, total - healthy - unhealthy - incomplete);
+  const grok2api = accounts.filter((account) => account.grok2api_status === "pushed" || account.grok2api_status_text === "已推送").length;
+  const sub2api = accounts.filter((account) => account.sub2api_status === "pushed" || account.sub2api_status_text === "已推送").length;
+  const needAction = accounts.filter((account) => {
+    return (
+      !account.has_refresh_token ||
+      account.health_status === "unhealthy" ||
+      account.health_status === "incomplete" ||
+      account.health_status_text === "失效" ||
+      account.health_status_text === "资料不完整" ||
+      isFailedStatus(account, "grok2api") ||
+      isFailedStatus(account, "sub2api")
+    );
+  }).length;
+  return {
+    total,
+    refresh,
+    healthy,
+    unhealthy,
+    incomplete,
+    untested,
+    grok2api,
+    sub2api,
+    needAction,
+  };
+}
+
+function percentText(value, total) {
+  if (!total) return "0%";
+  return `${Math.round((value / total) * 100)}%`;
+}
+
+function renderMixRow(parent, label, value, total, tone = "") {
+  const row = document.createElement("div");
+  row.className = `mix-row ${tone}`.trim();
+  const meta = document.createElement("div");
+  meta.className = "mix-meta";
+  const title = document.createElement("span");
+  title.textContent = label;
+  const count = document.createElement("strong");
+  count.textContent = `${value} / ${total}`;
+  meta.append(title, count);
+  const track = document.createElement("div");
+  track.className = "mix-track";
+  const bar = document.createElement("span");
+  bar.style.width = percentText(value, total);
+  track.appendChild(bar);
+  row.append(meta, track);
+  parent.appendChild(row);
+}
+
+function renderDashboard() {
+  if (!dashboardTotalAccounts) return;
+  const stats = accountDashboardStats();
+  dashboardMetricValue(dashboardTotalAccounts, stats.total);
+  dashboardMetricValue(dashboardRefreshAccounts, stats.refresh);
+  dashboardMetricValue(dashboardHealthyAccounts, stats.healthy);
+  dashboardMetricValue(dashboardNeedActionAccounts, stats.needAction);
+  if (dashboardStatusText) dashboardStatusText.textContent = statusText.textContent || "就绪";
+  if (dashboardRunNote) dashboardRunNote.textContent = statsText.textContent || "成功 0 / 失败 0";
+
+  if (dashboardPipeline) {
+    dashboardPipeline.innerHTML = "";
+    const flow = [
+      ["注册账号", stats.total, "账号池总量"],
+      ["Refresh Token", stats.refresh, "可推送 sub2api"],
+      ["健康可用", stats.healthy, "最近检查通过"],
+      ["grok2api", stats.grok2api, "远端已入池"],
+      ["sub2api", stats.sub2api, "远端已导入"],
+    ];
+    for (const [label, value, caption] of flow) {
+      const step = document.createElement("div");
+      step.className = "flow-step";
+      step.style.setProperty("--flow-percent", percentText(value, stats.total));
+      const name = document.createElement("span");
+      name.textContent = label;
+      const number = document.createElement("strong");
+      number.textContent = String(value);
+      const note = document.createElement("small");
+      note.textContent = `${caption} · ${percentText(value, stats.total)}`;
+      const line = document.createElement("i");
+      step.append(name, number, note, line);
+      dashboardPipeline.appendChild(step);
+    }
+  }
+
+  if (dashboardHealthMix) {
+    dashboardHealthMix.innerHTML = "";
+    renderMixRow(dashboardHealthMix, "可用", stats.healthy, stats.total, "ok");
+    renderMixRow(dashboardHealthMix, "未检查", stats.untested, stats.total);
+    renderMixRow(dashboardHealthMix, "资料不完整", stats.incomplete, stats.total, "warn");
+    renderMixRow(dashboardHealthMix, "失效", stats.unhealthy, stats.total, "bad");
+  }
+
+  if (dashboardPushMix) {
+    dashboardPushMix.innerHTML = "";
+    renderMixRow(dashboardPushMix, "grok2api 已推送", stats.grok2api, stats.total, "ok");
+    renderMixRow(dashboardPushMix, "sub2api 已推送", stats.sub2api, stats.total, "ok");
+    renderMixRow(dashboardPushMix, "Refresh Token 覆盖", stats.refresh, stats.total);
+  }
+
+  if (dashboardSources) {
+    dashboardSources.innerHTML = "";
+    const sourceCounts = new Map();
+    for (const account of accounts) {
+      const source = account.source_file || "未知来源";
+      sourceCounts.set(source, (sourceCounts.get(source) || 0) + 1);
+    }
+    const sources = Array.from(sourceCounts.entries())
+      .sort((a, b) => b[1] - a[1] || b[0].localeCompare(a[0]))
+      .slice(0, 5);
+    if (!sources.length) {
+      const empty = document.createElement("p");
+      empty.className = "dashboard-empty";
+      empty.textContent = "暂无账号批次，注册成功后这里会显示来源文件。";
+      dashboardSources.appendChild(empty);
+    }
+    for (const [source, count] of sources) {
+      const item = document.createElement("div");
+      item.className = "source-item";
+      const name = document.createElement("span");
+      name.textContent = source;
+      const value = document.createElement("strong");
+      value.textContent = `${count} 个`;
+      item.append(name, value);
+      dashboardSources.appendChild(item);
+    }
+  }
 }
 
 function syncSelectPageAccounts() {
@@ -388,6 +546,7 @@ function renderAccounts() {
 async function loadAccounts() {
   const payload = await requestJson("/api/accounts");
   accounts = payload.accounts || [];
+  renderDashboard();
   renderAccounts();
 }
 

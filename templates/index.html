@@ -23,13 +23,80 @@
       <div class="app-layout">
         <nav class="side-nav" aria-label="主功能">
           <p class="section-kicker">菜单</p>
-          <button class="tab-button active" type="button" data-tab-target="register">注册控制台</button>
+          <button class="tab-button active" type="button" data-tab-target="dashboard">运营看板</button>
+          <button class="tab-button" type="button" data-tab-target="register">注册控制台</button>
           <button class="tab-button" type="button" data-tab-target="accounts">账号管理</button>
           <button class="tab-button" type="button" data-tab-target="logs">实时日志</button>
         </nav>
 
         <div class="main-panel">
-          <section id="tab-register" class="tab-panel active" data-tab-panel="register">
+          <section id="tab-dashboard" class="tab-panel active dashboard" data-tab-panel="dashboard">
+            <div class="dashboard-hero">
+              <div class="dashboard-title">
+                <p class="section-kicker">运营看板</p>
+                <h2>账号资产和推送链路</h2>
+                <p>集中查看账号总量、Refresh Token 覆盖、健康状态和两个远端服务的推送进度。</p>
+              </div>
+              <div class="dashboard-live">
+                <span>当前任务</span>
+                <strong id="dashboardStatusText">就绪</strong>
+                <small id="dashboardRunNote">成功 0 / 失败 0</small>
+              </div>
+            </div>
+
+            <div class="dashboard-metrics">
+              <div class="metric-tile metric-primary">
+                <span>账号总量</span>
+                <strong id="dashboardTotalAccounts">0</strong>
+                <small>data 目录已收录账号</small>
+              </div>
+              <div class="metric-tile">
+                <span>Refresh 可用基础</span>
+                <strong id="dashboardRefreshAccounts">0</strong>
+                <small>可推送 sub2api 的账号</small>
+              </div>
+              <div class="metric-tile">
+                <span>健康可用</span>
+                <strong id="dashboardHealthyAccounts">0</strong>
+                <small>最近检查为可用</small>
+              </div>
+              <div class="metric-tile metric-alert">
+                <span>需要处理</span>
+                <strong id="dashboardNeedActionAccounts">0</strong>
+                <small>缺 Refresh / 失效 / 推送失败</small>
+              </div>
+            </div>
+
+            <div class="dashboard-flow" id="dashboardPipeline" aria-label="账号链路状态"></div>
+
+            <div class="dashboard-grid">
+              <section class="dashboard-panel">
+                <div class="panel-head">
+                  <p class="section-kicker">健康状态</p>
+                  <h2>Refresh Token 检查分布</h2>
+                </div>
+                <div class="mix-list" id="dashboardHealthMix"></div>
+              </section>
+
+              <section class="dashboard-panel">
+                <div class="panel-head">
+                  <p class="section-kicker">远端推送</p>
+                  <h2>grok2api / sub2api 覆盖</h2>
+                </div>
+                <div class="mix-list" id="dashboardPushMix"></div>
+              </section>
+
+              <section class="dashboard-panel dashboard-panel-wide">
+                <div class="panel-head">
+                  <p class="section-kicker">来源文件</p>
+                  <h2>最近账号批次</h2>
+                </div>
+                <div class="source-list" id="dashboardSources"></div>
+              </section>
+            </div>
+          </section>
+
+          <section id="tab-register" class="tab-panel" data-tab-panel="register">
             <div class="register-layout">
           <form id="configForm" class="config-stack">
             <section class="config-section" data-config-section="基础注册">
