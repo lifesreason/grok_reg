@@ -1476,6 +1476,41 @@ def _dispatch_cdp_click(page, x, y, include_keyboard=True):
             pass
 
 
+def _dispatch_cdp_text(page, text):
+    page.run_cdp("Input.insertText", text=str(text or ""))
+
+
+def _fill_otp_code_native(page, clean_code):
+    target = page.run_js(build_otp_native_target_script(), len(clean_code))
+    if not isinstance(target, dict) or target.get("state") != "otp-target":
+        return target
+    if target.get("centerX") is None or target.get("centerY") is None:
+        return {"state": "otp-target-missing-center", **target}
+    _dispatch_cdp_click(
+        page,
+        int(target.get("centerX")),
+        int(target.get("centerY")),
+        include_keyboard=False,
+    )
+    _dispatch_cdp_text(page, clean_code)
+    return {**target, "nativeInput": True}
+
+
+def _click_otp_submit_native(page):
+    target = page.run_js(build_otp_submit_target_script())
+    if not isinstance(target, dict) or target.get("state") != "otp-submit-target":
+        return target
+    if target.get("centerX") is None or target.get("centerY") is None:
+        return {"state": "otp-submit-missing-center", **target}
+    _dispatch_cdp_click(
+        page,
+        int(target.get("centerX")),
+        int(target.get("centerY")),
+        include_keyboard=False,
+    )
+    return {**target, "nativeClicked": True}
+
+
 def _click_xai_oauth_consent_if_present(page):
     try:
         result = page.run_js(build_xai_oauth_consent_click_script())
@@ -1943,6 +1978,134 @@ return JSON.stringify({
     })),
     buttons: buttons.slice(0, 6).map(textOf),
 });
+"""
+
+
+def build_otp_native_target_script():
+    return r"""
+// otp-native-target
+const codeLen = Number(arguments[0] || 6);
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+function inputAttrs(node) {
+    return [
+        node.getAttribute('data-testid'),
+        node.getAttribute('name'),
+        node.getAttribute('id'),
+        node.getAttribute('type'),
+        node.getAttribute('autocomplete'),
+        node.getAttribute('inputmode'),
+        node.getAttribute('placeholder'),
+        node.getAttribute('aria-label'),
+        node.getAttribute('data-input-otp'),
+    ].join(' ').toLowerCase();
+}
+function centerOf(node) {
+    const rect = node.getBoundingClientRect();
+    return {
+        centerX: Math.round(rect.left + rect.width / 2),
+        centerY: Math.round(rect.top + rect.height / 2),
+    };
+}
+const inputs = Array.from(document.querySelectorAll('input')).filter((node) => {
+    if (!isVisible(node) || node.disabled || node.readOnly) return false;
+    const type = String(node.getAttribute('type') || 'text').toLowerCase();
+    return !['hidden', 'password', 'checkbox', 'radio', 'submit', 'button'].includes(type);
+});
+const scored = inputs.map((node) => {
+    const attrs = inputAttrs(node);
+    let score = 0;
+    if (node.getAttribute('data-input-otp') === 'true') score += 120;
+    if (attrs.includes('one-time-code')) score += 110;
+    if (attrs.includes('otp')) score += 100;
+    if (attrs.includes('verification')) score += 90;
+    if (attrs.includes('code')) score += 80;
+    if (attrs.includes('验证码')) score += 80;
+    if (attrs.includes('numeric')) score += 40;
+    if (Number(node.maxLength || 0) >= codeLen) score += 25;
+    if (Number(node.maxLength || 0) === 1) score -= 15;
+    return { node, score };
+}).filter((item) => item.score > 0).sort((a, b) => b.score - a.score);
+if (scored.length) {
+    const target = scored[0].node;
+    target.focus();
+    const point = centerOf(target);
+    return {
+        state: 'otp-target',
+        mode: Number(target.maxLength || 0) === 1 ? 'split-first' : 'aggregate',
+        valueLen: String(target.value || '').length,
+        maxLength: Number(target.maxLength || 0),
+        ...point,
+    };
+}
+return {
+    state: 'otp-not-ready',
+    inputs: inputs.slice(0, 6).map((node) => ({
+        name: node.getAttribute('name') || '',
+        type: node.getAttribute('type') || '',
+        autocomplete: node.getAttribute('autocomplete') || '',
+        inputmode: node.getAttribute('inputmode') || '',
+        maxLength: Number(node.maxLength || 0),
+        aria: node.getAttribute('aria-label') || '',
+        dataInputOtp: node.getAttribute('data-input-otp') || '',
+    })),
+};
+"""
+
+
+def build_otp_submit_target_script():
+    return r"""
+// otp-submit-target
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+function textOf(node) {
+    return String(
+        node?.innerText ||
+        node?.textContent ||
+        node?.value ||
+        node?.getAttribute?.('aria-label') ||
+        ''
+    ).replace(/\s+/g, ' ').trim();
+}
+function centerOf(node) {
+    const rect = node.getBoundingClientRect();
+    return {
+        centerX: Math.round(rect.left + rect.width / 2),
+        centerY: Math.round(rect.top + rect.height / 2),
+    };
+}
+const buttons = Array.from(document.querySelectorAll('button[type="submit"], button, [role="button"], input[type="submit"]')).filter((node) => {
+    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
+});
+const target = buttons.find((node) => {
+    const text = textOf(node).toLowerCase().replace(/\s+/g, '');
+    return (
+        text.includes('确认邮箱') ||
+        text.includes('继续') ||
+        text.includes('下一步') ||
+        text.includes('confirm') ||
+        text.includes('continue') ||
+        text.includes('next')
+    );
+}) || buttons.find((node) => String(node.getAttribute('type') || '').toLowerCase() === 'submit');
+if (!target) return { state: 'otp-submit-not-ready', count: buttons.length };
+target.focus();
+return {
+    state: 'otp-submit-target',
+    text: textOf(target),
+    count: buttons.length,
+    ...centerOf(target),
+};
 """
 
 
@@ -3976,8 +4139,17 @@ return false;
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
-        filled = page.run_js(
-            """
+        native_state = _fill_otp_code_native(page, clean_code)
+        if isinstance(native_state, dict) and native_state.get("nativeInput"):
+            filled = "filled-native"
+            if log_callback:
+                log_callback(
+                    "[Debug] 验证码已通过 CDP 原生输入: "
+                    + json.dumps(native_state, ensure_ascii=False)[:500]
+                )
+        else:
+            filled = page.run_js(
+                """
 const code = String(arguments[0] || '').trim();
 if (!code) return 'empty-code';
 
@@ -4034,8 +4206,8 @@ if (otpBoxes.length >= code.length) {
 
 return 'not-ready';
             """,
-            clean_code,
-        )
+                clean_code,
+            )
 
         if filled == "not-ready":
             sleep_with_cancel(0.5, cancel_callback)
@@ -4049,8 +4221,17 @@ return 'not-ready';
             log_callback("[Debug] 验证码已填入，等待前端状态同步...")
         sleep_with_cancel(0.6, cancel_callback)
 
-        clicked = page.run_js(
-            r"""
+        native_submit = _click_otp_submit_native(page)
+        if isinstance(native_submit, dict) and native_submit.get("nativeClicked"):
+            clicked = "clicked"
+            if log_callback:
+                log_callback(
+                    "[Debug] 验证码提交按钮已通过 CDP 原生点击: "
+                    + json.dumps(native_submit, ensure_ascii=False)[:500]
+                )
+        else:
+            clicked = page.run_js(
+                r"""
 function isVisible(node) {
     if (!node) return false;
     const style = window.getComputedStyle(node);
@@ -4080,7 +4261,7 @@ btn.focus();
 btn.click();
 return 'clicked';
             """
-        )
+            )
 
         if clicked == "clicked" or clicked == "no-button":
             if log_callback:

@@ -419,6 +419,58 @@ def test_fill_code_waits_for_frontend_state_after_otp_input():
     assert "sleep_with_cancel(0.6, cancel_callback)" in source
 
 
+def test_fill_code_uses_native_cdp_input_for_otp(monkeypatch):
+    class FakePage:
+        def __init__(self):
+            self.cdp_calls = []
+
+        def run_js(self, script, *args):
+            if "otp-native-target" in script:
+                return {
+                    "state": "otp-target",
+                    "mode": "aggregate",
+                    "centerX": 101,
+                    "centerY": 202,
+                    "valueLen": 0,
+                }
+            if "otp-submit-target" in script:
+                return {
+                    "state": "otp-submit-target",
+                    "centerX": 303,
+                    "centerY": 404,
+                    "text": "Continue",
+                }
+            if args:
+                return "filled-aggregate"
+            return "clicked"
+
+        def run_cdp(self, method, **params):
+            self.cdp_calls.append((method, params))
+
+    page = FakePage()
+    transitions = []
+    monkeypatch.setattr(reg, "_get_page", lambda: page)
+    monkeypatch.setattr(reg, "get_oai_code", lambda *args, **kwargs: "TFF-KTN")
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda seconds, cancel_callback=None: None)
+    monkeypatch.setattr(
+        reg,
+        "wait_for_post_code_transition",
+        lambda page_arg, email, log_callback=None, cancel_callback=None: transitions.append(email),
+    )
+
+    assert reg.fill_code_and_submit("user@example.com", "mail-token") == "TFF-KTN"
+
+    assert ("Input.insertText", {"text": "TFFKTN"}) in page.cdp_calls
+    assert any(
+        method == "Input.dispatchMouseEvent"
+        and params.get("type") == "mousePressed"
+        and params.get("x") == 303
+        and params.get("y") == 404
+        for method, params in page.cdp_calls
+    )
+    assert transitions == ["user@example.com"]
+
+
 def test_registration_job_retries_when_email_domain_is_rejected(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     reg._rejected_email_domains.clear()
