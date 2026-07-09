@@ -4275,6 +4275,47 @@ return false;
     clean_code = str(code).replace("-", "").strip()
     deadline = time.time() + timeout
 
+    # 在填充/提交前启动 CDP 网络监听，无论请求经由 fetch/XHR/worker 发出，
+    # 都能截获 VerifyEmailValidationCode 的响应体，定位服务端拒绝原因。
+    listen_started = False
+    try:
+        page.listen.start("VerifyEmailValidationCode", method="POST")
+        listen_started = True
+    except Exception as listen_exc:
+        if log_callback:
+            log_callback(f"[Debug] 启动 verify-email 网络监听失败: {str(listen_exc)[:160]}")
+
+    def _log_verify_packet():
+        if not listen_started or not log_callback:
+            return
+        try:
+            packet = page.listen.wait(count=1, timeout=1.5, fit_count=False)
+        except Exception:
+            packet = None
+        if not packet:
+            return
+        packets = packet if isinstance(packet, (list, tuple)) else [packet]
+        for pkt in packets:
+            try:
+                resp = getattr(pkt, "response", None)
+                req = getattr(pkt, "request", None)
+                body = getattr(resp, "body", "") if resp else ""
+                status = getattr(resp, "status", "") if resp else ""
+                post = getattr(req, "postData", "") if req else ""
+                log_callback(
+                    "[Debug] verify-email CDP 抓包: "
+                    + json.dumps(
+                        {
+                            "status": status,
+                            "reqBody": str(post)[:400],
+                            "respBody": str(body)[:600],
+                        },
+                        ensure_ascii=False,
+                    )[:1200]
+                )
+            except Exception as pkt_exc:
+                log_callback(f"[Debug] verify-email 抓包解析失败: {str(pkt_exc)[:160]}")
+
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
         # 上游验证码填充（JS + _valueTracker 同步）为主路径：已验证能正确驱动
@@ -4409,6 +4450,10 @@ return 'clicked';
         if clicked == "clicked":
             if log_callback:
                 log_callback(f"[*] 已填写验证码并提交: {code}")
+            _log_verify_packet()
+            if listen_started:
+                try: page.listen.stop()
+                except Exception: pass
             wait_for_post_code_transition(
                 page,
                 email,
@@ -4419,6 +4464,10 @@ return 'clicked';
         if clicked == "no-button":
             if log_callback:
                 log_callback("[Debug] 验证码提交按钮未出现，等待前端自动提交结果...")
+            _log_verify_packet()
+            if listen_started:
+                try: page.listen.stop()
+                except Exception: pass
             wait_for_post_code_transition(
                 page,
                 email,
@@ -4429,6 +4478,9 @@ return 'clicked';
 
         sleep_with_cancel(0.5, cancel_callback)
 
+    if listen_started:
+        try: page.listen.stop()
+        except Exception: pass
     raise Exception("验证码已获取，但自动填写/提交失败")
 
 
