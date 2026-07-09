@@ -1480,6 +1480,30 @@ def _dispatch_cdp_text(page, text):
     page.run_cdp("Input.insertText", text=str(text or ""))
 
 
+def _dispatch_cdp_keypress(page, ch):
+    """派发真实按键事件（keyDown 带 text + keyUp），驱动 input-otp 等依赖
+    keydown/onChange 的受控组件；insertText 会绕过这些处理器导致值不同步。"""
+    ch = str(ch or "")
+    if not ch:
+        return
+    vk = ord(ch.upper())
+    page.run_cdp(
+        "Input.dispatchKeyEvent",
+        type="keyDown",
+        text=ch,
+        key=ch,
+        windowsVirtualKeyCode=vk,
+        nativeVirtualKeyCode=vk,
+    )
+    page.run_cdp(
+        "Input.dispatchKeyEvent",
+        type="keyUp",
+        key=ch,
+        windowsVirtualKeyCode=vk,
+        nativeVirtualKeyCode=vk,
+    )
+
+
 def _fill_otp_code_native(page, clean_code, cancel_callback=None):
     target = page.run_js(build_otp_native_target_script(), len(clean_code))
     if not isinstance(target, dict) or target.get("state") != "otp-target":
@@ -1494,10 +1518,26 @@ def _fill_otp_code_native(page, clean_code, cancel_callback=None):
     )
     inserted = 0
     for ch in str(clean_code or ""):
-        _dispatch_cdp_text(page, ch)
+        _dispatch_cdp_keypress(page, ch)
         inserted += 1
         sleep_with_cancel(0.08, cancel_callback)
-    return {**target, "nativeInput": True, "insertedChars": inserted}
+    # 填后回读实际值长度，确认按键事件真的驱动了受控组件
+    filled_len = None
+    try:
+        filled_len = page.run_js(
+            r"""
+try {
+  const el = document.activeElement;
+  const v = (el && typeof el.value === 'string') ? el.value : '';
+  const otp = document.querySelector('input[data-input-otp="true"], input[name="code"], input[autocomplete="one-time-code"]');
+  const ov = otp ? String(otp.value || '') : '';
+  return Math.max(String(v).replace(/\s+/g, '').length, ov.replace(/\s+/g, '').length);
+} catch (e) { return -1; }
+            """
+        )
+    except Exception:
+        filled_len = None
+    return {**target, "nativeInput": True, "insertedChars": inserted, "filledLen": filled_len}
 
 
 def _click_otp_submit_native(page):
