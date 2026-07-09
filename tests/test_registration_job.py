@@ -111,6 +111,51 @@ def test_registration_job_runs_successfully(monkeypatch, tmp_path):
     assert any("注册成功" in line for line in job.logs())
 
 
+def test_registration_job_retries_when_profile_session_returns_to_signup(monkeypatch, tmp_path):
+    emails = iter(["first@example.com", "second@example.com"])
+    profile_calls = [0]
+
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(reg, "start_browser", lambda log_callback=None: (object(), object()))
+    monkeypatch.setattr(reg, "restart_browser", lambda log_callback=None: (object(), object()))
+    monkeypatch.setattr(reg, "stop_browser", lambda: None)
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda seconds, cancel_callback=None: None)
+    monkeypatch.setattr(reg, "open_signup_page", lambda log_callback=None, cancel_callback=None: None)
+    monkeypatch.setattr(
+        reg,
+        "fill_email_and_submit",
+        lambda log_callback=None, cancel_callback=None: (next(emails), "mail-token"),
+    )
+    monkeypatch.setattr(
+        reg,
+        "fill_code_and_submit",
+        lambda email, token, log_callback=None, cancel_callback=None: "123456",
+    )
+
+    def fake_fill_profile(log_callback=None, cancel_callback=None):
+        profile_calls[0] += 1
+        if profile_calls[0] == 1:
+            raise reg.ProfileSessionLost("最终注册页退回注册入口")
+        return {"given_name": "Ada", "family_name": "Lovelace", "password": "secret"}
+
+    monkeypatch.setattr(reg, "fill_profile_and_submit", fake_fill_profile)
+    monkeypatch.setattr(reg, "wait_for_sso_cookie", lambda log_callback=None, cancel_callback=None: "sso-token")
+    monkeypatch.setattr(reg, "fetch_xai_oauth_refresh_token", lambda sso, log_callback=None, cancel_callback=None: "refresh-token")
+    monkeypatch.setattr(reg, "add_token_to_grok2api_pools", lambda raw_token, email="", log_callback=None: None)
+
+    job = reg.RegistrationJob({"email_provider": "duckmail", "register_count": 1, "register_threads": 1})
+    job.start()
+    status = wait_for_job(job)
+
+    assert status["status"] == "completed"
+    assert status["success_count"] == 1
+    assert status["fail_count"] == 0
+    assert any("最终注册页会话丢失，自动换邮箱重试" in line for line in job.logs())
+    assert "second@example.com----secret----sso-token----refresh-token" in tmp_path.joinpath(
+        status["output_file"]
+    ).read_text(encoding="utf-8")
+
+
 def test_registration_job_enables_nsfw_when_enabled(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(reg, "start_browser", lambda log_callback=None: (object(), object()))
@@ -1112,6 +1157,15 @@ def test_profile_submit_script_retries_xai_error_page():
     assert "profile-error-page-no-retry" in script
 
 
+def test_profile_submit_script_recovers_signup_entry_page():
+    script = reg.build_profile_submit_script("recover_entry")
+
+    assert "Create your account" in script
+    assert "Sign up with email" in script
+    assert "profile-entry-email-target" in script
+    assert "profile-entry-page-not-detected" in script
+
+
 def test_fill_profile_retries_xai_error_page_before_submit(monkeypatch):
     logs = []
     cdp_events = []
@@ -1155,6 +1209,55 @@ def test_fill_profile_retries_xai_error_page_before_submit(monkeypatch):
         and kwargs.get("type") == "mouseReleased"
         and kwargs.get("x") == 111
         and kwargs.get("y") == 222
+        for method, kwargs in cdp_events
+    )
+
+
+def test_fill_profile_recovers_signup_entry_page_before_submit(monkeypatch):
+    logs = []
+    cdp_events = []
+
+    class FakePage:
+        def __init__(self):
+            self.entry_recovered = False
+
+        def run_js(self, script, *args):
+            if 'action = "diagnose"' in script:
+                return '{"turnstile": {}}'
+            if 'action = "retry_error"' in script:
+                return "profile-error-page-not-detected"
+            if 'action = "recover_entry"' in script:
+                if not self.entry_recovered:
+                    self.entry_recovered = True
+                    return {
+                        "state": "profile-entry-email-target",
+                        "centerX": 333,
+                        "centerY": 444,
+                        "text": "Sign up with email",
+                    }
+                return "profile-entry-page-not-detected"
+            if 'action = "submit"' in script:
+                return "submitted"
+            return "profile-filled"
+
+        def run_cdp(self, method, **kwargs):
+            cdp_events.append((method, kwargs))
+
+    page = FakePage()
+    monkeypatch.setattr(reg, "_get_page", lambda: page)
+    monkeypatch.setattr(reg, "refresh_active_page", lambda: page)
+    monkeypatch.setattr(reg, "build_profile", lambda: ("Ada", "Lovelace", "secret"))
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda seconds, cancel_callback=None: None)
+
+    profile = reg.fill_profile_and_submit(timeout=5, log_callback=logs.append)
+
+    assert profile == {"given_name": "Ada", "family_name": "Lovelace", "password": "secret"}
+    assert any("最终注册页退回注册入口，点击邮箱注册恢复" in line for line in logs)
+    assert any(
+        method == "Input.dispatchMouseEvent"
+        and kwargs.get("type") == "mouseReleased"
+        and kwargs.get("x") == 333
+        and kwargs.get("y") == 444
         for method, kwargs in cdp_events
     )
 

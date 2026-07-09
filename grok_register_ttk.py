@@ -133,6 +133,10 @@ class EmailProviderUnavailable(Exception):
     pass
 
 
+class ProfileSessionLost(Exception):
+    pass
+
+
 def load_config():
     global config
     config_file = get_config_file()
@@ -1943,7 +1947,7 @@ return JSON.stringify({
 
 
 def build_profile_submit_script(action):
-    if action not in {"check", "submit", "trigger", "diagnose", "retry_error"}:
+    if action not in {"check", "submit", "trigger", "diagnose", "retry_error", "recover_entry"}:
         raise ValueError(f"Unsupported profile submit action: {action}")
     keywords = json.dumps(list(PROFILE_SUBMIT_KEYWORDS), ensure_ascii=False)
     action_json = json.dumps(action)
@@ -2120,6 +2124,45 @@ if (action === 'retry_error') {{
         centerX: Math.round(rect.left + rect.width / 2),
         centerY: Math.round(rect.top + rect.height / 2),
         text: nodeText(retryBtn).slice(0, 80),
+        title: document.title,
+        bodySnippet: bodyText.slice(0, 240),
+    }};
+}}
+if (action === 'recover_entry') {{
+    const bodyText = nodeText(document.body);
+    const compactBody = bodyText.toLowerCase().replace(/\\s+/g, '');
+    const hasProfileInputs = !!document.querySelector('input[name="givenName"], input[autocomplete="given-name"]')
+        && !!document.querySelector('input[name="password"], input[type="password"]');
+    if (hasProfileInputs) return 'profile-entry-has-profile-form';
+    const isSignupEntry = compactBody.includes('createyouraccount')
+        || compactBody.includes('signupwithemail')
+        || compactBody.includes('youaresigninginto');
+    if (!isSignupEntry) return 'profile-entry-page-not-detected';
+    const emailBtn = Array.from(document.querySelectorAll('button, [role="button"], input[type="button"], a[href]'))
+        .filter((node) => isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true')
+        .find((node) => {{
+            const text = normalizedText(node);
+            return text.includes('signupwithemail')
+                || text.includes('continuewithemail')
+                || text.includes('使用邮箱注册')
+                || text.includes('email');
+        }});
+    if (!emailBtn) {{
+        return {{
+            state: 'profile-entry-page-no-email',
+            title: document.title,
+            hints: ['Create your account', 'Sign up with email'],
+            bodySnippet: bodyText.slice(0, 240),
+        }};
+    }}
+    emailBtn.focus();
+    const rect = emailBtn.getBoundingClientRect();
+    try {{ emailBtn.click(); }} catch (e) {{}}
+    return {{
+        state: 'profile-entry-email-target',
+        centerX: Math.round(rect.left + rect.width / 2),
+        centerY: Math.round(rect.top + rect.height / 2),
+        text: nodeText(emailBtn).slice(0, 80),
         title: document.title,
         bodySnippet: bodyText.slice(0, 240),
     }};
@@ -2363,6 +2406,7 @@ class RegistrationJob:
         email = ""
         dev_token = ""
         code = ""
+        profile = None
         mail_ok = False
         max_mail_retry = 3
         for mail_try in range(1, max_mail_retry + 1):
@@ -2396,8 +2440,20 @@ class RegistrationJob:
                 code = fill_code_and_submit(
                     email, dev_token, log_callback=logf, cancel_callback=self.should_stop
                 )
+                logf(f"[*] 验证码: {code}")
+                logf("[*] 4. 填写资料")
+                profile = fill_profile_and_submit(
+                    log_callback=logf, cancel_callback=self.should_stop
+                )
                 mail_ok = True
                 break
+            except ProfileSessionLost as profile_exc:
+                if mail_try < max_mail_retry:
+                    logf(f"[!] 最终注册页会话丢失，自动换邮箱重试: {profile_exc}")
+                    restart_browser(log_callback=logf)
+                    sleep_with_cancel(1, self.should_stop)
+                    continue
+                raise
             except Exception as mail_exc:
                 msg = str(mail_exc)
                 if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
@@ -2408,11 +2464,6 @@ class RegistrationJob:
                 raise
         if not mail_ok:
             raise Exception("验证码阶段失败，已达到最大重试次数")
-        logf(f"[*] 验证码: {code}")
-        logf("[*] 4. 填写资料")
-        profile = fill_profile_and_submit(
-            log_callback=logf, cancel_callback=self.should_stop
-        )
         logf(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
         logf("[*] 5. 等待 sso cookie")
         sso = wait_for_sso_cookie(log_callback=logf, cancel_callback=self.should_stop)
@@ -4077,6 +4128,9 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
     error_page_retries = 0
     max_error_page_retries = 4
     last_error_page_retry_at = 0.0
+    entry_page_retries = 0
+    max_entry_page_retries = 2
+    last_entry_page_retry_at = 0.0
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -4123,6 +4177,50 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
                     continue
                 if error_state.get("state") == "profile-error-page-no-retry":
                     raise Exception(f"xAI 最终注册页错误页且未找到 Retry 按钮: {error_state.get('bodySnippet', '')}")
+
+        now = time.time()
+        if now - last_entry_page_retry_at >= 2.0:
+            try:
+                entry_state = page.run_js(build_profile_submit_script("recover_entry"))
+            except Exception as entry_retry_exc:
+                entry_state = f"profile-entry-check-failed:{entry_retry_exc}"
+
+            if isinstance(entry_state, dict) and str(entry_state.get("state") or "") in {
+                "profile-entry-email-target",
+                "profile-entry-page-no-email",
+            }:
+                if entry_state.get("state") == "profile-entry-email-target":
+                    entry_page_retries += 1
+                    if entry_page_retries > max_entry_page_retries:
+                        raise ProfileSessionLost(
+                            f"xAI 最终注册页反复退回注册入口，已尝试恢复 {max_entry_page_retries} 次仍未进入资料页"
+                        )
+                    if entry_state.get("centerX") is not None and entry_state.get("centerY") is not None:
+                        try:
+                            _dispatch_cdp_click(
+                                page,
+                                int(entry_state.get("centerX")),
+                                int(entry_state.get("centerY")),
+                                include_keyboard=False,
+                            )
+                            entry_state["nativeClicked"] = True
+                        except Exception as native_exc:
+                            entry_state["nativeClickError"] = str(native_exc)[:160]
+                    if log_callback:
+                        log_callback(
+                            f"[*] 最终注册页退回注册入口，点击邮箱注册恢复 ({entry_page_retries}/{max_entry_page_retries})"
+                        )
+                        log_callback(f"[Debug] 最终注册页入口恢复状态: {json.dumps(entry_state, ensure_ascii=False)}")
+                    last_entry_page_retry_at = now
+                    sleep_with_cancel(2, cancel_callback)
+                    try:
+                        refresh_active_page()
+                        page = _get_page()
+                    except Exception:
+                        pass
+                    continue
+                if entry_state.get("state") == "profile-entry-page-no-email":
+                    raise ProfileSessionLost(f"xAI 最终注册页退回注册入口且未找到邮箱注册按钮: {entry_state.get('bodySnippet', '')}")
 
         # 资料已填过，且表单已从页面消失 => 提交已被隐形 Turnstile 驱动成功，页面已推进
         if form_filled_once:
@@ -4183,7 +4281,11 @@ const givenInput = pickInput('input[data-testid="givenName"], input[name="givenN
 const familyInput = pickInput('input[data-testid="familyName"], input[name="familyName"], input[autocomplete="family-name"], input[aria-label*="姓"]');
 const passwordInput = pickInput('input[data-testid="password"], input[name="password"], input[type="password"], input[autocomplete="new-password"]');
 
-if (!givenInput || !familyInput || !passwordInput) return 'not-ready';
+if (!givenInput || !familyInput || !passwordInput) {
+    const emailInput = pickInput('input[type="email"], input[name="email"], input[autocomplete="email"]');
+    if (emailInput) return 'email-step';
+    return 'not-ready';
+}
 
 const ok1 = setInputValue(givenInput, givenName);
 const ok2 = setInputValue(familyInput, familyName);
@@ -4240,6 +4342,8 @@ return 'profile-filled';
             elif filled == "not-ready":
                 sleep_with_cancel(0.5, cancel_callback)
                 continue
+            elif filled == "email-step":
+                raise ProfileSessionLost("xAI 最终注册页退回邮箱输入页，验证码会话已失效")
 
         submit_state = page.run_js(build_profile_submit_script("submit"))
 
