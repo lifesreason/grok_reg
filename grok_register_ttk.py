@@ -194,6 +194,8 @@ load_config()
 EXTENSION_PATH = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "turnstilePatch")
 )
+TURNSTILE_PAGE_HOOK_PATH = os.path.join(EXTENSION_PATH, "pageHook.js")
+_turnstile_page_hook_source_cache = None
 
 
 DUCKMAIL_API_BASE = "https://api.duckmail.sbs"
@@ -1228,6 +1230,37 @@ def create_browser_options():
     if os.path.exists(EXTENSION_PATH):
         options.add_extension(EXTENSION_PATH)
     return options
+
+
+def turnstile_page_hook_source():
+    global _turnstile_page_hook_source_cache
+    if _turnstile_page_hook_source_cache is not None:
+        return _turnstile_page_hook_source_cache
+    try:
+        with open(TURNSTILE_PAGE_HOOK_PATH, "r", encoding="utf-8") as handle:
+            _turnstile_page_hook_source_cache = handle.read()
+    except Exception:
+        _turnstile_page_hook_source_cache = ""
+    return _turnstile_page_hook_source_cache
+
+
+def install_turnstile_page_hook(page, log_callback=None):
+    source = turnstile_page_hook_source()
+    if not page or not source:
+        return False
+    installed = False
+    try:
+        page.run_cdp("Page.addScriptToEvaluateOnNewDocument", source=source)
+        installed = True
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] Turnstile CDP 预注入失败: {str(exc)[:180]}")
+    try:
+        page.run_cdp("Runtime.evaluate", expression=source)
+        installed = True
+    except Exception:
+        pass
+    return installed
 
 
 def _build_request_kwargs(**kwargs):
@@ -3514,6 +3547,7 @@ def start_browser(log_callback=None):
                 page = tabs[-1] if tabs else browser.new_tab()
             _set_browser(browser)
             _set_page(page)
+            install_turnstile_page_hook(page, log_callback=log_callback)
             if log_callback and getattr(browser, "user_data_path", None):
                 log_callback(f"[Debug] 当前浏览器资料目录: {browser.user_data_path}")
             if log_callback:
@@ -3573,6 +3607,7 @@ def refresh_active_page():
         else:
             page = browser.new_tab()
         _set_page(page)
+        install_turnstile_page_hook(page)
     except Exception:
         _, page = restart_browser()
     return _get_page()
@@ -3637,19 +3672,24 @@ def open_signup_page(log_callback=None, cancel_callback=None):
     try:
         page = browser.get_tab(0)
         _set_page(page)
+        install_turnstile_page_hook(page, log_callback=log_callback)
         page.get(SIGNUP_URL)
     except Exception as e:
         if log_callback:
             log_callback(f"[Debug] 打开URL异常: {e}")
         try:
-            page = browser.new_tab(SIGNUP_URL)
+            page = browser.new_tab()
             _set_page(page)
+            install_turnstile_page_hook(page, log_callback=log_callback)
+            page.get(SIGNUP_URL)
         except Exception as e2:
             if log_callback:
                 log_callback(f"[Debug] 创建新标签页异常: {e2}")
             browser, _ = restart_browser()
-            page = browser.new_tab(SIGNUP_URL)
+            page = browser.new_tab()
             _set_page(page)
+            install_turnstile_page_hook(page, log_callback=log_callback)
+            page.get(SIGNUP_URL)
     page.wait.doc_loaded()
     sleep_with_cancel(2, cancel_callback)
     if log_callback:

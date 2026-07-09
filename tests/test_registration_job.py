@@ -1237,6 +1237,22 @@ def test_browser_options_apply_configured_proxy(monkeypatch):
     assert ("--proxy-server", "http://host.docker.internal:7890") in options.arguments
 
 
+def test_turnstile_page_hook_installs_with_cdp(monkeypatch):
+    events = []
+
+    class FakePage:
+        def run_cdp(self, method, **kwargs):
+            events.append((method, kwargs))
+
+    monkeypatch.setattr(reg, "turnstile_page_hook_source", lambda: "window.__grokTurnstileHookInstalled = true;")
+
+    assert reg.install_turnstile_page_hook(FakePage()) is True
+    assert events[0][0] == "Page.addScriptToEvaluateOnNewDocument"
+    assert events[0][1]["source"] == "window.__grokTurnstileHookInstalled = true;"
+    assert events[1][0] == "Runtime.evaluate"
+    assert events[1][1]["expression"] == "window.__grokTurnstileHookInstalled = true;"
+
+
 def test_docker_visible_browser_keeps_linux_startup_flags(monkeypatch):
     class FakeOptions:
         def __init__(self):
