@@ -1092,12 +1092,22 @@ def test_profile_submit_script_supports_role_button_and_aria_labels():
 
     assert '[role="button"]' in script
     assert "aria-label" in script
+    assert "submitted-no-challenge" in script
+    assert "ready-to-submit-no-challenge" in script
+    assert "requestSubmit" in script
     assert "continue" in reg.PROFILE_SUBMIT_KEYWORDS
     assert "create" in reg.PROFILE_SUBMIT_KEYWORDS
 
     diagnose_script = reg.build_profile_submit_script("diagnose")
 
     assert 'action = "diagnose"' in diagnose_script
+
+
+def test_wait_for_sso_cookie_final_page_can_submit_without_visible_turnstile():
+    source = Path("grok_register_ttk.py").read_text(encoding="utf-8")
+
+    assert "final-page-request-submit" in source
+    assert "const hasVisibleChallenge = !!document.querySelector('iframe[src*=\"turnstile\"], div.cf-turnstile, [data-sitekey]');" in source
 
 
 def test_yyds_code_polling_triggers_resend_callback(monkeypatch):

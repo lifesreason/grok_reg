@@ -1945,6 +1945,22 @@ function pickSubmitButton() {{
         return String(node.getAttribute('type') || '').toLowerCase() === 'submit';
     }}) || null;
 }}
+function submitProfileForm(submitBtn) {{
+    if (!submitBtn) return false;
+    submitBtn.focus();
+    const form = submitBtn.form || submitBtn.closest('form');
+    if (form && typeof form.requestSubmit === 'function') {{
+        try {{
+            form.requestSubmit(submitBtn);
+            return true;
+        }} catch (e) {{}}
+    }}
+    try {{
+        submitBtn.click();
+        return true;
+    }} catch (e) {{}}
+    return false;
+}}
 function cloudflareState() {{
     const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
     const cfPresent = !!cfInput
@@ -2026,16 +2042,23 @@ if (action === 'trigger') {{
     }} catch (e) {{}}
     const submitBtn = pickSubmitButton();
     if (!submitBtn) return 'trigger-no-submit';
-    submitBtn.focus();
-    submitBtn.click();
+    submitProfileForm(submitBtn);
     return 'trigger-clicked:' + (executed ? '1' : '0');
 }}
-if (cf.startsWith('wait-cloudflare')) return cf;
 const submitBtn = pickSubmitButton();
 if (!submitBtn) return 'no-submit-button';
+if (cf.startsWith('wait-cloudflare')) {{
+    const detail = turnstileDetail();
+    const hasVisibleChallenge = (detail.widgets && detail.widgets.length > 0) || (detail.iframes && detail.iframes.length > 0);
+    if (!hasVisibleChallenge && action !== 'check') {{
+        submitProfileForm(submitBtn);
+        return 'submitted-no-challenge';
+    }}
+    if (!hasVisibleChallenge && action === 'check') return 'ready-to-submit-no-challenge';
+    return cf;
+}}
 if (action === 'check') return 'ready-to-submit';
-submitBtn.focus();
-submitBtn.click();
+submitProfileForm(submitBtn);
 return 'submitted';
 """
 
@@ -4077,7 +4100,7 @@ return 'profile-filled';
             sleep_with_cancel(0.8, cancel_callback)
             continue
 
-        if submit_state == "submitted":
+        if submit_state in ("submitted", "submitted-no-challenge"):
             if log_callback:
                 log_callback(f"[*] 已填写注册资料并提交: {given_name} {family_name}")
             return {"given_name": given_name, "family_name": family_name, "password": password}
@@ -4135,7 +4158,8 @@ const cfPresent = !!cfInput
 if (cfPresent) {
     const token = String((cfInput && cfInput.value) || '').trim();
     const solved = token.length >= 80;
-    if (!solved) return 'final-page-wait-cf:' + token.length;
+    const hasVisibleChallenge = !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey]');
+    if (!solved && hasVisibleChallenge) return 'final-page-wait-cf:' + token.length;
 }
 
 const buttons = Array.from(document.querySelectorAll('button[type="submit"], button')).filter((node) => {
@@ -4147,12 +4171,16 @@ const submitBtn = buttons.find((node) => {
 });
 if (!submitBtn) return 'final-page-no-submit';
 submitBtn.focus();
+const form = submitBtn.form || submitBtn.closest('form');
+if (form && typeof form.requestSubmit === 'function') {
+    try { form.requestSubmit(submitBtn); return 'final-page-request-submit'; } catch (e) {}
+}
 submitBtn.click();
 return 'final-page-clicked-submit';
                     """
                 )
                 last_submit_retry = now
-                if log_callback and retried in ("final-page-no-submit", "final-page-clicked-submit"):
+                if log_callback and retried in ("final-page-no-submit", "final-page-clicked-submit", "final-page-request-submit"):
                     log_callback(f"[Debug] 最终页状态: {retried}")
                 if log_callback and isinstance(retried, str) and retried.startswith("final-page-wait-cf"):
                     token_len = retried.split(":", 1)[1] if ":" in retried else "0"
