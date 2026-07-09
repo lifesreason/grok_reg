@@ -1954,6 +1954,33 @@ function cloudflareState() {{
     if (token.length >= 80) return 'solved';
     return 'wait-cloudflare:' + token.length;
 }}
+function turnstileDetail() {{
+    const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+    const widgets = Array.from(document.querySelectorAll('div.cf-turnstile, [data-sitekey]')).map((n) => ({{
+        sitekey: n.getAttribute('data-sitekey') || '',
+        theme: n.getAttribute('data-theme') || '',
+        size: n.getAttribute('data-size') || '',
+        action: n.getAttribute('data-action') || '',
+        class: n.className || '',
+    }}));
+    const iframes = Array.from(document.querySelectorAll('iframe')).filter((f) => {{
+        const s = f.getAttribute('src') || '';
+        return s.includes('turnstile') || s.includes('challenges.cloudflare.com');
+    }}).map((f) => ({{
+        src: (f.getAttribute('src') || '').slice(0, 160),
+        w: f.getBoundingClientRect().width,
+        h: f.getBoundingClientRect().height,
+        visible: isVisible(f),
+    }}));
+    return {{
+        hasInput: !!cfInput,
+        inputLen: String((cfInput && cfInput.value) || '').trim().length,
+        turnstileApi: (typeof window.turnstile !== 'undefined'),
+        widgets,
+        iframes,
+        webdriver: navigator.webdriver,
+    }};
+}}
 if (action === 'diagnose') {{
     const buttons = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], a[href]'))
         .filter(isVisible)
@@ -1980,6 +2007,7 @@ if (action === 'diagnose') {{
         url: location.href,
         title: document.title,
         cf: cloudflareState(),
+        turnstile: turnstileDetail(),
         hasSubmitButton: !!pickSubmitButton(),
         buttons,
         inputs,
@@ -3878,6 +3906,14 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
     if log_callback:
         log_callback("[*] 预热 Turnstile...")
     sleep_with_cancel(2, cancel_callback)
+    # 预热后先采集一次 Turnstile 结构，便于判断是 IP 信誉还是自动化指纹问题
+    if log_callback:
+        try:
+            warm_diag = page.run_js(build_profile_submit_script("diagnose"))
+            warm_obj = json.loads(warm_diag) if isinstance(warm_diag, str) else warm_diag
+            log_callback(f"[Debug] 预热后 Turnstile 状态: {json.dumps(warm_obj.get('turnstile', {}), ensure_ascii=False)}")
+        except Exception as warm_exc:
+            log_callback(f"[Debug] 预热诊断失败: {warm_exc}")
     deadline = time.time() + timeout
     form_filled_once = False
     wait_cf_since = None
