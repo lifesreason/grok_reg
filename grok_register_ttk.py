@@ -2603,28 +2603,18 @@ return 'post-code-waiting';
             if name == "post-code-error-page":
                 resource_summary = state.get("resourceSummary")
                 retry_target = state.get("retryTarget")
+                # 验证码此时其实已被服务端接受(grpc-status:0)，会话 cookie 有效。
+                # 页面上的 "Retry" 按钮会重启整个注册流程、把会话冲回入口，
+                # 属破坏性操作。改为刷新当前页，让应用凭有效会话恢复到资料页。
                 if (
                     error_page_retries < max_error_page_retries
                     and isinstance(resource_summary, dict)
                     and resource_summary.get("verifyEmailSeen")
-                    and isinstance(retry_target, dict)
-                    and retry_target.get("centerX") is not None
-                    and retry_target.get("centerY") is not None
                 ):
                     error_page_retries += 1
-                    try:
-                        _dispatch_cdp_click(
-                            page,
-                            int(retry_target.get("centerX")),
-                            int(retry_target.get("centerY")),
-                            include_keyboard=False,
-                        )
-                        retry_target["nativeClicked"] = True
-                    except Exception as retry_exc:
-                        retry_target["nativeClickError"] = str(retry_exc)[:160]
                     if log_callback:
                         log_callback(
-                            f"[*] 验证码校验后错误页，点击 Retry 恢复 ({error_page_retries}/{max_error_page_retries})"
+                            f"[*] 验证码校验后过渡错误页，刷新页面恢复 ({error_page_retries}/{max_error_page_retries})"
                         )
                         log_callback(
                             "[Debug] 验证码后错误页恢复状态: "
@@ -2636,7 +2626,12 @@ return 'post-code-waiting';
                                 ensure_ascii=False,
                             )[:2500]
                         )
-                    sleep_with_cancel(2, cancel_callback)
+                    try:
+                        page.refresh()
+                    except Exception as refresh_exc:
+                        if log_callback:
+                            log_callback(f"[Debug] 刷新页面失败: {str(refresh_exc)[:160]}")
+                    sleep_with_cancel(3, cancel_callback)
                     continue
                 detail = ""
                 if resource_summary:
