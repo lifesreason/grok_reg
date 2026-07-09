@@ -4124,6 +4124,7 @@ def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
     last_seen_names = set()
     last_submit_retry = 0.0
     last_cf_retry_at = 0.0
+    last_final_retry_state = ""
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -4134,7 +4135,8 @@ def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
                 sleep_with_cancel(1, cancel_callback)
                 continue
 
-            # 仍停留在“完成注册”页时，若 Cloudflare 已通过，周期性重试点击提交
+            # 仍停留在最终注册页时，若 Cloudflare 已通过，周期性重试点击提交。
+            # xAI 页面会按区域显示中文或英文，不能只用中文标题判断。
             now = time.time()
             if now - last_submit_retry >= 2.5:
                 retried = page.run_js(
@@ -4146,11 +4148,19 @@ function isVisible(node) {
     const rect = node.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
 }
+function compactText(node) {
+    return String(node?.innerText || node?.textContent || node?.value || node?.getAttribute?.('aria-label') || '')
+        .replace(/\s+/g, '')
+        .toLowerCase();
+}
 const titleHit = !!Array.from(document.querySelectorAll('h1,h2,div,span')).find((el) => {
-    const t = (el.textContent || '').replace(/\s+/g, '');
-    return t.includes('完成注册');
+    const t = compactText(el);
+    return t.includes('完成注册') || t.includes('completeyoursignup') || t.includes('completesignup') || t.includes('createyourgrokaccount');
 });
-if (!titleHit) return 'not-final-page';
+const formHit = !!document.querySelector('input[name="givenName"], input[autocomplete="given-name"]')
+    && !!document.querySelector('input[name="password"], input[type="password"]');
+const urlHit = location.href.includes('/sign-up');
+if (!titleHit && !(formHit && urlHit)) return 'not-final-page:' + compactText(document.body).slice(0, 80);
 
 const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
 const cfPresent = !!cfInput
@@ -4166,8 +4176,8 @@ const buttons = Array.from(document.querySelectorAll('button[type="submit"], but
     return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
 });
 const submitBtn = buttons.find((node) => {
-    const t = (node.innerText || node.textContent || '').replace(/\s+/g, '').toLowerCase();
-    return t.includes('完成注册') || t.includes('创建账户') || t.includes('sign up') || t.includes('createaccount');
+    const t = compactText(node);
+    return t.includes('完成注册') || t.includes('创建账户') || t.includes('completesignup') || t.includes('signup') || t.includes('createaccount');
 });
 if (!submitBtn) return 'final-page-no-submit';
 submitBtn.focus();
@@ -4180,6 +4190,8 @@ return 'final-page-clicked-submit';
                     """
                 )
                 last_submit_retry = now
+                if isinstance(retried, str):
+                    last_final_retry_state = retried
                 if log_callback and retried in ("final-page-no-submit", "final-page-clicked-submit", "final-page-request-submit"):
                     log_callback(f"[Debug] 最终页状态: {retried}")
                 if log_callback and isinstance(retried, str) and retried.startswith("final-page-wait-cf"):
@@ -4209,7 +4221,7 @@ const buttons = Array.from(document.querySelectorAll('button[type="submit"], but
 });
 const submitBtn = buttons.find((node) => {
     const t = (node.innerText || node.textContent || '').replace(/\s+/g, '').toLowerCase();
-    return t.includes('完成注册') || t.includes('创建账户') || t.includes('sign up') || t.includes('createaccount');
+    return t.includes('完成注册') || t.includes('创建账户') || t.includes('completesignup') || t.includes('signup') || t.includes('createaccount');
 });
 if (submitBtn) { submitBtn.focus(); submitBtn.click(); }
 return 'final-trigger:' + (executed ? '1' : '0') + ':' + (submitBtn ? 'clicked' : 'no-btn');
@@ -4246,7 +4258,7 @@ return 'final-trigger:' + (executed ? '1' : '0') + ':' + (submitBtn ? 'clicked' 
         sleep_with_cancel(1, cancel_callback)
 
     raise Exception(
-        f"等待超时：未获取到 sso cookie。已看到 cookies: {sorted(last_seen_names)}"
+        f"等待超时：未获取到 sso cookie。最后最终页状态: {last_final_retry_state or 'unknown'}。已看到 cookies: {sorted(last_seen_names)}"
     )
 
 

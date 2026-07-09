@@ -1107,6 +1107,10 @@ def test_wait_for_sso_cookie_final_page_can_submit_without_visible_turnstile():
     source = Path("grok_register_ttk.py").read_text(encoding="utf-8")
 
     assert "final-page-request-submit" in source
+    assert "completeyoursignup" in source
+    assert "completesignup" in source
+    assert "not-final-page:" in source
+    assert "最后最终页状态" in source
     assert "const hasVisibleChallenge = !!document.querySelector('iframe[src*=\"turnstile\"], div.cf-turnstile, [data-sitekey]');" in source
 
 
