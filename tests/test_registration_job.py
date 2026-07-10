@@ -400,7 +400,9 @@ def test_wait_for_post_code_transition_returns_when_profile_form_appears(monkeyp
     assert reg.wait_for_post_code_transition(FakePage(), "user@example.com", timeout=5) == "profile-form"
 
 
-def test_wait_for_post_code_transition_retries_email_on_error_page():
+def test_wait_for_post_code_transition_rejects_a_persistent_error_page(monkeypatch):
+    now = [0.0]
+
     class FakePage:
         def run_js(self, script):
             return {
@@ -408,11 +410,20 @@ def test_wait_for_post_code_transition_retries_email_on_error_page():
                 "bodySnippet": "An error occurred There was an error loading this page.",
             }
 
-    with pytest.raises(reg.ProfileSessionLost, match="验证码提交后 xAI 返回错误页"):
-        reg.wait_for_post_code_transition(FakePage(), "user@example.com", timeout=5)
+    monkeypatch.setattr(reg.time, "time", lambda: now[0])
+    monkeypatch.setattr(
+        reg,
+        "sleep_with_cancel",
+        lambda seconds, cancel_callback=None: now.__setitem__(0, now[0] + seconds),
+    )
+
+    with pytest.raises(reg.ProfileSessionLost, match="持续停在错误页"):
+        reg.wait_for_post_code_transition(FakePage(), "user@example.com", timeout=30)
 
 
-def test_wait_for_post_code_transition_includes_error_resource_diagnostics():
+def test_wait_for_post_code_transition_includes_error_resource_diagnostics(monkeypatch):
+    now = [0.0]
+
     class FakePage:
         def run_js(self, script):
             return {
@@ -425,13 +436,20 @@ def test_wait_for_post_code_transition_includes_error_resource_diagnostics():
                 },
             }
 
+    monkeypatch.setattr(reg.time, "time", lambda: now[0])
+    monkeypatch.setattr(
+        reg,
+        "sleep_with_cancel",
+        lambda seconds, cancel_callback=None: now.__setitem__(0, now[0] + seconds),
+    )
+
     with pytest.raises(reg.ProfileSessionLost) as exc:
-        reg.wait_for_post_code_transition(FakePage(), "user@example.com", timeout=5)
+        reg.wait_for_post_code_transition(FakePage(), "user@example.com", timeout=30)
 
     assert "verifyEmailSeen" in str(exc.value)
 
 
-def test_wait_for_post_code_transition_retries_error_page_after_verify(monkeypatch):
+def test_wait_for_post_code_transition_waits_through_error_page_after_verify(monkeypatch):
     states = iter(
         [
             {
@@ -458,13 +476,7 @@ def test_wait_for_post_code_transition_retries_error_page_after_verify(monkeypat
     monkeypatch.setattr(reg, "sleep_with_cancel", lambda seconds, cancel_callback=None: None)
 
     assert reg.wait_for_post_code_transition(page, "user@example.com", timeout=5) == "profile-form"
-    assert any(
-        method == "Input.dispatchMouseEvent"
-        and params.get("type") == "mousePressed"
-        and params.get("x") == 11
-        and params.get("y") == 22
-        for method, params in page.cdp_calls
-    )
+    assert page.cdp_calls == []
 
 
 def test_fill_code_waits_for_frontend_state_after_otp_input():
@@ -474,7 +486,7 @@ def test_fill_code_waits_for_frontend_state_after_otp_input():
     assert "sleep_with_cancel(0.6, cancel_callback)" in source
 
 
-def test_fill_code_types_otp_one_character_at_a_time_with_cdp(monkeypatch):
+def test_fill_code_falls_back_to_cdp_when_js_otp_fill_is_not_ready(monkeypatch):
     class FakePage:
         def __init__(self):
             self.cdp_calls = []
@@ -496,7 +508,7 @@ def test_fill_code_types_otp_one_character_at_a_time_with_cdp(monkeypatch):
                     "text": "Continue",
                 }
             if args:
-                return "filled-aggregate"
+                return "not-ready"
             return "clicked"
 
         def run_cdp(self, method, **params):
@@ -515,12 +527,12 @@ def test_fill_code_types_otp_one_character_at_a_time_with_cdp(monkeypatch):
 
     assert reg.fill_code_and_submit("user@example.com", "mail-token") == "TFF-KTN"
 
-    inserted = [
+    typed = [
         params["text"]
         for method, params in page.cdp_calls
-        if method == "Input.insertText"
+        if method == "Input.dispatchKeyEvent" and params.get("type") == "keyDown"
     ]
-    assert inserted == list("TFFKTN")
+    assert typed == list("TFFKTN")
     assert any(
         method == "Input.dispatchMouseEvent"
         and params.get("type") == "mousePressed"
@@ -1578,6 +1590,21 @@ def test_browser_options_apply_configured_proxy(monkeypatch):
     options = reg.create_browser_options()
 
     assert ("--proxy-server", "http://host.docker.internal:7890") in options.arguments
+    assert not hasattr(options, "extension")
+
+
+def test_turnstile_hook_is_deferred_until_profile_form():
+    source = Path("grok_register_ttk.py").read_text(encoding="utf-8")
+    browser_start = source.index("def start_browser(")
+    browser_end = source.index("\ndef stop_browser", browser_start)
+    signup_start = source.index("def open_signup_page(")
+    signup_end = source.index("\ndef has_profile_form", signup_start)
+    profile_start = source.index("def fill_profile_and_submit(")
+    profile_end = source.index("\ndef wait_for_sso_cookie", profile_start)
+
+    assert "install_turnstile_page_hook(" not in source[browser_start:browser_end]
+    assert "install_turnstile_page_hook(" not in source[signup_start:signup_end]
+    assert "install_turnstile_page_hook(page" in source[profile_start:profile_end]
 
 
 def test_turnstile_page_hook_installs_with_cdp(monkeypatch):

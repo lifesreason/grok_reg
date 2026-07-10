@@ -1231,8 +1231,6 @@ def create_browser_options():
         options.set_argument("--window-size", "1365,900")
     if should_run_headless():
         options.headless(True)
-    if os.path.exists(EXTENSION_PATH):
-        options.add_extension(EXTENSION_PATH)
     return options
 
 
@@ -4021,7 +4019,6 @@ def start_browser(log_callback=None):
                 page = tabs[-1] if tabs else browser.new_tab()
             _set_browser(browser)
             _set_page(page)
-            install_turnstile_page_hook(page, log_callback=log_callback)
             if log_callback and getattr(browser, "user_data_path", None):
                 log_callback(f"[Debug] 当前浏览器资料目录: {browser.user_data_path}")
             if log_callback:
@@ -4081,7 +4078,6 @@ def refresh_active_page():
         else:
             page = browser.new_tab()
         _set_page(page)
-        install_turnstile_page_hook(page)
     except Exception:
         _, page = restart_browser()
     return _get_page()
@@ -4146,7 +4142,6 @@ def open_signup_page(log_callback=None, cancel_callback=None):
     try:
         page = browser.get_tab(0)
         _set_page(page)
-        install_turnstile_page_hook(page, log_callback=log_callback)
         page.get(SIGNUP_URL)
     except Exception as e:
         if log_callback:
@@ -4154,7 +4149,6 @@ def open_signup_page(log_callback=None, cancel_callback=None):
         try:
             page = browser.new_tab()
             _set_page(page)
-            install_turnstile_page_hook(page, log_callback=log_callback)
             page.get(SIGNUP_URL)
         except Exception as e2:
             if log_callback:
@@ -4162,7 +4156,6 @@ def open_signup_page(log_callback=None, cancel_callback=None):
             browser, _ = restart_browser()
             page = browser.new_tab()
             _set_page(page)
-            install_turnstile_page_hook(page, log_callback=log_callback)
             page.get(SIGNUP_URL)
     page.wait.doc_loaded()
     sleep_with_cancel(2, cancel_callback)
@@ -4585,8 +4578,10 @@ def build_profile():
 def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None):
     page = _get_page()
     given_name, family_name, password = build_profile()
-    # 预热 Turnstile：等 2 秒让 iframe 初始化，插件会自动点击 checkbox
-    # 填资料期间 Turnstile 在后台求解，填完时大概率已通过
+    # Keep the registration and OTP router unmodified; Turnstile only exists on
+    # the profile step, so install the hook after xAI has reached that form.
+    install_turnstile_page_hook(page, log_callback=log_callback)
+    # 预热 Turnstile：等 2 秒让 iframe 初始化，由页面自身流程完成校验。
     if log_callback:
         log_callback("[*] 预热 Turnstile...")
     sleep_with_cancel(2, cancel_callback)
