@@ -9,6 +9,7 @@
         callbackCount: 0,
         renderCount: 0,
         executeCount: 0,
+        executedWidgetIds: [],
         errors: [],
     };
 

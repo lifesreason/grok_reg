@@ -4915,30 +4915,42 @@ if (!titleHit && !(formHit && urlHit)) return 'not-final-page:' + compactText(do
 const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
 const cfPresent = !!cfInput
   || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]');
+const rawHook = window.__grokTurnstile || {};
+const capturedWidgets = Array.isArray(rawHook.widgets) ? rawHook.widgets : [];
+const executedWidgetIds = Array.isArray(rawHook.executedWidgetIds) ? rawHook.executedWidgetIds : [];
+if (!Array.isArray(rawHook.executedWidgetIds)) rawHook.executedWidgetIds = executedWidgetIds;
+const executedWidgets = [];
 if (cfPresent) {
     const token = String((cfInput && cfInput.value) || '').trim();
     const solved = token.length >= 80;
     const hasVisibleChallenge = !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey]');
-    if (!solved && hasVisibleChallenge) return 'final-page-wait-cf:' + token.length;
-}
-const executedWidgets = [];
-try {
-    if (window.turnstile && typeof window.turnstile.execute === 'function') {
-        const capturedWidgets = Array.isArray(window.__grokTurnstile && window.__grokTurnstile.widgets)
-            ? window.__grokTurnstile.widgets
-            : [];
-        for (const widget of capturedWidgets) {
-            const id = widget && widget.id;
-            if (id !== undefined && id !== null && id !== '') {
-                try {
-                    window.turnstile.execute(id);
-                    executedWidgets.push(String(id));
-                } catch (e) {}
+    if (!solved && (hasVisibleChallenge || capturedWidgets.length > 0)) {
+        try {
+            if (window.turnstile && typeof window.turnstile.execute === 'function') {
+                for (const widget of capturedWidgets) {
+                    const id = widget && widget.id;
+                    const idText = String(id || '');
+                    if (!idText || executedWidgetIds.includes(idText)) continue;
+                    try {
+                        window.turnstile.execute(id);
+                        executedWidgetIds.push(idText);
+                        executedWidgets.push(idText);
+                    } catch (e) {}
+                }
             }
-        }
+        } catch (e) {}
+        return {
+            state: 'final-page-wait-cf',
+            tokenLen: token.length,
+            executedWidgets,
+            captured: {
+                executeCount: rawHook.executeCount || 0,
+                callbackCount: rawHook.callbackCount || 0,
+                executedWidgetIds: executedWidgetIds.slice(-5),
+            },
+        };
     }
-} catch (e) {}
-
+}
 const buttons = Array.from(document.querySelectorAll('button[type="submit"], button')).filter((node) => {
     return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
 });

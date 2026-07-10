@@ -1478,6 +1478,15 @@ def test_wait_for_sso_cookie_final_page_can_submit_without_visible_turnstile():
     assert '"web_accessible_resources": ["pageHook.js"]' in manifest
 
 
+def test_final_page_executes_each_turnstile_widget_only_once():
+    source = Path("grok_register_ttk.py").read_text(encoding="utf-8")
+    page_hook = Path("turnstilePatch/pageHook.js").read_text(encoding="utf-8")
+
+    assert "executedWidgetIds" in source
+    assert "executedWidgetIds" in page_hook
+    assert "final-page-wait-cf" in source
+
+
 def test_wait_for_sso_cookie_uses_native_click_for_final_page(monkeypatch):
     events = []
 
