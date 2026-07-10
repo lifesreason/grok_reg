@@ -1607,6 +1607,17 @@ def test_turnstile_hook_is_deferred_until_profile_form():
     assert "install_turnstile_page_hook(page" in source[profile_start:profile_end]
 
 
+def test_turnstile_hook_is_network_safe_and_installed_before_otp_submit():
+    page_hook = Path("turnstilePatch/pageHook.js").read_text(encoding="utf-8")
+    source = Path("grok_register_ttk.py").read_text(encoding="utf-8")
+    otp_start = source.index("def fill_code_and_submit(")
+    otp_end = source.index("\ndef getTurnstileToken", otp_start)
+
+    assert "window.fetch =" not in page_hook
+    assert "XMLHttpRequest" not in page_hook
+    assert "install_turnstile_page_hook(page" in source[otp_start:otp_end]
+
+
 def test_turnstile_page_hook_installs_with_cdp(monkeypatch):
     events = []
 

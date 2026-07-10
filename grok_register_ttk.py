@@ -4261,6 +4261,10 @@ return false;
     clean_code = str(code).replace("-", "").strip()
     deadline = time.time() + timeout
 
+    # The profile form is rendered immediately after OTP success. Install the
+    # Turnstile-only hook before that transition so it can observe the widget.
+    install_turnstile_page_hook(page, log_callback=log_callback)
+
     # 在填充/提交前启动 CDP 网络监听，无论请求经由 fetch/XHR/worker 发出，
     # 都能截获 VerifyEmailValidationCode 的响应体，定位服务端拒绝原因。
     listen_started = False

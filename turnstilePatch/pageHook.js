@@ -12,65 +12,6 @@
         errors: [],
     };
 
-    // 捕获验证码接口的请求体/响应体，便于定位服务端为何拒绝
-    window.__grokNet = window.__grokNet || { verifyEmail: [] };
-    function isVerifyEmailUrl(url) {
-        return String(url || "").indexOf("VerifyEmailValidationCode") !== -1;
-    }
-    function pushVerify(rec) {
-        try {
-            window.__grokNet.verifyEmail.push(rec);
-            if (window.__grokNet.verifyEmail.length > 5) window.__grokNet.verifyEmail.shift();
-        } catch (e) {}
-    }
-    try {
-        var origFetch = window.fetch;
-        if (typeof origFetch === "function") {
-            window.fetch = function (input, init) {
-                var url = (typeof input === "string") ? input : (input && input.url) || "";
-                var reqBody = (init && init.body) ? String(init.body).slice(0, 400) : "";
-                var p = origFetch.apply(this, arguments);
-                if (isVerifyEmailUrl(url)) {
-                    p.then(function (resp) {
-                        try {
-                            resp.clone().text().then(function (txt) {
-                                pushVerify({ via: "fetch", url: String(url).slice(0, 200), status: resp.status, reqBody: reqBody, respBody: String(txt).slice(0, 400) });
-                            }).catch(function () {});
-                        } catch (e) {}
-                    }).catch(function () {});
-                }
-                return p;
-            };
-        }
-    } catch (e) { recordErrorSafe("fetch-hook", e); }
-    try {
-        var OrigXHR = window.XMLHttpRequest;
-        if (OrigXHR) {
-            var origOpen = OrigXHR.prototype.open;
-            var origSend = OrigXHR.prototype.send;
-            OrigXHR.prototype.open = function (method, url) {
-                this.__grokUrl = url;
-                return origOpen.apply(this, arguments);
-            };
-            OrigXHR.prototype.send = function (body) {
-                var xhr = this;
-                if (isVerifyEmailUrl(xhr.__grokUrl)) {
-                    var reqBody = body ? String(body).slice(0, 400) : "";
-                    xhr.addEventListener("loadend", function () {
-                        var respBody = "";
-                        try { respBody = String(xhr.responseText || "").slice(0, 400); } catch (e) {}
-                        pushVerify({ via: "xhr", url: String(xhr.__grokUrl).slice(0, 200), status: xhr.status, reqBody: reqBody, respBody: respBody });
-                    });
-                }
-                return origSend.apply(this, arguments);
-            };
-        }
-    } catch (e) { recordErrorSafe("xhr-hook", e); }
-
-    function recordErrorSafe(step, error) {
-        try { recordError(step, error); } catch (e) {}
-    }
-
     function recordError(step, error) {
         try {
             window.__grokTurnstile.errors.push({
