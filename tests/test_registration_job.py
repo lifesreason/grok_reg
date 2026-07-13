@@ -1777,7 +1777,7 @@ def test_yyds_code_polling_triggers_resend_callback(monkeypatch):
 
 
 def test_create_browser_options_loads_turnstile_extension_and_user_agent(monkeypatch):
-    recorded = {"args": [], "extension": None, "user_agent": None}
+    recorded = {"args": [], "extension": None, "user_agent": None, "prefs": {}}
 
     class FakeOptions:
         def auto_port(self):
@@ -1798,6 +1798,9 @@ def test_create_browser_options_loads_turnstile_extension_and_user_agent(monkeyp
         def set_user_agent(self, value):
             recorded["user_agent"] = value
 
+        def set_pref(self, key, value):
+            recorded["prefs"][key] = value
+
         def add_extension(self, path):
             recorded["extension"] = path
 
@@ -1805,6 +1808,7 @@ def test_create_browser_options_loads_turnstile_extension_and_user_agent(monkeyp
             return None
 
     monkeypatch.setattr(reg, "ChromiumOptions", FakeOptions)
+    # 仅在显式自定义 UA（非默认）时才覆盖，避免版本漂移。
     monkeypatch.setattr(reg, "config", {**reg.DEFAULT_CONFIG, "proxy": "", "user_agent": "TestAgent/1.0"})
     monkeypatch.setattr(reg, "should_apply_container_chrome_flags", lambda: True)
     monkeypatch.setattr(reg, "should_run_headless", lambda: False)
@@ -1817,6 +1821,8 @@ def test_create_browser_options_loads_turnstile_extension_and_user_agent(monkeyp
     assert recorded["user_agent"] == "TestAgent/1.0"
     assert recorded["extension"] == "/tmp/fake-turnstile-extension"
     assert any("AutomationControlled" in str(arg) for arg in recorded["args"])
+    assert any("enable-automation" in str(arg) for arg in recorded["args"])
+    assert any("swiftshader" in str(arg).lower() or "webgl" in str(arg).lower() for arg in recorded["args"])
 
 
 def test_docker_starts_web_server_directly_and_keeps_xvfb_for_registration():

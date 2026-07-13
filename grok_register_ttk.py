@@ -1410,38 +1410,164 @@ def create_browser_options():
     proxy = normalize_proxy_for_runtime(config.get("proxy", ""))
     if proxy:
         options.set_argument("--proxy-server", proxy)
-    # 与 HTTP 客户端保持一致的 UA，避免容器 Chromium 默认 UA 和站点画像冲突。
-    user_agent = get_user_agent()
-    if user_agent:
+
+    # 关键：手动浏览器能过、脚本不过时，优先消掉明显的自动化开关。
+    # 不要强行覆盖成“Chrome/138”这类可能与容器真实 Chromium 版本不一致的 UA，
+    # 版本漂移本身就是 Turnstile 常见扣分项；仅在配置显式给出时才设置。
+    configured_ua = str(config.get("user_agent") or "").strip()
+    default_ua = str(DEFAULT_CONFIG.get("user_agent") or "").strip()
+    if configured_ua and configured_ua != default_ua:
         try:
-            options.set_user_agent(user_agent)
+            options.set_user_agent(configured_ua)
         except Exception:
-            options.set_argument(f"--user-agent={user_agent}")
-    # turnstilePatch 扩展负责 document_start 隐藏 webdriver / 自动点选；
-    # 以前只 CDP 注入 pageHook，扩展从未真正加载。
+            options.set_argument(f"--user-agent={configured_ua}")
+
+    # 隐藏 automation controlled / enable-automation 横幅类特征。
+    options.set_argument("--disable-blink-features=AutomationControlled")
+    options.set_argument("--disable-infobars")
+    options.set_argument("--no-first-run")
+    options.set_argument("--no-default-browser-check")
+    options.set_argument("--password-store=basic")
+    try:
+        # DrissionPage/Chromium 参数写法兼容两种形式。
+        options.set_argument("--exclude-switches", "enable-automation")
+    except Exception:
+        options.set_argument("--exclude-switches=enable-automation")
+    try:
+        options.set_pref("credentials_enable_service", False)
+        options.set_pref("profile.password_manager_enabled", False)
+    except Exception:
+        pass
+
+    # turnstilePatch 扩展负责 document_start 隐藏 webdriver / 自动点选。
     if os.path.isdir(EXTENSION_PATH):
+        ext_path = os.path.abspath(EXTENSION_PATH)
+        loaded = False
         try:
             if hasattr(options, "add_extension"):
-                options.add_extension(EXTENSION_PATH)
-            else:
-                options.set_argument(f"--load-extension={EXTENSION_PATH}")
-                options.set_argument(f"--disable-extensions-except={EXTENSION_PATH}")
+                options.add_extension(ext_path)
+                loaded = True
         except Exception:
-            try:
-                options.set_argument(f"--load-extension={EXTENSION_PATH}")
-            except Exception:
-                pass
+            loaded = False
+        # 再补一层命令行加载，兼容部分 Chromium 对 unpacked 扩展的限制。
+        try:
+            options.set_argument(f"--load-extension={ext_path}")
+            options.set_argument(f"--disable-extensions-except={ext_path}")
+            options.set_argument("--enable-unsafe-extension-debugging")
+            loaded = True
+        except Exception:
+            pass
+        if not loaded:
+            pass
+
     if should_apply_container_chrome_flags():
         options.set_argument("--no-sandbox")
         options.set_argument("--disable-dev-shm-usage")
-        options.set_argument("--disable-gpu")
+        # 不要 --disable-gpu：flexible Turnstile 会看 WebGL/Canvas；容器用 ANGLE/SwiftShader 更接近可用路径。
+        options.set_argument("--use-gl=angle")
+        options.set_argument("--use-angle=swiftshader-webgl")
+        options.set_argument("--enable-webgl")
+        options.set_argument("--ignore-gpu-blocklist")
         options.set_argument("--window-size", "1365,900")
-        # Docker/Xvfb 下尽量模拟普通桌面环境，降低 headless/容器指纹。
         options.set_argument("--lang", "en-US")
-        options.set_argument("--disable-blink-features=AutomationControlled")
+        options.set_argument("--accept-lang", "en-US,en;q=0.9")
     if should_run_headless():
         options.headless(True)
     return options
+
+
+def probe_browser_stealth(page, log_callback=None):
+    """启动后采样自动化指纹，方便对照“手动能过/脚本不过”。"""
+    if not page:
+        return {}
+    try:
+        detail = page.run_js(
+            r"""
+return {
+  webdriver: navigator.webdriver,
+  languages: navigator.languages,
+  platform: navigator.platform,
+  userAgent: navigator.userAgent,
+  hardwareConcurrency: navigator.hardwareConcurrency,
+  deviceMemory: navigator.deviceMemory || null,
+  chrome: !!(window.chrome && window.chrome.runtime),
+  plugins: navigator.plugins ? navigator.plugins.length : 0,
+  webgl: (function () {
+    try {
+      const c = document.createElement('canvas');
+      const gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+      if (!gl) return {ok:false};
+      const ext = gl.getExtension('WEBGL_debug_renderer_info');
+      return {
+        ok: true,
+        vendor: gl.getParameter(ext ? ext.UNMASKED_VENDOR_WEBGL : gl.VENDOR),
+        renderer: gl.getParameter(ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER),
+      };
+    } catch (e) {
+      return {ok:false, error: String(e && e.message || e).slice(0, 120)};
+    }
+  })(),
+};
+            """
+        )
+    except Exception as exc:
+        detail = {"error": str(exc)[:200]}
+    if log_callback:
+        try:
+            log_callback(f"[Debug] 浏览器指纹采样: {json.dumps(detail, ensure_ascii=False)[:500]}")
+        except Exception:
+            log_callback(f"[Debug] 浏览器指纹采样: {detail}")
+    return detail if isinstance(detail, dict) else {"raw": detail}
+
+
+def humanize_page_activity(page, log_callback=None, cancel_callback=None):
+    """在 Turnstile 评分窗口内模拟轻微鼠标/滚动，避免“纯脚本填表零交互”。"""
+    if not page:
+        return
+    try:
+        viewport = page.run_js(
+            """
+return {
+  w: Math.max(320, window.innerWidth || 1365),
+  h: Math.max(320, window.innerHeight || 900),
+};
+            """
+        ) or {"w": 1365, "h": 900}
+        width = int(viewport.get("w") or 1365)
+        height = int(viewport.get("h") or 900)
+        points = [
+            (int(width * 0.22), int(height * 0.28)),
+            (int(width * 0.48), int(height * 0.42)),
+            (int(width * 0.63), int(height * 0.57)),
+            (int(width * 0.40), int(height * 0.70)),
+        ]
+        for x, y in points:
+            raise_if_cancelled(cancel_callback)
+            try:
+                page.run_cdp(
+                    "Input.dispatchMouseEvent",
+                    type="mouseMoved",
+                    x=x,
+                    y=y,
+                    modifiers=0,
+                )
+            except Exception:
+                pass
+            sleep_with_cancel(random.uniform(0.05, 0.16), cancel_callback)
+        try:
+            page.run_js(
+                """
+window.scrollBy(0, Math.floor(40 + Math.random() * 120));
+setTimeout(() => window.scrollBy(0, -Math.floor(20 + Math.random() * 60)), 120);
+                """
+            )
+        except Exception:
+            pass
+        if log_callback:
+            log_callback("[Debug] 已注入轻微鼠标/滚动交互，等待 Turnstile 被动评分")
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 人机交互模拟失败: {str(exc)[:160]}")
 
 
 def turnstile_page_hook_source():
@@ -4689,6 +4815,11 @@ def start_browser(log_callback=None):
                 page = tabs[-1] if tabs else browser.new_tab()
             _set_browser(browser)
             _set_page(page)
+            # 尽早注入 pageHook，覆盖后续所有导航（扩展加载失败时的兜底）。
+            try:
+                install_turnstile_page_hook(page, log_callback=log_callback)
+            except Exception:
+                pass
             if log_callback and getattr(browser, "user_data_path", None):
                 log_callback(f"[Debug] 当前浏览器资料目录: {browser.user_data_path}")
             if log_callback:
@@ -4697,9 +4828,9 @@ def start_browser(log_callback=None):
                 extension_loaded = os.path.isdir(EXTENSION_PATH)
                 log_callback(
                     f"[Debug] 浏览器模式: {mode}，代理: {proxy or '直连'}，"
-                    f"Turnstile扩展: {'已加载' if extension_loaded else '未找到'}，"
-                    f"UA: {(get_user_agent() or '')[:48]}"
+                    f"Turnstile扩展路径: {'存在' if extension_loaded else '未找到'}"
                 )
+            probe_browser_stealth(page, log_callback=log_callback)
             if log_callback and attempt > 1:
                 log_callback(f"[*] 浏览器第 {attempt} 次启动成功")
             return browser, page
@@ -5260,10 +5391,11 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
     # Keep the registration and OTP router unmodified; Turnstile only exists on
     # the profile step, so install the hook after xAI has reached that form.
     install_turnstile_page_hook(page, log_callback=log_callback)
-    # 预热 Turnstile：等 2 秒让 iframe 初始化，由页面自身流程完成校验。
+    # 预热 Turnstile：先被动等待，不要一上来狂 execute（手动能过时说明被动评分更重要）。
     if log_callback:
-        log_callback("[*] 预热 Turnstile...")
-    sleep_with_cancel(2, cancel_callback)
+        log_callback("[*] 预热 Turnstile（被动评分，暂不强制 execute）...")
+    humanize_page_activity(page, log_callback=log_callback, cancel_callback=cancel_callback)
+    sleep_with_cancel(3, cancel_callback)
     # 预热后先采集一次 Turnstile 结构，便于判断是 IP 信誉还是自动化指纹问题
     if log_callback:
         try:
@@ -5276,6 +5408,7 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
     form_filled_once = False
     wait_cf_since = None
     last_cf_retry_at = 0.0
+    last_humanize_at = 0.0
     cf_wait_log_state = {}
     error_page_retries = 0
     max_error_page_retries = 4
@@ -5470,24 +5603,24 @@ return 'profile-filled';
                 now = time.time()
                 if wait_cf_since is None:
                     wait_cf_since = now
-                # token 长时间为 0 时，多半是出口 IP/代理信誉问题，提前失败换号比干等到 SSO 超时更有用。
-                if now - wait_cf_since >= 45 and str(token_len) in {"0", ""}:
+                # token 长时间为 0：先给被动评分窗口；仍为 0 再少量 trigger；再不行提前失败。
+                if now - wait_cf_since >= 70 and str(token_len) in {"0", ""}:
                     raise Exception(
-                        "Cloudflare Turnstile 45s 内未签发 token（token长度=0）。"
-                        "常见原因是代理/出口 IP 信誉差或被 Cloudflare 静默拒绝，请更换代理后重试"
+                        "Cloudflare Turnstile 70s 内未签发 token（token长度=0）。"
+                        "同一代理若手动能过、脚本不过，通常是 Docker/自动化浏览器指纹被拒，"
+                        "不是验证码逻辑错误"
                     )
-                # 卡住后主动触发 Turnstile（提交时才验证的隐形模式）
-                if now - wait_cf_since >= 8 and now - last_cf_retry_at >= 8:
+                # 前 20 秒只做人机交互，不强制 execute（避免脚本味过重）
+                if now - last_humanize_at >= 4:
+                    humanize_page_activity(page, log_callback=None, cancel_callback=cancel_callback)
+                    last_humanize_at = now
+                if now - wait_cf_since >= 20 and now - last_cf_retry_at >= 12:
                     if log_callback:
-                        log_callback("[*] Cloudflare 验证卡住，主动触发 Turnstile（暂不空 token 提交）...")
+                        log_callback("[*] 被动等待后仍无 token，尝试有限次 Turnstile execute...")
                     try:
                         trig = page.run_js(build_profile_submit_script("trigger"))
                         if log_callback:
                             log_callback(f"[Debug] Turnstile 主动触发结果: {trig}")
-                        try:
-                            page.run_js(build_profile_submit_script("trigger"))
-                        except Exception:
-                            pass
                         _click_turnstile_challenge_if_visible(page)
                     except Exception as cf_exc:
                         if log_callback:
@@ -5517,15 +5650,16 @@ return 'profile-filled';
             now = time.time()
             if wait_cf_since is None:
                 wait_cf_since = now
-            if now - wait_cf_since >= 45 and str(token_len) in {"0", ""}:
+            if now - wait_cf_since >= 70 and str(token_len) in {"0", ""}:
                 raise Exception(
-                    "Cloudflare Turnstile 45s 内未签发 token（token长度=0）。"
-                    "常见原因是代理/出口 IP 信誉差或被 Cloudflare 静默拒绝，请更换代理后重试"
+                    "Cloudflare Turnstile 70s 内未签发 token（token长度=0）。"
+                    "同一代理若手动能过、脚本不过，通常是 Docker/自动化浏览器指纹被拒"
                 )
-            if now - wait_cf_since >= 8 and now - last_cf_retry_at >= 8:
+            if now - wait_cf_since >= 20 and now - last_cf_retry_at >= 12:
                 if log_callback:
-                    log_callback("[*] 提交前仍卡住，主动触发 Turnstile（暂不空 token 提交）...")
+                    log_callback("[*] 提交前仍无 token，尝试有限次 Turnstile execute...")
                 try:
+                    humanize_page_activity(page, log_callback=None, cancel_callback=cancel_callback)
                     trig = page.run_js(build_profile_submit_script("trigger"))
                     if log_callback:
                         log_callback(f"[Debug] Turnstile 主动触发结果: {trig}")
