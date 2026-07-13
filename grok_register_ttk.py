@@ -44,8 +44,9 @@ except ModuleNotFoundError:
         pass
 
 try:
-    from curl_cffi import requests
+    from curl_cffi import CurlMime, requests
 except ModuleNotFoundError:
+    CurlMime = None
     requests = None
 
 
@@ -1938,14 +1939,23 @@ def export_and_push_cpa_credential(email, refresh_token, settings=None, log_call
         result["upload_error"] = "CPA 自动推送缺少管理地址或管理密钥"
         return result
 
+    multipart = None
     try:
-        with open(local_path, "rb") as credential:
-            response = http_post(
-                normalize_cpa_management_auth_files_url(management_base),
-                headers={"Authorization": f"Bearer {management_key}"},
-                files={"file": (filename, credential, "application/json")},
-                timeout=30,
-            )
+        if CurlMime is None:
+            raise RuntimeError("curl_cffi 未安装，无法上传 CPA 凭证")
+        multipart = CurlMime()
+        multipart.addpart(
+            name="file",
+            content_type="application/json",
+            filename=filename,
+            local_path=local_path,
+        )
+        response = http_post(
+            normalize_cpa_management_auth_files_url(management_base),
+            headers={"Authorization": f"Bearer {management_key}"},
+            multipart=multipart,
+            timeout=30,
+        )
         response.raise_for_status()
         result["uploaded"] = True
         result["upload_status"] = getattr(response, "status_code", None)
@@ -1953,6 +1963,9 @@ def export_and_push_cpa_credential(email, refresh_token, settings=None, log_call
     except Exception as exc:
         result["upload_error"] = str(exc)[:500]
         log(f"[cpa] 推送 CPA 凭证失败: {result['upload_error']}")
+    finally:
+        if multipart is not None:
+            multipart.close()
     return result
 
 

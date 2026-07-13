@@ -1757,6 +1757,17 @@ def test_turnstile_page_hook_installs_with_cdp(monkeypatch):
 def test_export_and_push_cpa_credential_writes_management_auth_file(monkeypatch, tmp_path):
     captured = {}
 
+    class FakeMultipart:
+        def __init__(self):
+            self.parts = []
+            self.closed = False
+
+        def addpart(self, **kwargs):
+            self.parts.append(kwargs)
+
+        def close(self):
+            self.closed = True
+
     class FakeResponse:
         status_code = 201
         text = '{"status":"ok"}'
@@ -1767,10 +1778,11 @@ def test_export_and_push_cpa_credential_writes_management_auth_file(monkeypatch,
     def fake_post(url, **kwargs):
         captured["url"] = url
         captured["headers"] = kwargs["headers"]
-        captured["filename"] = kwargs["files"]["file"][0]
+        captured["multipart"] = kwargs["multipart"]
         return FakeResponse()
 
     monkeypatch.setattr(reg, "http_post", fake_post)
+    monkeypatch.setattr(reg, "CurlMime", FakeMultipart, raising=False)
     monkeypatch.setattr(
         reg,
         "exchange_xai_refresh_token",
@@ -1794,9 +1806,17 @@ def test_export_and_push_cpa_credential_writes_management_auth_file(monkeypatch,
     assert result["ok"] is True
     assert captured["url"] == "https://cpa.example.test/v0/management/auth-files"
     assert captured["headers"]["Authorization"] == "Bearer management-secret"
-    assert captured["filename"] == "xai-user@example.com.json"
+    assert captured["multipart"].parts == [
+        {
+            "name": "file",
+            "content_type": "application/json",
+            "filename": "xai-user@example.com.json",
+            "local_path": str(tmp_path / "xai-user@example.com.json"),
+        }
+    ]
+    assert captured["multipart"].closed is True
     assert result["refresh_token"] == "rotated-refresh-token"
-    payload = json.loads(tmp_path.joinpath(captured["filename"]).read_text(encoding="utf-8"))
+    payload = json.loads(tmp_path.joinpath(result["filename"]).read_text(encoding="utf-8"))
     assert payload["type"] == "xai"
     assert payload["refresh_token"] == "rotated-refresh-token"
 
