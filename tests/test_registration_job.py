@@ -1647,6 +1647,13 @@ def test_docker_runs_visible_chromium_under_xvfb_by_default():
     assert 'GROK_REG_HEADLESS: "0"' in compose
 
 
+def test_docker_workflow_publishes_amd64_and_arm64_images():
+    workflow = Path(".github/workflows/docker-image.yml").read_text(encoding="utf-8")
+
+    assert "docker/setup-qemu-action@v3" in workflow
+    assert "platforms: linux/amd64,linux/arm64" in workflow
+
+
 def test_loopback_proxy_is_rewritten_inside_docker(monkeypatch):
     monkeypatch.setenv("GROK_REG_IN_DOCKER", "1")
 
