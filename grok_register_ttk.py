@@ -1410,11 +1410,35 @@ def create_browser_options():
     proxy = normalize_proxy_for_runtime(config.get("proxy", ""))
     if proxy:
         options.set_argument("--proxy-server", proxy)
+    # 与 HTTP 客户端保持一致的 UA，避免容器 Chromium 默认 UA 和站点画像冲突。
+    user_agent = get_user_agent()
+    if user_agent:
+        try:
+            options.set_user_agent(user_agent)
+        except Exception:
+            options.set_argument(f"--user-agent={user_agent}")
+    # turnstilePatch 扩展负责 document_start 隐藏 webdriver / 自动点选；
+    # 以前只 CDP 注入 pageHook，扩展从未真正加载。
+    if os.path.isdir(EXTENSION_PATH):
+        try:
+            if hasattr(options, "add_extension"):
+                options.add_extension(EXTENSION_PATH)
+            else:
+                options.set_argument(f"--load-extension={EXTENSION_PATH}")
+                options.set_argument(f"--disable-extensions-except={EXTENSION_PATH}")
+        except Exception:
+            try:
+                options.set_argument(f"--load-extension={EXTENSION_PATH}")
+            except Exception:
+                pass
     if should_apply_container_chrome_flags():
         options.set_argument("--no-sandbox")
         options.set_argument("--disable-dev-shm-usage")
         options.set_argument("--disable-gpu")
         options.set_argument("--window-size", "1365,900")
+        # Docker/Xvfb 下尽量模拟普通桌面环境，降低 headless/容器指纹。
+        options.set_argument("--lang", "en-US")
+        options.set_argument("--disable-blink-features=AutomationControlled")
     if should_run_headless():
         options.headless(True)
     return options
@@ -4670,7 +4694,12 @@ def start_browser(log_callback=None):
             if log_callback:
                 proxy = normalize_proxy_for_runtime(config.get("proxy", ""))
                 mode = "headless" if should_run_headless() else "visible"
-                log_callback(f"[Debug] 浏览器模式: {mode}，代理: {proxy or '直连'}")
+                extension_loaded = os.path.isdir(EXTENSION_PATH)
+                log_callback(
+                    f"[Debug] 浏览器模式: {mode}，代理: {proxy or '直连'}，"
+                    f"Turnstile扩展: {'已加载' if extension_loaded else '未找到'}，"
+                    f"UA: {(get_user_agent() or '')[:48]}"
+                )
             if log_callback and attempt > 1:
                 log_callback(f"[*] 浏览器第 {attempt} 次启动成功")
             return browser, page

@@ -1776,6 +1776,49 @@ def test_yyds_code_polling_triggers_resend_callback(monkeypatch):
     assert resend_calls
 
 
+def test_create_browser_options_loads_turnstile_extension_and_user_agent(monkeypatch):
+    recorded = {"args": [], "extension": None, "user_agent": None}
+
+    class FakeOptions:
+        def auto_port(self):
+            return None
+
+        def set_timeouts(self, base=1):
+            return None
+
+        def set_browser_path(self, path):
+            return None
+
+        def set_argument(self, *args):
+            if len(args) == 1:
+                recorded["args"].append(args[0])
+            elif len(args) >= 2:
+                recorded["args"].append(f"{args[0]}={args[1]}")
+
+        def set_user_agent(self, value):
+            recorded["user_agent"] = value
+
+        def add_extension(self, path):
+            recorded["extension"] = path
+
+        def headless(self, value=True):
+            return None
+
+    monkeypatch.setattr(reg, "ChromiumOptions", FakeOptions)
+    monkeypatch.setattr(reg, "config", {**reg.DEFAULT_CONFIG, "proxy": "", "user_agent": "TestAgent/1.0"})
+    monkeypatch.setattr(reg, "should_apply_container_chrome_flags", lambda: True)
+    monkeypatch.setattr(reg, "should_run_headless", lambda: False)
+    monkeypatch.setattr(reg, "EXTENSION_PATH", "/tmp/fake-turnstile-extension")
+    monkeypatch.setattr(reg.os.path, "isdir", lambda path: path == "/tmp/fake-turnstile-extension")
+
+    options = reg.create_browser_options()
+
+    assert isinstance(options, FakeOptions)
+    assert recorded["user_agent"] == "TestAgent/1.0"
+    assert recorded["extension"] == "/tmp/fake-turnstile-extension"
+    assert any("AutomationControlled" in str(arg) for arg in recorded["args"])
+
+
 def test_docker_starts_web_server_directly_and_keeps_xvfb_for_registration():
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
     compose = Path("docker-compose.yml").read_text(encoding="utf-8")
