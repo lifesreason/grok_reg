@@ -1470,7 +1470,8 @@ def create_browser_options():
         options.set_argument("--ignore-gpu-blocklist")
         options.set_argument("--window-size", "1365,900")
         options.set_argument("--lang", "en-US")
-        options.set_argument("--accept-lang", "en-US,en;q=0.9")
+        # 不要写成 Accept-Language 的 q 值形式，部分 Chromium 会原样塞进 navigator.languages。
+        options.set_argument("--accept-lang", "en-US,en")
     if should_run_headless():
         options.headless(True)
     return options
@@ -4815,11 +4816,10 @@ def start_browser(log_callback=None):
                 page = tabs[-1] if tabs else browser.new_tab()
             _set_browser(browser)
             _set_page(page)
-            # 尽早注入 pageHook，覆盖后续所有导航（扩展加载失败时的兜底）。
-            try:
-                install_turnstile_page_hook(page, log_callback=log_callback)
-            except Exception:
-                pass
+            # 注意：不要在启动时注入 pageHook。
+            # 历史回归：OTP 通过后过早补丁 turnstile/路由，会让 xAI 停在
+            # "An error occurred / error loading this page"，永远进不了资料页。
+            # pageHook 只在 fill_profile_and_submit 进入资料页后再装。
             if log_callback and getattr(browser, "user_data_path", None):
                 log_callback(f"[Debug] 当前浏览器资料目录: {browser.user_data_path}")
             if log_callback:
@@ -5067,9 +5067,10 @@ return false;
     clean_code = str(code).replace("-", "").strip()
     deadline = time.time() + timeout
 
-    # The profile form is rendered immediately after OTP success. Install the
-    # Turnstile-only hook before that transition so it can observe the widget.
-    install_turnstile_page_hook(page, log_callback=log_callback)
+    # 不要在 OTP 页安装 Turnstile pageHook。
+    # 验证码接口 200 后 xAI 前端路由对脚本注入很敏感，过早 hook 会导致
+    # 持续停在 "An error occurred" 过渡/错误页，无法进入资料页。
+    # Turnstile 仅存在于资料页，延后到 fill_profile_and_submit 再注入。
 
     # 在填充/提交前启动 CDP 网络监听，无论请求经由 fetch/XHR/worker 发出，
     # 都能截获 VerifyEmailValidationCode 的响应体，定位服务端拒绝原因。

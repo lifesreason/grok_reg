@@ -1665,9 +1665,11 @@ def test_wait_for_sso_cookie_final_page_can_submit_without_visible_turnstile():
     # managed/flexible 模式无可见 iframe 时也必须等 token，禁止空 token 提交
     assert "只要 token 未签发就必须等待" in source
     assert "int(retried.get(\"tokenLen\") or 0) >= 80" in source
-    assert 'chrome.runtime.getURL("pageHook.js")' in content_script
+    # content.js 只做 stealth，不再在 OTP 阶段注入 pageHook（会破坏验证码后路由）
+    assert "injectPageHook" not in content_script
     assert "window.__grokTurnstile" in page_hook
-    assert '"web_accessible_resources": ["pageHook.js"]' in manifest
+    assert "pageHook.js" in manifest
+    assert "accounts.x.ai" in manifest
 
 
 def test_final_page_executes_each_turnstile_widget_only_once():
@@ -1900,15 +1902,19 @@ def test_turnstile_hook_is_deferred_until_profile_form():
     assert "install_turnstile_page_hook(page" in source[profile_start:profile_end]
 
 
-def test_turnstile_hook_is_network_safe_and_installed_before_otp_submit():
+def test_turnstile_hook_is_network_safe_and_deferred_from_otp_submit():
     page_hook = Path("turnstilePatch/pageHook.js").read_text(encoding="utf-8")
     source = Path("grok_register_ttk.py").read_text(encoding="utf-8")
     otp_start = source.index("def fill_code_and_submit(")
     otp_end = source.index("\ndef getTurnstileToken", otp_start)
+    profile_start = source.index("def fill_profile_and_submit(")
+    profile_end = source.index("\ndef wait_for_sso_cookie", profile_start)
 
     assert "window.fetch =" not in page_hook
     assert "XMLHttpRequest" not in page_hook
-    assert "install_turnstile_page_hook(page" in source[otp_start:otp_end]
+    # OTP 阶段禁止安装 pageHook，避免验证码后 SPA 路由卡死
+    assert "install_turnstile_page_hook(page" not in source[otp_start:otp_end]
+    assert "install_turnstile_page_hook(page" in source[profile_start:profile_end]
 
 
 def test_turnstile_page_hook_installs_with_cdp(monkeypatch):
