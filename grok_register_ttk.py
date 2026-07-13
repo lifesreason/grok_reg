@@ -2947,8 +2947,12 @@ if (action === 'trigger') {{
     }} catch (e) {{}}
     const submitBtn = pickSubmitButton();
     if (!submitBtn) return 'trigger-no-submit';
-    submitProfileForm(submitBtn);
-    return 'trigger-clicked:' + (executed ? '1' : '0') + ':' + executedWidgets.join(',');
+    // 仅在已有 token 时才点提交；token 仍为空时只触发 challenge，避免空 token 提交后卡死。
+    if (cf === 'solved' || cf === 'none') {{
+        submitProfileForm(submitBtn);
+        return 'trigger-clicked:' + (executed ? '1' : '0') + ':' + executedWidgets.join(',');
+    }}
+    return 'trigger-wait-cf:' + (executed ? '1' : '0') + ':' + executedWidgets.join(',') + ':' + cf;
 }}
 const submitBtn = pickSubmitButton();
 if (!submitBtn) return 'no-submit-button';
@@ -2957,13 +2961,8 @@ if (!hasResource('ValidatePassword')) {{
     return 'wait-password-validation';
 }}
 if (cf.startsWith('wait-cloudflare')) {{
-    const detail = turnstileDetail();
-    const hasVisibleChallenge = (detail.widgets && detail.widgets.length > 0) || (detail.iframes && detail.iframes.length > 0);
-    if (!hasVisibleChallenge && action !== 'check') {{
-        submitProfileForm(submitBtn);
-        return 'submitted-no-challenge';
-    }}
-    if (!hasVisibleChallenge && action === 'check') return 'ready-to-submit-no-challenge';
+    // 只要存在 cf-turnstile-response 且 token 为空，就必须等待。
+    // managed/flexible 模式经常没有可见 iframe，不能据此当成“无挑战”提前提交。
     return cf;
 }}
 if (action === 'check') return 'ready-to-submit';
@@ -3962,18 +3961,42 @@ def generate_username(length=10):
     return "".join(secrets.choice(chars) for _ in range(length))
 
 
-def remember_rejected_email_domain(domain):
-    normalized = str(domain or "").strip().lower()
+def rejected_email_domain_variants(domain):
+    normalized = str(domain or "").strip().lower().lstrip("@")
     if not normalized:
+        return set()
+    variants = {normalized}
+    parts = [part for part in normalized.split(".") if part]
+    # 子域被拒时连父域一起记，例如 007.hzeg.eu.org -> hzeg.eu.org
+    if len(parts) >= 3:
+        variants.add(".".join(parts[1:]))
+    return variants
+
+
+def remember_rejected_email_domain(domain):
+    variants = rejected_email_domain_variants(domain)
+    if not variants:
         return
     with _rejected_email_domains_lock:
-        _rejected_email_domains.add(normalized)
+        _rejected_email_domains.update(variants)
 
 
 def is_email_domain_rejected(domain):
-    normalized = str(domain or "").strip().lower()
+    normalized = str(domain or "").strip().lower().lstrip("@")
+    if not normalized:
+        return False
     with _rejected_email_domains_lock:
-        return normalized in _rejected_email_domains
+        if normalized in _rejected_email_domains:
+            return True
+        parts = [part for part in normalized.split(".") if part]
+        for index in range(1, max(0, len(parts) - 1)):
+            parent = ".".join(parts[index:])
+            if parent in _rejected_email_domains:
+                return True
+        for rejected in _rejected_email_domains:
+            if normalized.endswith("." + rejected):
+                return True
+    return False
 
 
 def pick_rotating_domain(candidates, index_name):
@@ -5418,14 +5441,25 @@ return 'profile-filled';
                 now = time.time()
                 if wait_cf_since is None:
                     wait_cf_since = now
+                # token 长时间为 0 时，多半是出口 IP/代理信誉问题，提前失败换号比干等到 SSO 超时更有用。
+                if now - wait_cf_since >= 45 and str(token_len) in {"0", ""}:
+                    raise Exception(
+                        "Cloudflare Turnstile 45s 内未签发 token（token长度=0）。"
+                        "常见原因是代理/出口 IP 信誉差或被 Cloudflare 静默拒绝，请更换代理后重试"
+                    )
                 # 卡住后主动触发 Turnstile（提交时才验证的隐形模式）
-                if now - wait_cf_since >= 12 and now - last_cf_retry_at >= 8:
+                if now - wait_cf_since >= 8 and now - last_cf_retry_at >= 8:
                     if log_callback:
-                        log_callback("[*] Cloudflare 验证卡住，主动触发 Turnstile 并点击提交...")
+                        log_callback("[*] Cloudflare 验证卡住，主动触发 Turnstile（暂不空 token 提交）...")
                     try:
                         trig = page.run_js(build_profile_submit_script("trigger"))
                         if log_callback:
                             log_callback(f"[Debug] Turnstile 主动触发结果: {trig}")
+                        try:
+                            page.run_js(build_profile_submit_script("trigger"))
+                        except Exception:
+                            pass
+                        _click_turnstile_challenge_if_visible(page)
                     except Exception as cf_exc:
                         if log_callback:
                             log_callback(f"[Debug] Turnstile 主动触发失败: {cf_exc}")
@@ -5454,13 +5488,19 @@ return 'profile-filled';
             now = time.time()
             if wait_cf_since is None:
                 wait_cf_since = now
-            if now - wait_cf_since >= 12 and now - last_cf_retry_at >= 8:
+            if now - wait_cf_since >= 45 and str(token_len) in {"0", ""}:
+                raise Exception(
+                    "Cloudflare Turnstile 45s 内未签发 token（token长度=0）。"
+                    "常见原因是代理/出口 IP 信誉差或被 Cloudflare 静默拒绝，请更换代理后重试"
+                )
+            if now - wait_cf_since >= 8 and now - last_cf_retry_at >= 8:
                 if log_callback:
-                    log_callback("[*] 提交前仍卡住，主动触发 Turnstile 并点击提交...")
+                    log_callback("[*] 提交前仍卡住，主动触发 Turnstile（暂不空 token 提交）...")
                 try:
                     trig = page.run_js(build_profile_submit_script("trigger"))
                     if log_callback:
                         log_callback(f"[Debug] Turnstile 主动触发结果: {trig}")
+                    _click_turnstile_challenge_if_visible(page)
                 except Exception as cf_exc:
                     if log_callback:
                         log_callback(f"[Debug] Turnstile 主动触发失败: {cf_exc}")
@@ -5468,7 +5508,21 @@ return 'profile-filled';
             sleep_with_cancel(0.8, cancel_callback)
             continue
 
-        if submit_state in ("submitted", "submitted-no-challenge"):
+        if submit_state == "submitted":
+            if log_callback:
+                log_callback(f"[*] 已填写注册资料并提交: {given_name} {family_name}")
+            return {"given_name": given_name, "family_name": family_name, "password": password}
+        if submit_state == "submitted-no-challenge":
+            # 兼容旧脚本返回值：无 CF 痕迹才允许；有空 token 时继续等。
+            if log_callback:
+                log_callback("[Debug] 收到 submitted-no-challenge，复查 Cloudflare 状态...")
+            try:
+                recheck = page.run_js(build_profile_submit_script("check"))
+            except Exception:
+                recheck = "unknown"
+            if isinstance(recheck, str) and recheck.startswith("wait-cloudflare"):
+                sleep_with_cancel(0.8, cancel_callback)
+                continue
             if log_callback:
                 log_callback(f"[*] 已填写注册资料并提交: {given_name} {family_name}")
             return {"given_name": given_name, "family_name": family_name, "password": password}
@@ -5498,6 +5552,7 @@ def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
     last_submit_retry = 0.0
     last_cf_retry_at = 0.0
     last_final_retry_state = ""
+    wait_cf_zero_since = None
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -5546,19 +5601,28 @@ const executedWidgets = [];
 if (cfPresent) {
     const token = String((cfInput && cfInput.value) || '').trim();
     const solved = token.length >= 80;
-    const hasVisibleChallenge = !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey]');
-    if (!solved && (hasVisibleChallenge || capturedWidgets.length > 0)) {
+    // managed/flexible 模式经常没有可见 iframe，只要 token 未签发就必须等待，禁止空 token 提交。
+    if (!solved) {
         try {
             if (window.turnstile && typeof window.turnstile.execute === 'function') {
+                // token 仍为空时允许重复 execute，避免“只执行一次后永久卡住”。
+                if (token.length === 0 && executedWidgetIds.length > 8) {
+                    rawHook.executedWidgetIds = [];
+                    executedWidgetIds.length = 0;
+                }
                 for (const widget of capturedWidgets) {
                     const id = widget && widget.id;
                     const idText = String(id || '');
-                    if (!idText || executedWidgetIds.includes(idText)) continue;
+                    if (!idText) continue;
+                    if (token.length > 0 && executedWidgetIds.includes(idText)) continue;
                     try {
                         window.turnstile.execute(id);
-                        executedWidgetIds.push(idText);
+                        if (!executedWidgetIds.includes(idText)) executedWidgetIds.push(idText);
                         executedWidgets.push(idText);
                     } catch (e) {}
+                }
+                if (!executedWidgets.length) {
+                    try { window.turnstile.execute(); executedWidgets.push('anonymous'); } catch (e) {}
                 }
             }
         } catch (e) {}
@@ -5613,19 +5677,27 @@ return {
                     """
                 )
                 last_submit_retry = now
+                token_len_now = None
                 if isinstance(retried, str):
                     last_final_retry_state = retried
+                    if retried.startswith("final-page-wait-cf"):
+                        token_len_now = retried.split(":", 1)[1] if ":" in retried else "0"
                 if isinstance(retried, dict):
                     last_final_retry_state = str(retried.get("state") or "final-page-dict")
+                    if last_final_retry_state == "final-page-wait-cf":
+                        token_len_now = str(retried.get("tokenLen", "0"))
+                        if retried.get("executedWidgets"):
+                            try:
+                                retried["challengeClick"] = _click_turnstile_challenge_if_visible(page)
+                            except Exception as challenge_exc:
+                                retried["challengeClickError"] = str(challenge_exc)[:160]
+                    # 只有 CF 已通过/无 CF 时才原生点击提交，避免空 token 连点。
                     if (
-                        last_final_retry_state == "final-page-wait-cf"
-                        and retried.get("executedWidgets")
+                        last_final_retry_state == "final-page-submit-target"
+                        and retried.get("centerX") is not None
+                        and retried.get("centerY") is not None
+                        and int(retried.get("tokenLen") or 0) >= 80
                     ):
-                        try:
-                            retried["challengeClick"] = _click_turnstile_challenge_if_visible(page)
-                        except Exception as challenge_exc:
-                            retried["challengeClickError"] = str(challenge_exc)[:160]
-                    if retried.get("centerX") is not None and retried.get("centerY") is not None:
                         try:
                             x = int(retried.get("centerX"))
                             y = int(retried.get("centerY"))
@@ -5637,47 +5709,45 @@ return {
                             last_final_retry_state = f"{last_final_retry_state}:native-failed"
                     if log_callback:
                         log_callback(f"[Debug] 最终页状态: {json.dumps(retried, ensure_ascii=False)}")
-                if log_callback and retried in ("final-page-no-submit", "final-page-clicked-submit"):
-                    log_callback(f"[Debug] 最终页状态: {retried}")
-                if log_callback and isinstance(retried, str) and retried.startswith("final-page-wait-cf"):
-                    token_len = retried.split(":", 1)[1] if ":" in retried else "0"
-                    log_callback(f"[Debug] 最终页状态: final-page-wait-cf, token长度={token_len}")
+                if token_len_now is not None:
+                    if str(token_len_now) in {"0", ""}:
+                        if wait_cf_zero_since is None:
+                            wait_cf_zero_since = now
+                        elif now - wait_cf_zero_since >= 45:
+                            raise Exception(
+                                "最终页 Cloudflare Turnstile 45s 内未签发 token（token长度=0）。"
+                                "常见原因是代理/出口 IP 信誉差或被 Cloudflare 静默拒绝，请更换代理后重试"
+                            )
+                    else:
+                        wait_cf_zero_since = None
+                    if log_callback:
+                        log_callback(f"[Debug] 最终页状态: final-page-wait-cf, token长度={token_len_now}")
                     if now - last_cf_retry_at >= 10:
                         if log_callback:
-                            log_callback("[*] 最终页 Cloudflare 卡住，主动触发 Turnstile 并点击提交...")
+                            log_callback("[*] 最终页 Cloudflare 卡住，主动触发 Turnstile（暂不空 token 提交）...")
                         try:
                             trig = page.run_js(
                                 r"""
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
 let executed = false;
 try {
     if (window.turnstile && typeof window.turnstile.execute === 'function') {
         try { window.turnstile.execute(); executed = true; } catch (e) {}
     }
 } catch (e) {}
-const buttons = Array.from(document.querySelectorAll('button[type="submit"], button')).filter((node) => {
-    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
-});
-const submitBtn = buttons.find((node) => {
-    const t = (node.innerText || node.textContent || '').replace(/\s+/g, '').toLowerCase();
-    return t.includes('完成注册') || t.includes('创建账户') || t.includes('completesignup') || t.includes('signup') || t.includes('createaccount');
-});
-if (submitBtn) { submitBtn.focus(); submitBtn.click(); }
-return 'final-trigger:' + (executed ? '1' : '0') + ':' + (submitBtn ? 'clicked' : 'no-btn');
+const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+const tokenLen = String((cfInput && cfInput.value) || '').trim().length;
+return 'final-trigger:' + (executed ? '1' : '0') + ':token=' + tokenLen;
                                 """
                             )
                             if log_callback:
                                 log_callback(f"[Debug] 最终页 Turnstile 主动触发结果: {trig}")
+                            _click_turnstile_challenge_if_visible(page)
                         except Exception as cf_exc:
                             if log_callback:
                                 log_callback(f"[Debug] 最终页 Turnstile 主动触发失败: {cf_exc}")
                         last_cf_retry_at = now
+                if log_callback and retried in ("final-page-no-submit", "final-page-clicked-submit"):
+                    log_callback(f"[Debug] 最终页状态: {retried}")
 
             cookies = page.cookies(all_domains=True, all_info=True) or []
             for item in cookies:

@@ -799,7 +799,16 @@ def test_yyds_pick_domain_skips_rejected_domains_and_rotates(monkeypatch):
     monkeypatch.setattr(reg, "_yyds_domain_index", 0, raising=False)
 
     assert reg.yyds_pick_domain() == "second.example"
-    assert reg.yyds_pick_domain() == "third.example"
+
+
+def test_remember_rejected_email_domain_also_blocks_sibling_subdomains():
+    reg._rejected_email_domains.clear()
+    reg.remember_rejected_email_domain("007.hzeg.eu.org")
+
+    assert reg.is_email_domain_rejected("007.hzeg.eu.org")
+    assert reg.is_email_domain_rejected("10011.hzeg.eu.org")
+    assert reg.is_email_domain_rejected("hzeg.eu.org")
+    assert not reg.is_email_domain_rejected("10161993.xyz")
 
 
 def test_list_registered_accounts_reads_accounts_files(monkeypatch, tmp_path):
@@ -1472,8 +1481,10 @@ def test_profile_submit_script_supports_role_button_and_aria_labels():
 
     assert '[role="button"]' in script
     assert "aria-label" in script
-    assert "submitted-no-challenge" in script
-    assert "ready-to-submit-no-challenge" in script
+    assert "wait-cloudflare" in script
+    # managed/flexible Turnstile 经常没有可见 iframe，禁止“无挑战提前提交”
+    assert "submitted-no-challenge" not in script
+    assert "ready-to-submit-no-challenge" not in script
     assert "requestSubmit" in script
     assert "continue" in reg.PROFILE_SUBMIT_KEYWORDS
     assert "create" in reg.PROFILE_SUBMIT_KEYWORDS
@@ -1651,7 +1662,9 @@ def test_wait_for_sso_cookie_final_page_can_submit_without_visible_turnstile():
     assert "completesignup" in source
     assert "not-final-page:" in source
     assert "最后最终页状态" in source
-    assert "const hasVisibleChallenge = !!document.querySelector('iframe[src*=\"turnstile\"], div.cf-turnstile, [data-sitekey]');" in source
+    # managed/flexible 模式无可见 iframe 时也必须等 token，禁止空 token 提交
+    assert "只要 token 未签发就必须等待" in source
+    assert "int(retried.get(\"tokenLen\") or 0) >= 80" in source
     assert 'chrome.runtime.getURL("pageHook.js")' in content_script
     assert "window.__grokTurnstile" in page_hook
     assert '"web_accessible_resources": ["pageHook.js"]' in manifest
@@ -1709,7 +1722,8 @@ def test_wait_for_sso_cookie_uses_native_click_for_final_page(monkeypatch):
                 "centerX": 321,
                 "centerY": 654,
                 "text": "completesignup",
-                "tokenLen": 0,
+                # 只有 token 已签发时才允许原生点击提交
+                "tokenLen": 120,
                 "captured": {"hookInstalled": True, "widgets": [{"id": "widget-1"}]},
             }
 
