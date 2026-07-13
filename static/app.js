@@ -99,6 +99,7 @@ function formPayload() {
   data.register_threads = Number(data.register_threads || 1);
   data.sub2api_concurrency = Number(data.sub2api_concurrency || 3);
   data.sub2api_priority = Number(data.sub2api_priority || 50);
+  data.cpa_push_workers = Number(data.cpa_push_workers || 3);
   return data;
 }
 

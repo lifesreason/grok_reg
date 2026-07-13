@@ -1,5 +1,6 @@
 import base64
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -56,6 +57,14 @@ def test_validate_registration_config_keeps_auto_push_switches():
 
     assert settings["grok2api_auto_add_remote"] is True
     assert settings["sub2api_auto_import_remote"] is True
+
+
+def test_validate_registration_config_limits_cpa_push_workers():
+    settings = reg.validate_registration_config(
+        {"email_provider": "duckmail", "cpa_push_workers": "99"}
+    )
+
+    assert settings["cpa_push_workers"] == 10
 
 
 def test_load_config_resets_defaults_when_data_directory_has_no_config(monkeypatch, tmp_path):
@@ -1916,6 +1925,43 @@ def test_import_accounts_to_cpa_pushes_each_selected_account(monkeypatch):
     assert all(call[2]["cpa_auto_push_remote"] is True for call in calls)
 
 
+def test_import_accounts_to_cpa_pushes_normal_accounts_concurrently_and_keeps_order(monkeypatch):
+    started = []
+    lock = threading.Lock()
+    second_push_started = threading.Event()
+
+    def fake_export(email, refresh_token, settings, log_callback=None):
+        with lock:
+            started.append(email)
+            if len(started) >= 2:
+                second_push_started.set()
+        assert second_push_started.wait(timeout=0.5), "CPA push did not run concurrently"
+        return {"ok": True, "uploaded": True, "filename": f"xai-{email}.json"}
+
+    monkeypatch.setattr(reg, "export_and_push_cpa_credential", fake_export)
+    accounts = [
+        {"email": "user1@example.com", "refresh_token": "refresh-token-1"},
+        {"email": "user2@example.com", "refresh_token": "refresh-token-2"},
+        {"email": "user3@example.com", "refresh_token": "refresh-token-3"},
+    ]
+
+    result = reg.import_accounts_to_cpa(
+        accounts,
+        {
+            "cpa_management_base": "https://cpa.example.test",
+            "cpa_management_key": "management-secret",
+            "cpa_push_workers": 3,
+        },
+    )
+
+    assert result["total"] == 3
+    assert [item["email"] for item in result["items"]] == [
+        "user1@example.com",
+        "user2@example.com",
+        "user3@example.com",
+    ]
+
+
 def test_import_accounts_to_cpa_keeps_pushing_after_an_account_failure(monkeypatch):
     calls = []
 
@@ -2251,9 +2297,11 @@ def test_web_console_exposes_auto_push_switches():
     assert 'name="sub2api_auto_import_remote"' in html
     assert 'name="cpa_auto_push_remote"' in html
     assert 'name="cpa_management_key"' in html
+    assert 'name="cpa_push_workers"' in html
     assert "data.grok2api_auto_add_remote" in js
     assert "data.sub2api_auto_import_remote" in js
     assert "data.cpa_auto_push_remote" in js
+    assert "data.cpa_push_workers" in js
 
 
 def test_web_console_exposes_account_table_controls():

@@ -298,6 +298,10 @@
                   本地凭证目录
                   <input name="cpa_auth_dir" placeholder="cpa_auths" />
                 </label>
+                <label>
+                  CPA 推送并发
+                  <input name="cpa_push_workers" type="number" min="1" max="10" value="3" />
+                </label>
                 <label class="check wide">
                   <input name="cpa_auto_push_remote" type="checkbox" />
                   注册成功后生成并自动推送 CPA xAI 凭证

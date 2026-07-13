@@ -8,6 +8,7 @@ Grok 注册机 - TTK GUI 版本
 import threading
 import datetime
 import time
+from concurrent.futures import ThreadPoolExecutor
 import os
 import sys
 import queue
@@ -100,6 +101,7 @@ DEFAULT_CONFIG = {
     "cpa_auto_push_remote": False,
     "cpa_management_base": "",
     "cpa_management_key": "",
+    "cpa_push_workers": 3,
     "register_threads": 1,
     "thread_start_interval": 0.8,
     "show_tutorial_on_start": True,
@@ -1978,91 +1980,115 @@ def import_accounts_to_cpa(accounts, settings=None, log_callback=None):
         raise ValueError("推送到 CPA 需要先填写 CPA 管理地址和管理密钥")
     resolved_settings["cpa_auto_push_remote"] = True
 
-    items = []
-    for account in accounts or []:
+    accounts = list(accounts or [])
+    items = [None] * len(accounts)
+    pending = []
+    for index, account in enumerate(accounts):
         email = str(account.get("email") or account.get("id") or "").strip()
         refresh_token = str(account.get("refresh_token") or "").strip()
         if not refresh_token:
-            items.append(
-                {
-                    "email": email,
-                    "status": "failed",
-                    "step": "credential",
-                    "error": "缺少 refresh_token",
-                }
-            )
+            items[index] = {
+                "email": email,
+                "status": "failed",
+                "step": "credential",
+                "error": "缺少 refresh_token",
+            }
             continue
+
+        pending.append((index, account, email, refresh_token))
+
+    worker_count = _parse_positive_int(
+        resolved_settings.get("cpa_push_workers"), 3, minimum=1, maximum=10
+    )
+    log_lock = threading.Lock()
+
+    def safe_log(message):
+        if log_callback:
+            with log_lock:
+                log_callback(message)
+
+    def push_once(task):
+        index, account, email, refresh_token = task
         try:
             result = export_and_push_cpa_credential(
                 email,
                 refresh_token,
                 resolved_settings,
-                log_callback=log_callback,
+                log_callback=safe_log,
             )
+            return index, account, email, refresh_token, result, None
         except Exception as exc:
-            error_text = _sub2api_error_text(exc)
-            if account.get("sso") and is_xai_refresh_token_client_error(exc):
-                try:
-                    if log_callback:
-                        log_callback(f"[*] CPA Refresh Token 不可用，尝试用 SSO 重新获取: {email}")
-                    refresh_token = fetch_xai_oauth_refresh_token(
-                        account.get("sso"),
-                        log_callback=log_callback,
-                    )
-                    replace_registered_account_refresh_token(account, refresh_token)
-                    result = export_and_push_cpa_credential(
-                        email,
-                        refresh_token,
-                        resolved_settings,
-                        log_callback=log_callback,
-                    )
-                except Exception as retry_exc:
-                    error_text = f"{error_text}; retry_with_sso_failed: {_sub2api_error_text(retry_exc)}"
-                    items.append(
-                        {
-                            "email": email,
-                            "status": "failed",
-                            "step": "credential",
-                            "error": error_text[:1000],
-                        }
-                    )
-                    continue
-            else:
-                items.append(
-                    {
-                        "email": email,
-                        "status": "failed",
-                        "step": "credential",
-                        "error": error_text,
-                    }
-                )
-                continue
+            return index, account, email, refresh_token, None, exc
 
+    def result_item(account, email, refresh_token, result):
         rotated_refresh_token = str(result.get("refresh_token") or "").strip()
         if rotated_refresh_token and rotated_refresh_token != refresh_token:
             replace_registered_account_refresh_token(account, rotated_refresh_token)
         upload_error = str(result.get("upload_error") or "").strip()
         if upload_error or not result.get("uploaded"):
-            items.append(
-                {
-                    "email": email,
-                    "status": "failed",
-                    "step": "upload",
-                    "error": upload_error or "CPA 未确认上传成功",
-                }
-            )
-            continue
-        items.append(
-            {
+            return {
                 "email": email,
-                "status": "pushed",
-                "response": {
-                    "filename": result.get("filename", ""),
-                    "uploaded": True,
-                    "upload_status": result.get("upload_status"),
-                },
+                "status": "failed",
+                "step": "upload",
+                "error": upload_error or "CPA 未确认上传成功",
             }
-        )
+        return {
+            "email": email,
+            "status": "pushed",
+            "response": {
+                "filename": result.get("filename", ""),
+                "uploaded": True,
+                "upload_status": result.get("upload_status"),
+            },
+        }
+
+    outcomes = []
+    if pending:
+        actual_workers = min(worker_count, len(pending))
+        safe_log(f"[*] CPA 批量推送: {len(pending)} 个账号，{actual_workers} 路并发")
+        with ThreadPoolExecutor(max_workers=actual_workers, thread_name_prefix="cpa-push") as executor:
+            outcomes = list(executor.map(push_once, pending))
+
+    retry_with_sso = []
+    for index, account, email, refresh_token, result, error in outcomes:
+        if error is None:
+            items[index] = result_item(account, email, refresh_token, result)
+            continue
+
+        error_text = _sub2api_error_text(error)
+        if account.get("sso") and is_xai_refresh_token_client_error(error):
+            retry_with_sso.append((index, account, email, refresh_token, error_text))
+            continue
+        items[index] = {
+            "email": email,
+            "status": "failed",
+            "step": "credential",
+            "error": error_text,
+        }
+
+    # SSO recovery opens browser tabs and mutates source account files, so keep it serialized.
+    for index, account, email, refresh_token, error_text in retry_with_sso:
+        try:
+            safe_log(f"[*] CPA Refresh Token 不可用，尝试用 SSO 重新获取: {email}")
+            refresh_token = fetch_xai_oauth_refresh_token(
+                account.get("sso"),
+                log_callback=safe_log,
+            )
+            replace_registered_account_refresh_token(account, refresh_token)
+            result = export_and_push_cpa_credential(
+                email,
+                refresh_token,
+                resolved_settings,
+                log_callback=safe_log,
+            )
+            items[index] = result_item(account, email, refresh_token, result)
+        except Exception as retry_exc:
+            items[index] = {
+                "email": email,
+                "status": "failed",
+                "step": "credential",
+                "error": f"{error_text}; retry_with_sso_failed: {_sub2api_error_text(retry_exc)}"[:1000],
+            }
 
     success_count = len([item for item in items if item.get("status") == "pushed"])
     failed_count = len(items) - success_count
@@ -3071,6 +3097,9 @@ def validate_registration_config(settings):
     )
     normalized["sub2api_concurrency"] = _parse_positive_int(
         normalized.get("sub2api_concurrency"), 3, minimum=0, maximum=1000
+    )
+    normalized["cpa_push_workers"] = _parse_positive_int(
+        normalized.get("cpa_push_workers"), 3, minimum=1, maximum=10
     )
     normalized["sub2api_priority"] = _parse_positive_int(
         normalized.get("sub2api_priority"), 50, minimum=0, maximum=1000
