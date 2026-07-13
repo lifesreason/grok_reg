@@ -800,6 +800,20 @@ def test_exchange_xai_refresh_token_posts_refresh_grant(monkeypatch):
     assert calls[0][1]["data"]["refresh_token"] == "refresh-token"
 
 
+def test_exchange_xai_refresh_token_includes_oauth_error_response(monkeypatch):
+    class FakeResponse:
+        status_code = 400
+        text = '{"error":"invalid_grant","error_description":"Refresh token has been revoked"}'
+
+        def raise_for_status(self):
+            raise RuntimeError("HTTP Error 400")
+
+    monkeypatch.setattr(reg, "http_post", lambda *args, **kwargs: FakeResponse())
+
+    with pytest.raises(ValueError, match="invalid_grant.*revoked"):
+        reg.exchange_xai_refresh_token("refresh-token")
+
+
 def test_check_registered_accounts_health_updates_rotated_refresh_token(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     account_file = tmp_path.joinpath("accounts_20260630_140000_job.txt")
@@ -1910,6 +1924,54 @@ def test_import_accounts_to_cpa_keeps_pushing_after_an_account_failure(monkeypat
     assert result["items"][0]["error"] == "CPA unavailable"
     assert result["items"][1]["error"] == "缺少 refresh_token"
     assert result["items"][2]["status"] == "pushed"
+
+
+def test_import_accounts_to_cpa_reacquires_refresh_token_with_sso_after_http_400(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    source = tmp_path.joinpath("accounts_20260713_120000_job.txt")
+    source.write_text(
+        "user@example.com----Pass----sso-token----old-refresh-token\n",
+        encoding="utf-8",
+    )
+    account = reg.list_registered_accounts()[0]
+    calls = []
+
+    class RefreshTokenError(Exception):
+        def __init__(self):
+            super().__init__("HTTP Error 400: ")
+            self.response = type("Response", (), {"status_code": 400, "text": ""})()
+
+    def fake_export(email, refresh_token, settings, log_callback=None):
+        calls.append(refresh_token)
+        if refresh_token == "old-refresh-token":
+            raise RefreshTokenError()
+        return {
+            "ok": True,
+            "uploaded": True,
+            "filename": "xai-user@example.com.json",
+            "refresh_token": refresh_token,
+        }
+
+    monkeypatch.setattr(reg, "export_and_push_cpa_credential", fake_export)
+    monkeypatch.setattr(
+        reg,
+        "fetch_xai_oauth_refresh_token",
+        lambda sso, log_callback=None, cancel_callback=None: "new-refresh-token",
+    )
+
+    result = reg.import_accounts_to_cpa(
+        [account],
+        {
+            "cpa_management_base": "https://cpa.example.test",
+            "cpa_management_key": "management-secret",
+        },
+    )
+
+    assert result["total"] == 1
+    assert result["failed"] == 0
+    assert calls == ["old-refresh-token", "new-refresh-token"]
+    assert account["refresh_token"] == "new-refresh-token"
+    assert source.read_text(encoding="utf-8").endswith("----new-refresh-token\n")
 
 
 def test_import_accounts_to_cpa_persists_a_rotated_refresh_token(monkeypatch, tmp_path):

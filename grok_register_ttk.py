@@ -500,6 +500,13 @@ def is_refresh_token_revoked_error(error_text):
     return "invalid_grant" in text or "revoked" in text or "refresh token has been revoked" in text
 
 
+def is_xai_refresh_token_client_error(exc):
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    text = _sub2api_error_text(exc).lower()
+    return status_code == 400 or "http 400" in text or is_refresh_token_revoked_error(text)
+
+
 def attach_account_status(account, statuses=None):
     if not isinstance(account, dict):
         return account
@@ -1798,6 +1805,12 @@ def exchange_xai_refresh_token(refresh_token, settings=None):
         },
         timeout=60,
     )
+    status_code = getattr(resp, "status_code", None)
+    if status_code is not None and int(status_code) >= 400:
+        detail = str(getattr(resp, "text", "") or "").strip()
+        if detail:
+            raise ValueError(f"xAI OAuth refresh HTTP {status_code}: {detail[:1000]}")
+        raise ValueError(f"xAI OAuth refresh HTTP {status_code}")
     resp.raise_for_status()
     data = resp.json()
     if not isinstance(data, dict) or not str(data.get("access_token") or "").strip():
@@ -1956,40 +1969,70 @@ def import_accounts_to_cpa(accounts, settings=None, log_callback=None):
                 resolved_settings,
                 log_callback=log_callback,
             )
-            rotated_refresh_token = str(result.get("refresh_token") or "").strip()
-            if rotated_refresh_token and rotated_refresh_token != refresh_token:
-                replace_registered_account_refresh_token(account, rotated_refresh_token)
-            upload_error = str(result.get("upload_error") or "").strip()
-            if upload_error or not result.get("uploaded"):
+        except Exception as exc:
+            error_text = _sub2api_error_text(exc)
+            if account.get("sso") and is_xai_refresh_token_client_error(exc):
+                try:
+                    if log_callback:
+                        log_callback(f"[*] CPA Refresh Token 不可用，尝试用 SSO 重新获取: {email}")
+                    refresh_token = fetch_xai_oauth_refresh_token(
+                        account.get("sso"),
+                        log_callback=log_callback,
+                    )
+                    replace_registered_account_refresh_token(account, refresh_token)
+                    result = export_and_push_cpa_credential(
+                        email,
+                        refresh_token,
+                        resolved_settings,
+                        log_callback=log_callback,
+                    )
+                except Exception as retry_exc:
+                    error_text = f"{error_text}; retry_with_sso_failed: {_sub2api_error_text(retry_exc)}"
+                    items.append(
+                        {
+                            "email": email,
+                            "status": "failed",
+                            "step": "credential",
+                            "error": error_text[:1000],
+                        }
+                    )
+                    continue
+            else:
                 items.append(
                     {
                         "email": email,
                         "status": "failed",
-                        "step": "upload",
-                        "error": upload_error or "CPA 未确认上传成功",
+                        "step": "credential",
+                        "error": error_text,
                     }
                 )
                 continue
-            items.append(
-                {
-                    "email": email,
-                    "status": "pushed",
-                    "response": {
-                        "filename": result.get("filename", ""),
-                        "uploaded": True,
-                        "upload_status": result.get("upload_status"),
-                    },
-                }
-            )
-        except Exception as exc:
+
+        rotated_refresh_token = str(result.get("refresh_token") or "").strip()
+        if rotated_refresh_token and rotated_refresh_token != refresh_token:
+            replace_registered_account_refresh_token(account, rotated_refresh_token)
+        upload_error = str(result.get("upload_error") or "").strip()
+        if upload_error or not result.get("uploaded"):
             items.append(
                 {
                     "email": email,
                     "status": "failed",
-                    "step": "credential",
-                    "error": str(exc)[:1000],
+                    "step": "upload",
+                    "error": upload_error or "CPA 未确认上传成功",
                 }
             )
+            continue
+        items.append(
+            {
+                "email": email,
+                "status": "pushed",
+                "response": {
+                    "filename": result.get("filename", ""),
+                    "uploaded": True,
+                    "upload_status": result.get("upload_status"),
+                },
+            }
+        )
 
     success_count = len([item for item in items if item.get("status") == "pushed"])
     failed_count = len(items) - success_count
