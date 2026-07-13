@@ -93,6 +93,25 @@ def list_accounts():
     return {"total": len(accounts), "accounts": accounts}
 
 
+@app.delete("/api/accounts")
+def delete_accounts(payload: dict):
+    try:
+        result = reg.delete_registered_accounts(payload.get("account_ids") or [])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"删除账号失败: {exc}")
+    if not result["deleted"]:
+        raise HTTPException(status_code=404, detail="未找到选中的账号")
+    accounts = reg.list_registered_accounts(include_sso=False)
+    return {
+        **result,
+        "status": "deleted",
+        "message": f"已删除 {result['deleted']} 个账号",
+        "accounts": [public_account(account) for account in accounts],
+    }
+
+
 @app.post("/api/accounts/import/sub2api")
 def import_accounts_to_sub2api(payload: dict):
     settings = merge_sensitive_values(payload)

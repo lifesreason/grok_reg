@@ -11,6 +11,7 @@ const checkHealthBtn = document.querySelector("#checkHealthBtn");
 const importGrok2apiBtn = document.querySelector("#importGrok2apiBtn");
 const importSub2apiBtn = document.querySelector("#importSub2apiBtn");
 const importCpaBtn = document.querySelector("#importCpaBtn");
+const deleteAccountsBtn = document.querySelector("#deleteAccountsBtn");
 const dashboardStatusText = document.querySelector("#dashboardStatusText");
 const dashboardRunNote = document.querySelector("#dashboardRunNote");
 const dashboardTotalAccounts = document.querySelector("#dashboardTotalAccounts");
@@ -562,6 +563,41 @@ async function loadAccounts() {
   renderAccounts();
 }
 
+async function deleteSelectedAccounts() {
+  const accountIds = selectedAccountIds();
+  if (!accountIds.length) {
+    setMessage("请选择账号再删除");
+    return;
+  }
+  if (!window.confirm(`确定删除选中的 ${accountIds.length} 个账号吗？此操作不可恢复。`)) return;
+
+  deleteAccountsBtn.disabled = true;
+  deleteAccountsBtn.textContent = `删除中 ${accountIds.length} 个...`;
+  setMessage(`正在删除 ${accountIds.length} 个账号`);
+  try {
+    const result = await requestJson("/api/accounts", {
+      method: "DELETE",
+      body: JSON.stringify({ account_ids: accountIds }),
+    });
+    accountIds.forEach((id) => {
+      selectedAccountIdsSet.delete(id);
+      delete accountHealthStatus[id];
+      delete accountPushStatus[id];
+      delete accountGrok2apiPushStatus[id];
+      delete accountCpaPushStatus[id];
+    });
+    accounts = result.accounts || [];
+    setMessage(result.message || `已删除 ${result.deleted || 0} 个账号`);
+  } catch (error) {
+    setMessage(`删除账号失败：${error.message}`);
+  } finally {
+    deleteAccountsBtn.disabled = false;
+    deleteAccountsBtn.textContent = "删除选中";
+    renderDashboard();
+    renderAccounts();
+  }
+}
+
 async function checkSelectedAccountHealth() {
   const accountIds = selectedAccountIds();
   if (!accountIds.length) {
@@ -809,6 +845,10 @@ importGrok2apiBtn.addEventListener("click", () => {
 
 importCpaBtn.addEventListener("click", () => {
   importSelectedToCpa().catch((error) => setMessage(error.message));
+});
+
+deleteAccountsBtn.addEventListener("click", () => {
+  deleteSelectedAccounts().catch((error) => setMessage(error.message));
 });
 
 tabButtons.forEach((button) => {

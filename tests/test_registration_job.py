@@ -81,6 +81,44 @@ def test_load_config_resets_defaults_when_data_directory_has_no_config(monkeypat
     assert settings["cpa_management_key"] == ""
 
 
+def test_delete_registered_accounts_removes_selected_account_and_migrates_remaining_statuses(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    source = tmp_path.joinpath("accounts_20260713_120000_job.txt")
+    source.write_text(
+        "first@example.com----Pass----sso-token-1----refresh-token-1\n"
+        "remove@example.com----Pass----sso-token-2----refresh-token-2\n"
+        "last@example.com----Pass----sso-token-3----refresh-token-3\n",
+        encoding="utf-8",
+    )
+    first, removed, last = reg.list_registered_accounts()
+    reg.save_account_statuses(
+        {
+            removed["id"]: {"cpa_status": "pushed", "email": removed["email"]},
+            last["id"]: {"health_status": "healthy", "email": last["email"]},
+        }
+    )
+
+    result = reg.delete_registered_accounts([removed["id"]])
+
+    assert result["deleted"] == 1
+    assert result["missing"] == 0
+    assert source.read_text(encoding="utf-8") == (
+        "first@example.com----Pass----sso-token-1----refresh-token-1\n"
+        "last@example.com----Pass----sso-token-3----refresh-token-3\n"
+    )
+    current = reg.list_registered_accounts()
+    assert [account["email"] for account in current] == ["first@example.com", "last@example.com"]
+    assert current[0]["id"] == first["id"]
+    assert current[1]["id"] != last["id"]
+    statuses = reg.load_account_statuses()
+    assert removed["id"] not in statuses
+    assert last["id"] not in statuses
+    assert statuses[current[1]["id"]]["health_status"] == "healthy"
+    assert statuses[current[1]["id"]]["line_no"] == 2
+
+
 def test_registration_job_runs_successfully(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(reg, "start_browser", lambda log_callback=None: (object(), object()))
@@ -2287,6 +2325,16 @@ def test_web_console_exposes_selected_account_cpa_push_action():
     assert "/api/accounts/import/cpa" in js
     assert "importSelectedToCpa" in js
     assert 'async function importSelectedToCpa() {\n  const accountIds = selectedAccountIds();' in js
+
+
+def test_web_console_exposes_selected_account_delete_action():
+    html = Path("templates/index.html").read_text(encoding="utf-8")
+    js = Path("static/app.js").read_text(encoding="utf-8")
+
+    assert 'id="deleteAccountsBtn"' in html
+    assert "deleteSelectedAccounts" in js
+    assert 'requestJson("/api/accounts", {' in js
+    assert 'method: "DELETE"' in js
 
 
 def test_web_console_exposes_auto_push_switches():

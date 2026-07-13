@@ -146,6 +146,30 @@ def test_accounts_endpoint_lists_registered_accounts(monkeypatch, tmp_path):
     assert payload["accounts"][0]["refresh_token_preview"] == "refres...-token"
 
 
+def test_delete_selected_accounts_removes_records_and_returns_remaining_accounts(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    tmp_path.joinpath("accounts_20260630_140000_job.txt").write_text(
+        "first@example.com----Pass----sso-token-1----refresh-token-1\n"
+        "second@example.com----Pass----sso-token-2----refresh-token-2\n",
+        encoding="utf-8",
+    )
+    from web_app import app
+
+    client = TestClient(app)
+    accounts = client.get("/api/accounts").json()["accounts"]
+    selected = next(account for account in accounts if account["email"] == "second@example.com")
+
+    response = client.request("DELETE", "/api/accounts", json={"account_ids": [selected["id"]]})
+
+    assert response.status_code == 200
+    assert response.json()["deleted"] == 1
+    assert response.json()["message"] == "已删除 1 个账号"
+    assert [account["email"] for account in response.json()["accounts"]] == ["first@example.com"]
+    assert [account["email"] for account in client.get("/api/accounts").json()["accounts"]] == [
+        "first@example.com"
+    ]
+
+
 def test_import_selected_accounts_to_sub2api(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     tmp_path.joinpath("accounts_20260630_140000_job.txt").write_text(

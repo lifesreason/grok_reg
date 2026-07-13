@@ -130,6 +130,7 @@ _cf_domain_index = 0
 _yyds_domain_index = 0
 _rejected_email_domains = set()
 _rejected_email_domains_lock = threading.Lock()
+_registered_accounts_lock = threading.Lock()
 # CloudMail 公开 token 单例（多线程共享，避免并发覆盖）
 _cloudmail_public_token = None
 _cloudmail_public_token_lock = threading.Lock()
@@ -606,19 +607,17 @@ def replace_registered_account_refresh_token(account, refresh_token):
     if not os.path.isfile(path):
         return False
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        if line_no > len(lines):
-            return False
-        parts = lines[line_no - 1].rstrip("\n").split("----", 3)
-        if len(parts) < 3:
-            return False
-        newline = "\n" if lines[line_no - 1].endswith("\n") else ""
-        lines[line_no - 1] = f"{parts[0]}----{parts[1]}----{parts[2]}----{refresh_token}{newline}"
-        tmp_path = f"{path}.tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.writelines(lines)
-        os.replace(tmp_path, path)
+        with _registered_accounts_lock:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            if line_no > len(lines):
+                return False
+            parts = lines[line_no - 1].rstrip("\n").split("----", 3)
+            if len(parts) < 3:
+                return False
+            newline = "\n" if lines[line_no - 1].endswith("\n") else ""
+            lines[line_no - 1] = f"{parts[0]}----{parts[1]}----{parts[2]}----{refresh_token}{newline}"
+            _write_registered_account_lines(path, lines)
         account["refresh_token"] = refresh_token
         account["refresh_token_preview"] = _mask_token(refresh_token)
         account["has_refresh_token"] = True
@@ -807,6 +806,76 @@ def find_registered_accounts(account_ids):
     if not wanted:
         return []
     return [account for account in list_registered_accounts(include_sso=True) if account["id"] in wanted]
+
+
+def _write_registered_account_lines(path, lines):
+    directory = os.path.dirname(path) or "."
+    fd, temp_path = tempfile.mkstemp(prefix=".accounts-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            file.writelines(lines)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def delete_registered_accounts(account_ids):
+    wanted = {str(account_id).strip() for account_id in (account_ids or []) if str(account_id).strip()}
+    if not wanted:
+        raise ValueError("请选择要删除的账号")
+
+    deleted_ids = set()
+    statuses = load_account_statuses()
+    with _registered_accounts_lock:
+        data_dir = get_data_dir()
+        for name in sorted(os.listdir(data_dir), reverse=True):
+            if not (name.startswith("accounts_") and name.endswith(".txt")):
+                continue
+            path = os.path.join(data_dir, name)
+            if not os.path.isfile(path):
+                continue
+            with open(path, "r", encoding="utf-8") as file:
+                lines = file.readlines()
+
+            retained_lines = []
+            for old_line_no, line in enumerate(lines, start=1):
+                account = parse_registered_account_line(
+                    line, source=name, line_no=old_line_no, include_sso=True
+                )
+                if account and account["id"] in wanted:
+                    deleted_ids.add(account["id"])
+                    statuses.pop(account["id"], None)
+                    continue
+
+                retained_lines.append(line)
+                if not account:
+                    continue
+                new_line_no = len(retained_lines)
+                new_account_id = _account_id(name, new_line_no, account["email"], account["sso"])
+                if new_account_id == account["id"]:
+                    continue
+                record = statuses.pop(account["id"], None)
+                if isinstance(record, dict):
+                    record = dict(record)
+                    record.update(
+                        {
+                            "email": account["email"],
+                            "source_file": name,
+                            "line_no": new_line_no,
+                        }
+                    )
+                    statuses[new_account_id] = record
+
+            if len(retained_lines) != len(lines):
+                _write_registered_account_lines(path, retained_lines)
+
+        if deleted_ids:
+            save_account_statuses(statuses)
+
+    return {"deleted": len(deleted_ids), "missing": len(wanted - deleted_ids)}
 
 
 def _parse_int_list(value):
@@ -3325,12 +3394,13 @@ class RegistrationJob:
             self.success_count += 1
             line = f"{email}----{profile.get('password','')}----{sso}----{refresh_token}\n"
             try:
-                with open(
-                    os.path.join(get_data_dir(), self.output_file),
-                    "a",
-                    encoding="utf-8",
-                ) as f:
-                    f.write(line)
+                with _registered_accounts_lock:
+                    with open(
+                        os.path.join(get_data_dir(), self.output_file),
+                        "a",
+                        encoding="utf-8",
+                    ) as f:
+                        f.write(line)
             except Exception as file_exc:
                 logf(f"[Debug] 保存账号文件失败: {file_exc}")
         account = parse_registered_account_line(
