@@ -5856,95 +5856,206 @@ try {
         return ""
 
 
+def _parse_element_rect(box):
+    """兼容 DrissionPage rect 的多种返回形态：对象 / dict / (x,y,w,h) tuple。"""
+    if box is None:
+        return None
+    try:
+        # 对象形态：.location / .size 或 .x/.y/.width/.height
+        loc = getattr(box, "location", None)
+        size = getattr(box, "size", None)
+        if isinstance(loc, dict) or isinstance(size, dict):
+            x = float((loc or {}).get("x") or getattr(box, "x", 0) or 0)
+            y = float((loc or {}).get("y") or getattr(box, "y", 0) or 0)
+            w = float((size or {}).get("width") or getattr(box, "width", 0) or 0)
+            h = float((size or {}).get("height") or getattr(box, "height", 0) or 0)
+            return {"x": x, "y": y, "width": w, "height": h}
+        if all(hasattr(box, attr) for attr in ("x", "y", "width", "height")):
+            return {
+                "x": float(box.x or 0),
+                "y": float(box.y or 0),
+                "width": float(box.width or 0),
+                "height": float(box.height or 0),
+            }
+    except Exception:
+        pass
+    # tuple/list: (x, y, w, h) 或 (x1,y1,x2,y2)
+    if isinstance(box, (tuple, list)):
+        nums = [float(v) for v in box[:4]]
+        if len(nums) >= 4:
+            # JS getBoundingClientRect 导出为 [left, top, width, height]
+            return {"x": nums[0], "y": nums[1], "width": nums[2], "height": nums[3]}
+    if isinstance(box, dict):
+        if "location" in box or "size" in box:
+            loc = box.get("location") or {}
+            size = box.get("size") or {}
+            return {
+                "x": float(loc.get("x") or box.get("x") or 0),
+                "y": float(loc.get("y") or box.get("y") or 0),
+                "width": float(size.get("width") or box.get("width") or 0),
+                "height": float(size.get("height") or box.get("height") or 0),
+            }
+        return {
+            "x": float(box.get("x") or 0),
+            "y": float(box.get("y") or 0),
+            "width": float(box.get("width") or box.get("w") or 0),
+            "height": float(box.get("height") or box.get("h") or 0),
+        }
+    return None
+
+
+def _safe_element_click(el, actions=None, label="element"):
+    """兼容 ChromiumElement / ChromiumFrame 的点击。"""
+    actions = actions if actions is not None else []
+    if el is None:
+        return False
+    # 1) 标准 click
+    for kwargs in ({"by_js": False}, {}, {"by_js": True}):
+        try:
+            if kwargs:
+                el.click(**kwargs)
+            else:
+                el.click()
+            actions.append(f"clicked-{label}")
+            return True
+        except TypeError:
+            try:
+                el.click()
+                actions.append(f"clicked-{label}")
+                return True
+            except Exception:
+                continue
+        except Exception as exc:
+            actions.append(f"click-{label}-fail:{type(el).__name__}:{exc}")
+            break
+    # 2) 某些 Frame 只有 .click.left
+    try:
+        click_obj = getattr(el, "click", None)
+        if click_obj is not None and hasattr(click_obj, "left"):
+            click_obj.left()
+            actions.append(f"clicked-{label}-left")
+            return True
+    except Exception as exc:
+        actions.append(f"click-{label}-left-fail:{exc}")
+    return False
+
+
+def _cdp_click_element_left(page, el, actions=None, label="element"):
+    """用元素 rect 算左侧复选框位置，CDP 真实鼠标点击（Docker 里更可靠）。"""
+    actions = actions if actions is not None else []
+    if el is None:
+        return False
+    rect = None
+    for getter in (
+        lambda: getattr(el, "rect", None),
+        lambda: el.states.has_rect and el.rect,
+        lambda: el.run_js(
+            "const r=this.getBoundingClientRect();"
+            "return [r.left, r.top, r.width, r.height];"
+        )
+        if hasattr(el, "run_js")
+        else None,
+    ):
+        try:
+            raw = getter()
+            rect = _parse_element_rect(raw)
+            if rect and rect.get("width", 0) > 1:
+                break
+        except Exception as exc:
+            actions.append(f"rect-{label}-fail:{exc}")
+            rect = None
+    if not rect or rect.get("width", 0) <= 1:
+        actions.append(f"no-rect-{label}")
+        return False
+    x = int(rect["x"] + min(max(16, rect["width"] * 0.12), 36))
+    y = int(rect["y"] + max(rect["height"] / 2, 12))
+    try:
+        _click_point_on_page(page, x, y)
+        actions.append(f"cdp-click-{label}:{x},{y}")
+        # 轻微二次点击，部分环境第一次只 focus
+        sleep_with_cancel(0.12)
+        _click_point_on_page(page, x + 1, y)
+        actions.append(f"cdp-click2-{label}:{x+1},{y}")
+        return True
+    except Exception as exc:
+        actions.append(f"cdp-click-{label}-fail:{exc}")
+        return False
+
+
 def _click_turnstile_via_shadow_dom(page, log_callback=None):
     """参考 grok-auto-register：通过 DrissionPage shadow_root 点 Cloudflare 复选框。
 
-    可见「请验证您是真人」复选框在 closed shadow + iframe 内，
-    主文档 querySelector / 普通 CDP DOM 都看不到，必须走元素 API 穿透。
+    Docker 中 element.click() 常“假成功”不出 token，因此 shadow 点选后
+    必须再补一次 CDP 坐标点击。
     """
     actions = []
     try:
         challenge_input = None
-        # 多种定位 cf-turnstile-response
         for locator in (
             "@name=cf-turnstile-response",
             'css:input[name="cf-turnstile-response"]',
             "css:input[name*=turnstile]",
         ):
             try:
-                challenge_input = page.ele(locator, timeout=0.2)
+                challenge_input = page.ele(locator, timeout=0.3)
             except Exception:
                 challenge_input = None
             if challenge_input:
                 actions.append(f"found-input:{locator}")
                 break
 
-        if not challenge_input:
-            # 直接找 turnstile 容器 / iframe
+        iframe = None
+        btn = None
+
+        if challenge_input:
+            wrapper = challenge_input
+            for depth in range(0, 6):
+                try:
+                    if hasattr(wrapper, "shadow_root") and wrapper.shadow_root:
+                        try:
+                            iframe = wrapper.shadow_root.ele("tag:iframe", timeout=0.3)
+                        except Exception:
+                            iframe = None
+                        if iframe:
+                            actions.append(f"iframe-via-shadow-depth:{depth}")
+                            break
+                except Exception:
+                    pass
+                try:
+                    parent = wrapper.parent()
+                except Exception:
+                    parent = None
+                if not parent:
+                    break
+                wrapper = parent
+
+        if not iframe:
             for locator in (
-                "css:div.cf-turnstile",
-                "css:[data-sitekey]",
+                "tag:iframe@src():turnstile",
+                "tag:iframe@src():challenges.cloudflare.com",
                 "css:iframe[src*='turnstile']",
                 "css:iframe[src*='challenges.cloudflare.com']",
                 "css:iframe[title*='Cloudflare']",
                 "css:iframe[title*='小部件']",
+                "css:div.cf-turnstile iframe",
+                "css:[data-sitekey] iframe",
             ):
                 try:
-                    node = page.ele(locator, timeout=0.2)
+                    iframe = page.ele(locator, timeout=0.25)
                 except Exception:
-                    node = None
-                if node:
-                    actions.append(f"found-node:{locator}")
-                    try:
-                        node.click(by_js=False)
-                        actions.append("clicked-node")
-                    except Exception as exc:
-                        actions.append(f"click-node-fail:{exc}")
-                    return {"ok": True, "actions": actions}
-            return {"ok": False, "actions": actions or ["no-cf-input"]}
-
-        # 从 input 向上找 wrapper，再进 shadow_root 的 iframe
-        wrapper = challenge_input
-        iframe = None
-        for depth in range(0, 6):
-            try:
-                if hasattr(wrapper, "shadow_root") and wrapper.shadow_root:
-                    try:
-                        iframe = wrapper.shadow_root.ele("tag:iframe", timeout=0.2)
-                    except Exception:
-                        iframe = None
-                    if iframe:
-                        actions.append(f"iframe-via-shadow-depth:{depth}")
-                        break
-            except Exception:
-                pass
-            try:
-                parent = wrapper.parent()
-            except Exception:
-                parent = None
-            if not parent:
-                break
-            wrapper = parent
-
-        if not iframe:
-            # 再试：页面级找 iframe
-            try:
-                iframe = page.ele("tag:iframe@src():turnstile", timeout=0.2)
-            except Exception:
-                iframe = None
-            if iframe:
-                actions.append("iframe-via-page-src")
+                    iframe = None
+                if iframe:
+                    actions.append(f"iframe-via:{locator}")
+                    break
 
         if not iframe:
             try:
-                # 任意 iframe 尺寸像 checkbox 条
                 frames = page.eles("tag:iframe") or []
-                for fr in frames[:12]:
+                for fr in frames[:16]:
                     try:
-                        rect = fr.rect
-                        size = getattr(rect, "size", None) or {}
-                        w = float(size.get("width") or getattr(rect, "width", 0) or 0)
-                        h = float(size.get("height") or getattr(rect, "height", 0) or 0)
+                        rect = _parse_element_rect(getattr(fr, "rect", None))
+                        w = float((rect or {}).get("width") or 0)
+                        h = float((rect or {}).get("height") or 0)
                     except Exception:
                         w = h = 0
                     if 180 <= w <= 560 and 36 <= h <= 120:
@@ -5954,13 +6065,14 @@ def _click_turnstile_via_shadow_dom(page, log_callback=None):
             except Exception as exc:
                 actions.append(f"iframe-scan-fail:{exc}")
 
-        if not iframe:
-            return {"ok": False, "actions": actions + ["no-iframe"]}
+        if not iframe and not challenge_input:
+            return {"ok": False, "actions": actions or ["no-cf-input"]}
 
-        # 参考项目：伪造 screenX/screenY，再点 shadow 内 input
-        try:
-            iframe.run_js(
-                """
+        # 参考项目：伪造 screenX/screenY
+        if iframe is not None:
+            try:
+                iframe.run_js(
+                    """
 window.dtp = 1;
 function getRandomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 let sx = getRandomInt(800, 1200);
@@ -5969,56 +6081,71 @@ try {
   Object.defineProperty(MouseEvent.prototype, 'screenX', { get: function(){ return sx; } });
   Object.defineProperty(MouseEvent.prototype, 'screenY', { get: function(){ return sy; } });
 } catch (e) {}
-                """
-            )
-            actions.append("patched-mouse-screen")
-        except Exception as exc:
-            actions.append(f"patch-mouse-fail:{exc}")
+                    """
+                )
+                actions.append("patched-mouse-screen")
+            except Exception as exc:
+                actions.append(f"patch-mouse-fail:{exc}")
 
         clicked = False
-        # 1) iframe body shadow_root 内的 input checkbox
-        try:
-            body = iframe.ele("tag:body", timeout=0.5)
-            body_sr = body.shadow_root if body else None
-            btn = None
-            if body_sr:
-                for sel in ("tag:input", "css:input[type=checkbox]", "css:.cb-lb", "css:label"):
-                    try:
-                        btn = body_sr.ele(sel, timeout=0.2)
-                    except Exception:
-                        btn = None
-                    if btn:
-                        actions.append(f"btn:{sel}")
-                        break
-            if btn:
-                btn.click()
-                clicked = True
-                actions.append("clicked-shadow-input")
-        except Exception as exc:
-            actions.append(f"shadow-click-fail:{exc}")
+        # 1) iframe body shadow_root 内 checkbox
+        if iframe is not None:
+            try:
+                body = iframe.ele("tag:body", timeout=0.8)
+                body_sr = getattr(body, "shadow_root", None) if body else None
+                if body_sr:
+                    for sel in (
+                        "tag:input",
+                        "css:input[type=checkbox]",
+                        "css:input",
+                        "css:.cb-lb",
+                        "css:label",
+                        "css:[role=checkbox]",
+                    ):
+                        try:
+                            btn = body_sr.ele(sel, timeout=0.25)
+                        except Exception:
+                            btn = None
+                        if btn:
+                            actions.append(f"btn:{sel}")
+                            break
+                if btn is not None:
+                    if _safe_element_click(btn, actions, "shadow-input"):
+                        clicked = True
+                    # Docker 下 element.click 常假成功：再补 CDP 坐标点
+                    if _cdp_click_element_left(page, btn, actions, "shadow-btn"):
+                        clicked = True
+            except Exception as exc:
+                actions.append(f"shadow-click-fail:{exc}")
 
-        # 2) 直接点 iframe 元素左侧
+        # 2) 点 iframe / 容器本身（兼容 ChromiumFrame 无 click）
+        if iframe is not None:
+            if _safe_element_click(iframe, actions, "iframe"):
+                clicked = True
+            if _cdp_click_element_left(page, iframe, actions, "iframe"):
+                clicked = True
+
+        # 3) 点 cf-turnstile 容器
+        if challenge_input is not None:
+            try:
+                host = challenge_input.parent()
+            except Exception:
+                host = challenge_input
+            if _cdp_click_element_left(page, host, actions, "host"):
+                clicked = True
+
+        # 4) 最后 CDP 全局定位兜底
         if not clicked:
             try:
-                iframe.click(by_js=False)
-                clicked = True
-                actions.append("clicked-iframe")
+                cdp_info = _click_turnstile_challenge_if_visible(page)
+                actions.append(
+                    "cdp-global:"
+                    + json.dumps(cdp_info if isinstance(cdp_info, dict) else {"raw": str(cdp_info)}, ensure_ascii=False)[:180]
+                )
+                if isinstance(cdp_info, dict) and cdp_info.get("nativeClicked"):
+                    clicked = True
             except Exception as exc:
-                actions.append(f"iframe-click-fail:{exc}")
-
-        # 3) CDP 点 iframe 矩形左侧
-        if not clicked:
-            try:
-                box = iframe.rect
-                loc = getattr(box, "location", None) or {}
-                size = getattr(box, "size", None) or {}
-                x = int(float(loc.get("x") or 0) + 24)
-                y = int(float(loc.get("y") or 0) + float(size.get("height") or 65) / 2)
-                _click_point_on_page(page, x, y)
-                clicked = True
-                actions.append(f"cdp-click:{x},{y}")
-            except Exception as exc:
-                actions.append(f"cdp-click-fail:{exc}")
+                actions.append(f"cdp-global-fail:{exc}")
 
         return {"ok": clicked, "actions": actions}
     except Exception as exc:
@@ -6040,30 +6167,38 @@ def getTurnstileToken(log_callback=None, cancel_callback=None, attempts=15):
             return token
 
         click_info = _click_turnstile_via_shadow_dom(page, log_callback=log_callback)
-        if log_callback and (i == 0 or i % 3 == 0 or (isinstance(click_info, dict) and click_info.get("ok"))):
+        if log_callback:
             log_callback(
                 f"[*] Turnstile shadow 点击尝试 #{i+1}: "
-                + json.dumps(click_info, ensure_ascii=False)[:400]
+                + json.dumps(click_info, ensure_ascii=False)[:500]
             )
-        # 再兜底一次旧的 CDP 定位
-        if not (isinstance(click_info, dict) and click_info.get("ok")):
-            try:
-                cdp_info = _click_turnstile_challenge_if_visible(page)
-                if log_callback and i == 0:
-                    log_callback(
-                        "[Debug] Turnstile CDP 兜底: "
-                        + json.dumps(cdp_info if isinstance(cdp_info, dict) else {"raw": str(cdp_info)}, ensure_ascii=False)[:300]
-                    )
-            except Exception as exc:
-                if log_callback and i == 0:
-                    log_callback(f"[Debug] Turnstile CDP 兜底失败: {exc}")
 
-        sleep_with_cancel(1, cancel_callback)
+        # 点完多等一会：Docker 里 CF 出 token 更慢
+        sleep_with_cancel(1.2 if i == 0 else 1.0, cancel_callback)
         token = _read_turnstile_token_from_page(page)
         if len(token) >= 80:
             if log_callback:
                 log_callback(f"[*] Turnstile 已通过，token长度={len(token)}")
             return token
+
+        # 若“点成功”但 token 仍空，再强制 CDP 全局点一次
+        if isinstance(click_info, dict) and click_info.get("ok") and not token:
+            try:
+                cdp_info = _click_turnstile_challenge_if_visible(page)
+                if log_callback:
+                    log_callback(
+                        "[*] 点击后 token 仍为空，CDP 再点: "
+                        + json.dumps(cdp_info if isinstance(cdp_info, dict) else {"raw": str(cdp_info)}, ensure_ascii=False)[:300]
+                    )
+                sleep_with_cancel(1.0, cancel_callback)
+                token = _read_turnstile_token_from_page(page)
+                if len(token) >= 80:
+                    if log_callback:
+                        log_callback(f"[*] Turnstile 已通过，token长度={len(token)}")
+                    return token
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[Debug] CDP 再点失败: {exc}")
 
     raise Exception("Turnstile 获取 token 失败")
 
