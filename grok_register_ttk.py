@@ -5940,18 +5940,132 @@ def _safe_element_click(el, actions=None, label="element"):
     return False
 
 
+def _is_page_absolute_turnstile_rect(rect):
+    """过滤 iframe 内部相对坐标（Docker 里常见 x=25,y=32 这种误点）。"""
+    if not rect:
+        return False
+    x = float(rect.get("x") or 0)
+    y = float(rect.get("y") or 0)
+    w = float(rect.get("width") or 0)
+    h = float(rect.get("height") or 0)
+    if w < 80 or h < 20:
+        return False
+    # 页面中部/下方的 checkbox 条，不太可能贴在 (0,0) 附近
+    if x < 40 and y < 40 and w < 120:
+        return False
+    # 明显在可视区域内
+    if x > 2500 or y > 2500:
+        return False
+    return True
+
+
+def _locate_turnstile_box_on_page(page):
+    """在主文档坐标系下找 Turnstile 可见区域（页面绝对坐标）。"""
+    try:
+        raw = page.run_js(
+            r"""
+function boxOf(node) {
+  if (!node || !node.getBoundingClientRect) return null;
+  const r = node.getBoundingClientRect();
+  if (r.width < 40 || r.height < 16) return null;
+  return [r.left, r.top, r.width, r.height];
+}
+// 1) 从 hidden input 向上找合适容器
+const input = document.querySelector('input[name="cf-turnstile-response"]');
+if (input) {
+  let n = input;
+  for (let i = 0; i < 10 && n; i++) {
+    const b = boxOf(n);
+    if (b && b[2] >= 180 && b[2] <= 560 && b[3] >= 36 && b[3] <= 120) return {via:'input-parent', box:b};
+    n = n.parentElement;
+  }
+}
+// 2) 标准 host
+const hosts = Array.from(document.querySelectorAll('div.cf-turnstile, [data-sitekey], iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"], iframe[title*="Cloudflare"], iframe[title*="小部件"]'));
+for (const h of hosts) {
+  const b = boxOf(h);
+  if (b) return {via:'host', box:b, tag:h.tagName};
+}
+// 3) 开放 shadow 里的 iframe
+function walk(root, depth) {
+  if (!root || depth > 6) return null;
+  let nodes;
+  try { nodes = root.querySelectorAll('*'); } catch (e) { return null; }
+  for (const node of nodes) {
+    try {
+      if (node.shadowRoot) {
+        const hit = walk(node.shadowRoot, depth + 1);
+        if (hit) return hit;
+      }
+    } catch (e) {}
+    if (String(node.tagName||'').toLowerCase() === 'iframe') {
+      const b = boxOf(node);
+      if (b && b[2] >= 180 && b[2] <= 560 && b[3] >= 36 && b[3] <= 120) {
+        return {via:'open-shadow-iframe', box:b};
+      }
+    }
+  }
+  return null;
+}
+const shadowHit = walk(document, 0);
+if (shadowHit) return shadowHit;
+// 4) 任意“checkbox 条”尺寸元素（靠近密码框下方优先）
+const password = document.querySelector('input[type="password"], input[name="password"]');
+const py = password ? password.getBoundingClientRect().bottom : 0;
+let best = null;
+for (const node of Array.from(document.querySelectorAll('div,iframe,section'))) {
+  const b = boxOf(node);
+  if (!b || b[2] < 200 || b[2] > 520 || b[3] < 40 || b[3] > 90) continue;
+  const score = Math.abs((b[1] + b[3]/2) - (py || b[1]));
+  if (!best || score < best.score) best = {via:'sized', box:b, score};
+}
+return best;
+            """
+        )
+    except Exception as exc:
+        return {"error": str(exc)[:160]}
+    if not isinstance(raw, dict):
+        return None
+    box = _parse_element_rect(raw.get("box"))
+    if not _is_page_absolute_turnstile_rect(box):
+        return {"raw": raw, "rejected_box": box}
+    return {"via": raw.get("via"), "box": box}
+
+
+def _cdp_click_page_box_left(page, box, actions=None, label="page-box"):
+    actions = actions if actions is not None else []
+    if not _is_page_absolute_turnstile_rect(box):
+        actions.append(f"skip-bad-box-{label}:{box}")
+        return False
+    x = int(box["x"] + min(max(16, box["width"] * 0.12), 36))
+    y = int(box["y"] + max(box["height"] / 2, 12))
+    # 再保险：拒绝贴边误点
+    if x < 30 and y < 30:
+        actions.append(f"skip-corner-{label}:{x},{y}")
+        return False
+    try:
+        _click_point_on_page(page, x, y)
+        actions.append(f"cdp-click-{label}:{x},{y}")
+        sleep_with_cancel(0.15)
+        _click_point_on_page(page, x + 2, y)
+        actions.append(f"cdp-click2-{label}:{x+2},{y}")
+        return True
+    except Exception as exc:
+        actions.append(f"cdp-click-{label}-fail:{exc}")
+        return False
+
+
 def _cdp_click_element_left(page, el, actions=None, label="element"):
-    """用元素 rect 算左侧复选框位置，CDP 真实鼠标点击（Docker 里更可靠）。"""
+    """仅在能拿到页面绝对坐标时 CDP 点击；拒绝 iframe 内相对坐标。"""
     actions = actions if actions is not None else []
     if el is None:
         return False
     rect = None
     for getter in (
         lambda: getattr(el, "rect", None),
-        lambda: el.states.has_rect and el.rect,
         lambda: el.run_js(
             "const r=this.getBoundingClientRect();"
-            "return [r.left, r.top, r.width, r.height];"
+            "return [r.left + (window.scrollX||0), r.top + (window.scrollY||0), r.width, r.height];"
         )
         if hasattr(el, "run_js")
         else None,
@@ -5964,22 +6078,15 @@ def _cdp_click_element_left(page, el, actions=None, label="element"):
         except Exception as exc:
             actions.append(f"rect-{label}-fail:{exc}")
             rect = None
-    if not rect or rect.get("width", 0) <= 1:
-        actions.append(f"no-rect-{label}")
+    if not _is_page_absolute_turnstile_rect(rect):
+        # 元素坐标不可信（常见于 iframe 内 shadow input），改用主文档定位
+        actions.append(f"untrusted-rect-{label}:{rect}")
+        located = _locate_turnstile_box_on_page(page)
+        if isinstance(located, dict) and located.get("box"):
+            return _cdp_click_page_box_left(page, located["box"], actions, f"{label}-via-page")
+        actions.append(f"no-page-box-{label}:{located}")
         return False
-    x = int(rect["x"] + min(max(16, rect["width"] * 0.12), 36))
-    y = int(rect["y"] + max(rect["height"] / 2, 12))
-    try:
-        _click_point_on_page(page, x, y)
-        actions.append(f"cdp-click-{label}:{x},{y}")
-        # 轻微二次点击，部分环境第一次只 focus
-        sleep_with_cancel(0.12)
-        _click_point_on_page(page, x + 1, y)
-        actions.append(f"cdp-click2-{label}:{x+1},{y}")
-        return True
-    except Exception as exc:
-        actions.append(f"cdp-click-{label}-fail:{exc}")
-        return False
+    return _cdp_click_page_box_left(page, rect, actions, label)
 
 
 def _click_turnstile_via_shadow_dom(page, log_callback=None):
@@ -6088,7 +6195,7 @@ try {
                 actions.append(f"patch-mouse-fail:{exc}")
 
         clicked = False
-        # 1) iframe body shadow_root 内 checkbox
+        # 1) iframe body shadow_root 内 checkbox（本地桌面最有效）
         if iframe is not None:
             try:
                 body = iframe.ele("tag:body", timeout=0.8)
@@ -6112,20 +6219,20 @@ try {
                 if btn is not None:
                     if _safe_element_click(btn, actions, "shadow-input"):
                         clicked = True
-                    # Docker 下 element.click 常假成功：再补 CDP 坐标点
-                    if _cdp_click_element_left(page, btn, actions, "shadow-btn"):
-                        clicked = True
             except Exception as exc:
                 actions.append(f"shadow-click-fail:{exc}")
 
-        # 2) 点 iframe / 容器本身（兼容 ChromiumFrame 无 click）
-        if iframe is not None:
-            if _safe_element_click(iframe, actions, "iframe"):
+        # 2) 主文档坐标系下定位 widget 后 CDP 点左侧
+        # 关键：禁止使用 iframe 内相对坐标（Docker 曾误点 25,32 把页面点飞）
+        located = _locate_turnstile_box_on_page(page)
+        if isinstance(located, dict) and located.get("box"):
+            actions.append(f"page-box:{located.get('via')}:{located.get('box')}")
+            if _cdp_click_page_box_left(page, located["box"], actions, "page-widget"):
                 clicked = True
-            if _cdp_click_element_left(page, iframe, actions, "iframe"):
-                clicked = True
+        else:
+            actions.append(f"page-box-miss:{located}")
 
-        # 3) 点 cf-turnstile 容器
+        # 3) 仅当元素 rect 是页面绝对坐标时，才对 host 再点
         if challenge_input is not None:
             try:
                 host = challenge_input.parent()
@@ -6134,7 +6241,8 @@ try {
             if _cdp_click_element_left(page, host, actions, "host"):
                 clicked = True
 
-        # 4) 最后 CDP 全局定位兜底
+        # 4) 不要对 ChromiumFrame 调 .click()；坐标不可信时跳过
+        # 5) 全局 CDP frame-owner 兜底（about:blank）
         if not clicked:
             try:
                 cdp_info = _click_turnstile_challenge_if_visible(page)
@@ -6143,7 +6251,13 @@ try {
                     + json.dumps(cdp_info if isinstance(cdp_info, dict) else {"raw": str(cdp_info)}, ensure_ascii=False)[:180]
                 )
                 if isinstance(cdp_info, dict) and cdp_info.get("nativeClicked"):
-                    clicked = True
+                    # 若坐标看起来像左上角误点，视为失败
+                    cx = int(cdp_info.get("x") or 0)
+                    cy = int(cdp_info.get("y") or 0)
+                    if cx < 40 and cy < 40:
+                        actions.append(f"cdp-global-rejected-corner:{cx},{cy}")
+                    else:
+                        clicked = True
             except Exception as exc:
                 actions.append(f"cdp-global-fail:{exc}")
 
