@@ -68,6 +68,10 @@ def get_account_status_file():
     return os.path.join(get_data_dir(), "account_status.json")
 
 
+def get_rejected_email_domains_file():
+    return os.path.join(get_data_dir(), "rejected_email_domains.json")
+
+
 CONFIG_FILE = get_config_file()
 
 DEFAULT_CONFIG = {
@@ -1906,6 +1910,11 @@ def _dispatch_cdp_text(page, text):
 
 
 def _click_turnstile_challenge_if_visible(page):
+    """点击可见的 Cloudflare 复选框/挑战框。
+
+    本地桌面 Chrome 常渲染成可见的「请验证您是真人」复选框；
+    Docker 里多为 flexible 无框。两者都要支持，不能只被动等 token。
+    """
     target = page.run_js(
         r"""
 // turnstile-challenge-target
@@ -1913,35 +1922,128 @@ function visible(node) {
     if (!node) return false;
     const style = window.getComputedStyle(node);
     const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+}
+function centerOf(node, preferCheckboxLeft) {
+    const rect = node.getBoundingClientRect();
+    // 复选框通常在左侧；点整块 widget 中心容易点到文字/logo 无效
+    const x = preferCheckboxLeft
+        ? Math.round(rect.left + Math.min(Math.max(18, rect.width * 0.12), 36))
+        : Math.round(rect.left + rect.width / 2);
+    const y = Math.round(rect.top + rect.height / 2);
+    return {
+        x, y,
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+    };
 }
 const frames = [];
+const widgets = [];
+const textHits = [];
 function visit(root) {
     if (!root || !root.querySelectorAll) return;
     for (const node of Array.from(root.querySelectorAll('*'))) {
         if (node.shadowRoot) visit(node.shadowRoot);
-        if (String(node.tagName || '').toLowerCase() !== 'iframe') continue;
+        const tag = String(node.tagName || '').toLowerCase();
+        if (tag === 'iframe') {
+            const marker = [
+                node.getAttribute('src'),
+                node.getAttribute('title'),
+                node.getAttribute('name'),
+                node.id,
+                node.className,
+            ].join(' ').toLowerCase();
+            if (
+                marker.includes('challenge') ||
+                marker.includes('turnstile') ||
+                marker.includes('cloudflare') ||
+                marker.includes('cf-chl')
+            ) {
+                if (visible(node)) frames.push(node);
+            }
+            continue;
+        }
         const marker = [
-            node.getAttribute('src'),
-            node.getAttribute('title'),
-            node.getAttribute('name'),
-            node.id,
             node.className,
+            node.id,
+            node.getAttribute && node.getAttribute('data-sitekey'),
+            node.getAttribute && node.getAttribute('aria-label'),
         ].join(' ').toLowerCase();
-        if (marker.includes('challenge') || marker.includes('turnstile')) frames.push(node);
+        if (
+            visible(node) && (
+                marker.includes('cf-turnstile') ||
+                marker.includes('cf-chl') ||
+                (node.getAttribute && node.getAttribute('data-sitekey'))
+            )
+        ) {
+            widgets.push(node);
+        }
+        const text = String(node.innerText || node.textContent || node.getAttribute?.('aria-label') || '')
+            .replace(/\s+/g, '');
+        if (
+            visible(node) && text && text.length < 40 && (
+                text.includes('请验证您是真人') ||
+                text.includes('确认您是真人') ||
+                text.includes('Verifyyouarehuman') ||
+                text.toLowerCase().includes('verifyyouarehuman') ||
+                text.includes('我不是机器人')
+            )
+        ) {
+            textHits.push(node);
+        }
     }
 }
 visit(document);
-const targetFrame = frames.find(visible);
-if (!targetFrame) return { state: 'turnstile-challenge-not-found', count: frames.length };
-const rect = targetFrame.getBoundingClientRect();
+
+// 1) 优先点可见 turnstile iframe 左侧复选框位置
+if (frames.length) {
+    const frame = frames[0];
+    return {
+        state: 'turnstile-challenge-target',
+        via: 'iframe',
+        count: frames.length,
+        src: String(frame.getAttribute('src') || '').slice(0, 160),
+        ...centerOf(frame, true),
+    };
+}
+// 2) 点 cf-turnstile / data-sitekey 容器左侧
+if (widgets.length) {
+    const widget = widgets[0];
+    return {
+        state: 'turnstile-challenge-target',
+        via: 'widget',
+        count: widgets.length,
+        src: String(widget.getAttribute('data-sitekey') || widget.className || '').slice(0, 160),
+        ...centerOf(widget, true),
+    };
+}
+// 3) 点「请验证您是真人」文字所在区域左侧（截图里的可见复选框文案）
+if (textHits.length) {
+    // 文案节点可能在右侧，向左偏移一点点到 checkbox
+    const node = textHits[0];
+    const rect = node.getBoundingClientRect();
+    // 往父级找更大的可点容器
+    let box = node;
+    for (let i = 0; i < 5 && box.parentElement; i++) {
+        const p = box.parentElement;
+        const pr = p.getBoundingClientRect();
+        if (pr.width > rect.width * 1.2 && pr.width < 520 && pr.height < 120) box = p;
+        else break;
+    }
+    return {
+        state: 'turnstile-challenge-target',
+        via: 'text',
+        count: textHits.length,
+        text: String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80),
+        ...centerOf(box, true),
+    };
+}
 return {
-    state: 'turnstile-challenge-target',
-    x: Math.round(rect.left + Math.min(Math.max(24, rect.width * 0.15), 42)),
-    y: Math.round(rect.top + rect.height / 2),
-    width: Math.round(rect.width),
-    height: Math.round(rect.height),
-    src: String(targetFrame.getAttribute('src') || '').slice(0, 160),
+    state: 'turnstile-challenge-not-found',
+    count: 0,
+    frameCount: frames.length,
+    widgetCount: widgets.length,
+    textCount: textHits.length,
 };
         """
     )
@@ -1949,6 +2051,17 @@ return {
         return target
     if target.get("x") is None or target.get("y") is None:
         return {"state": "turnstile-challenge-missing-center", **target}
+    # 先 hover 再点，更接近真人
+    try:
+        page.run_cdp(
+            "Input.dispatchMouseEvent",
+            type="mouseMoved",
+            x=int(target.get("x")),
+            y=int(target.get("y")),
+            modifiers=0,
+        )
+    except Exception:
+        pass
     _dispatch_cdp_click(
         page,
         int(target.get("x")),
@@ -3644,9 +3757,12 @@ class RegistrationJob:
                     log_callback=logf, cancel_callback=self.should_stop
                 )
             except EmailDomainRejected as rejected:
-                remember_rejected_email_domain(rejected.domain)
+                remembered = remember_rejected_email_domain(rejected.domain)
                 if mail_try < max_mail_retry:
-                    logf(f"[!] 邮箱域名被 x.ai 拒收，自动换邮箱重试: {rejected.domain}")
+                    logf(
+                        f"[!] 邮箱域名被 x.ai 拒收，已加入黑名单并换后缀重试: {rejected.domain}"
+                        f"（当前共 {len(remembered)} 个拒收域名）"
+                    )
                     restart_browser(log_callback=logf)
                     sleep_with_cancel(1, self.should_stop)
                     continue
@@ -3816,6 +3932,13 @@ class RegistrationJob:
             f"连续封禁熔断 {block_threshold or '关闭'}，"
             f"注册后 NSFW={'开' if self.settings.get('enable_nsfw') else '关'}"
         )
+        rejected_domains = list_rejected_email_domains()
+        if rejected_domains:
+            preview = ", ".join(rejected_domains[:12])
+            extra = f" 等{len(rejected_domains)}个" if len(rejected_domains) > 12 else f" 共{len(rejected_domains)}个"
+            self.log(f"[*] 已加载历史拒收邮箱后缀，将自动跳过: {preview}{extra}")
+        else:
+            self.log("[*] 历史拒收邮箱后缀: 无")
         self.log(f"[*] 成功账号将实时保存到: {os.path.join(get_data_dir(), self.output_file)}")
         try:
             start_interval = float(self.settings.get("thread_start_interval", 2.0))
@@ -4222,21 +4345,94 @@ def rejected_email_domain_variants(domain):
     # 子域被拒时连父域一起记，例如 007.hzeg.eu.org -> hzeg.eu.org
     if len(parts) >= 3:
         variants.add(".".join(parts[1:]))
-    return variants
+    # 邮箱地址进来时只取 @ 后域名
+    if "@" in normalized:
+        variants |= rejected_email_domain_variants(normalized.split("@", 1)[1])
+    return {item for item in variants if item and "@" not in item}
+
+
+def load_rejected_email_domains(force=False):
+    """从 data 目录加载历史拒收域名，进程内缓存。"""
+    global _rejected_email_domains
+    path = get_rejected_email_domains_file()
+    with _rejected_email_domains_lock:
+        if not force and _rejected_email_domains:
+            # 已有内存数据时也要合并磁盘，避免多任务漏载
+            pass
+        loaded = set()
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    raw = json.load(handle)
+                if isinstance(raw, list):
+                    items = raw
+                elif isinstance(raw, dict):
+                    items = raw.get("domains") or raw.get("rejected") or []
+                else:
+                    items = []
+                for item in items:
+                    loaded |= rejected_email_domain_variants(item)
+            except Exception:
+                loaded = set()
+        if force:
+            _rejected_email_domains = loaded
+        else:
+            _rejected_email_domains |= loaded
+        return set(_rejected_email_domains)
+
+
+def save_rejected_email_domains():
+    path = get_rejected_email_domains_file()
+    with _rejected_email_domains_lock:
+        domains = sorted(_rejected_email_domains)
+    payload = {
+        "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "domains": domains,
+    }
+    directory = os.path.dirname(path) or "."
+    fd, temp_path = tempfile.mkstemp(prefix=".rejected-domains-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
+    return path
 
 
 def remember_rejected_email_domain(domain):
+    """记录被 x.ai 拒收的邮箱后缀，并持久化到 data/rejected_email_domains.json。"""
+    load_rejected_email_domains()
     variants = rejected_email_domain_variants(domain)
     if not variants:
-        return
+        return set()
     with _rejected_email_domains_lock:
+        before = set(_rejected_email_domains)
         _rejected_email_domains.update(variants)
+        changed = _rejected_email_domains != before
+        snapshot = set(_rejected_email_domains)
+    if changed:
+        try:
+            save_rejected_email_domains()
+        except Exception:
+            pass
+    return snapshot
 
 
 def is_email_domain_rejected(domain):
+    load_rejected_email_domains()
     normalized = str(domain or "").strip().lower().lstrip("@")
     if not normalized:
         return False
+    if "@" in normalized:
+        normalized = normalized.split("@", 1)[1]
     with _rejected_email_domains_lock:
         if normalized in _rejected_email_domains:
             return True
@@ -4249,6 +4445,12 @@ def is_email_domain_rejected(domain):
             if normalized.endswith("." + rejected):
                 return True
     return False
+
+
+def list_rejected_email_domains():
+    load_rejected_email_domains()
+    with _rejected_email_domains_lock:
+        return sorted(_rejected_email_domains)
 
 
 def pick_rotating_domain(candidates, index_name):
@@ -4505,8 +4707,13 @@ def get_email_and_token(api_key=None):
         domains = [x.strip() for x in re.split(r"[,，\s]+", raw) if x.strip()]
         if not domains:
             raise Exception("CloudMail 需要在 defaultDomains 中配置可用域名")
+        available = [d for d in domains if not is_email_domain_rejected(d)]
+        if not available:
+            raise EmailProviderUnavailable(
+                "CloudMail defaultDomains 中的域名均已被 x.ai 拒收: " + ", ".join(domains)
+            )
         global _cf_domain_index
-        domain = domains[_cf_domain_index % len(domains)]
+        domain = available[_cf_domain_index % len(available)]
         _cf_domain_index += 1
         username = generate_username(10)
         address = f"{username}@{domain}"
@@ -4518,15 +4725,29 @@ def get_email_and_token(api_key=None):
             raise Exception("Cloudflare API Base 未配置")
         try:
             # cloudflare_temp_email 专用模式
-            return cloudflare_create_temp_address(api_base)
+            address, token = cloudflare_create_temp_address(api_base)
+            # 若历史黑名单命中，直接换兜底域名创建，避免重复撞同一拒收后缀
+            if address and is_email_domain_rejected(address):
+                raise Exception(f"临时邮箱域名已在拒收黑名单: {address}")
+            return address, token
         except Exception as primary_exc:
             # 兜底回退到 Mail.tm 风格
             key = api_key or get_cloudflare_api_key()
             domains = cloudflare_get_domains(api_base, api_key=key)
             if not domains:
                 raise Exception(f"Cloudflare 创建邮箱失败: {primary_exc}")
-            verified = [d for d in domains if d.get("isVerified")]
-            target = verified[0] if verified else domains[0]
+            verified = [
+                d for d in domains
+                if d.get("isVerified") and not is_email_domain_rejected(d.get("domain"))
+            ]
+            candidates = verified or [
+                d for d in domains if not is_email_domain_rejected(d.get("domain"))
+            ]
+            if not candidates:
+                raise EmailProviderUnavailable(
+                    f"Cloudflare 可用域名均已被 x.ai 拒收（含历史黑名单）: {primary_exc}"
+                )
+            target = candidates[0]
             domain = target.get("domain")
             if not domain:
                 raise Exception("Cloudflare 域名数据格式错误，缺少 domain 字段")
@@ -5734,23 +5955,39 @@ return 'profile-filled';
                 if now - wait_cf_since >= wait_limit and str(token_len) in {"0", ""}:
                     raise Exception(
                         f"Cloudflare Turnstile {wait_limit:.0f}s 内未签发 token（token长度=0）。"
-                        "同一代理若手动能过、脚本不过，通常是 Docker/自动化浏览器指纹被拒"
+                        "若页面上有可见复选框却未点中，请看日志里的 challengeClick；"
+                        "若始终无框且 token=0，则多为自动化环境被拒"
                     )
-                # 全程保持轻微交互；默认不 force execute
+                # 全程保持轻微交互
                 if now - last_humanize_at >= 5:
                     humanize_page_activity(page, log_callback=None, cancel_callback=cancel_callback)
                     last_humanize_at = now
-                if force_execute and now - wait_cf_since >= 35 and now - last_cf_retry_at >= 15:
-                    if log_callback:
-                        log_callback("[*] 已开启 turnstile_force_execute，尝试有限次 execute...")
+                # 本地常见：可见「请验证您是真人」复选框。必须主动点，不能只被动等。
+                if now - last_cf_retry_at >= 3:
                     try:
-                        trig = page.run_js(build_profile_submit_script("trigger"))
+                        click_result = _click_turnstile_challenge_if_visible(page)
+                        if log_callback and isinstance(click_result, dict):
+                            state = str(click_result.get("state") or "")
+                            if state == "turnstile-challenge-target" or click_result.get("nativeClicked"):
+                                log_callback(
+                                    "[*] 检测到可见 Cloudflare 挑战，尝试点击复选框: "
+                                    + json.dumps(click_result, ensure_ascii=False)[:320]
+                                )
+                            elif state != "turnstile-challenge-not-found":
+                                log_callback(
+                                    f"[Debug] Cloudflare 挑战点击结果: {json.dumps(click_result, ensure_ascii=False)[:240]}"
+                                )
+                    except Exception as click_exc:
                         if log_callback:
-                            log_callback(f"[Debug] Turnstile 主动触发结果: {trig}")
-                        _click_turnstile_challenge_if_visible(page)
-                    except Exception as cf_exc:
-                        if log_callback:
-                            log_callback(f"[Debug] Turnstile 主动触发失败: {cf_exc}")
+                            log_callback(f"[Debug] Cloudflare 挑战点击失败: {click_exc}")
+                    if force_execute and now - wait_cf_since >= 20:
+                        try:
+                            trig = page.run_js(build_profile_submit_script("trigger"))
+                            if log_callback:
+                                log_callback(f"[Debug] Turnstile 主动触发结果: {trig}")
+                        except Exception as cf_exc:
+                            if log_callback:
+                                log_callback(f"[Debug] Turnstile 主动触发失败: {cf_exc}")
                     last_cf_retry_at = now
                 sleep_with_cancel(0.8, cancel_callback)
                 continue
@@ -5782,22 +6019,32 @@ return 'profile-filled';
             if now - wait_cf_since >= wait_limit and str(token_len) in {"0", ""}:
                 raise Exception(
                     f"Cloudflare Turnstile {wait_limit:.0f}s 内未签发 token（token长度=0）。"
-                    "同一代理若手动能过、脚本不过，通常是 Docker/自动化浏览器指纹被拒"
+                    "若页面上有可见复选框却未点中，请看日志里的 challengeClick"
                 )
             if now - last_humanize_at >= 5:
                 humanize_page_activity(page, log_callback=None, cancel_callback=cancel_callback)
                 last_humanize_at = now
-            if force_execute and now - wait_cf_since >= 35 and now - last_cf_retry_at >= 15:
-                if log_callback:
-                    log_callback("[*] 提交前仍无 token，且已开启 force_execute，尝试 execute...")
+            if now - last_cf_retry_at >= 3:
                 try:
-                    trig = page.run_js(build_profile_submit_script("trigger"))
+                    click_result = _click_turnstile_challenge_if_visible(page)
+                    if log_callback and isinstance(click_result, dict):
+                        state = str(click_result.get("state") or "")
+                        if state == "turnstile-challenge-target" or click_result.get("nativeClicked"):
+                            log_callback(
+                                "[*] 提交前检测到可见 Cloudflare 挑战，尝试点击: "
+                                + json.dumps(click_result, ensure_ascii=False)[:320]
+                            )
+                except Exception as click_exc:
                     if log_callback:
-                        log_callback(f"[Debug] Turnstile 主动触发结果: {trig}")
-                    _click_turnstile_challenge_if_visible(page)
-                except Exception as cf_exc:
-                    if log_callback:
-                        log_callback(f"[Debug] Turnstile 主动触发失败: {cf_exc}")
+                        log_callback(f"[Debug] 提交前挑战点击失败: {click_exc}")
+                if force_execute and now - wait_cf_since >= 20:
+                    try:
+                        trig = page.run_js(build_profile_submit_script("trigger"))
+                        if log_callback:
+                            log_callback(f"[Debug] Turnstile 主动触发结果: {trig}")
+                    except Exception as cf_exc:
+                        if log_callback:
+                            log_callback(f"[Debug] Turnstile 主动触发失败: {cf_exc}")
                 last_cf_retry_at = now
             sleep_with_cancel(0.8, cancel_callback)
             continue

@@ -811,6 +811,23 @@ def test_remember_rejected_email_domain_also_blocks_sibling_subdomains():
     assert not reg.is_email_domain_rejected("10161993.xyz")
 
 
+def test_rejected_email_domains_are_persisted_and_reloaded(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    reg._rejected_email_domains.clear()
+    reg.remember_rejected_email_domain("100811.xyz")
+
+    path = tmp_path / "rejected_email_domains.json"
+    assert path.exists()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert "100811.xyz" in payload["domains"]
+
+    # 模拟进程重启：清空内存后再加载
+    reg._rejected_email_domains.clear()
+    assert reg.is_email_domain_rejected("a@100811.xyz")
+    assert reg.is_email_domain_rejected("sub.100811.xyz")
+    assert "100811.xyz" in reg.list_rejected_email_domains()
+
+
 def test_list_registered_accounts_reads_accounts_files(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     tmp_path.joinpath("accounts_20260630_140000_job.txt").write_text(
@@ -1697,7 +1714,9 @@ def test_turnstile_challenge_target_uses_a_real_cdp_click():
     class FakePage:
         def run_js(self, script):
             assert "turnstile-challenge-target" in script
-            return {"state": "turnstile-challenge-target", "x": 111, "y": 222}
+            # 新逻辑会找 iframe / widget /「请验证您是真人」文案
+            assert "请验证您是真人" in script
+            return {"state": "turnstile-challenge-target", "x": 111, "y": 222, "via": "text"}
 
         def run_cdp(self, method, **params):
             events.append((method, params))
@@ -1705,6 +1724,13 @@ def test_turnstile_challenge_target_uses_a_real_cdp_click():
     result = reg._click_turnstile_challenge_if_visible(FakePage())
 
     assert result["nativeClicked"] is True
+    assert any(
+        method == "Input.dispatchMouseEvent"
+        and params.get("type") == "mouseMoved"
+        and params.get("x") == 111
+        and params.get("y") == 222
+        for method, params in events
+    )
     assert any(
         method == "Input.dispatchMouseEvent"
         and params.get("type") == "mousePressed"
