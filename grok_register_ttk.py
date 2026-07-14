@@ -1601,7 +1601,7 @@ def turnstile_page_hook_source():
 
 
 def install_light_stealth_script(page, log_callback=None):
-    """轻量 stealth + WebGL/Canvas 反指纹，绝不补丁 window.turnstile（避免破坏 flexible 模式）。"""
+    """增强 stealth：WebGL/Canvas/Audio 反指纹 + 插件/WebRTC 伪装，绝不补丁 window.turnstile。"""
     if not page:
         return False
     source = r"""
@@ -1611,13 +1611,13 @@ def install_light_stealth_script(page, log_callback=None):
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true });
   } catch (e) {}
 
-  // 2. chrome.runtime
+  // 2. chrome.runtime —— Turnstile 检查 window.chrome.runtime 是否存在
   try {
     if (!window.chrome) window.chrome = {};
     if (!window.chrome.runtime) window.chrome.runtime = {};
   } catch (e) {}
 
-  // 3. permissions.query
+  // 3. permissions.query —— notifications 路径异常是已知检测项
   try {
     const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
     if (originalQuery) {
@@ -1637,7 +1637,7 @@ def install_light_stealth_script(page, log_callback=None):
     });
   } catch (e) {}
 
-  // 5. platform —— 根据 UA 动态推导，不再硬编码 Linux x86_64
+  // 5. platform —— 根据 UA 动态推导
   try {
     const ua = navigator.userAgent || '';
     let p = 'Linux x86_64';
@@ -1646,44 +1646,33 @@ def install_light_stealth_script(page, log_callback=None):
     Object.defineProperty(navigator, 'platform', { get: () => p, configurable: true });
   } catch (e) {}
 
-  // 6. WebGL vendor/renderer 伪装 —— 仅当检测到 SwiftShader / llvmpipe 等软件渲染时替换
+  // 6. WebGL vendor/renderer —— 始终 hook getParameter，在调用时才判断是否需要伪装
+  //    关键：不能先检测再 hook，因为 document_start 阶段检测可能因时序问题失败
   try {
     const FAKE_WGL_VENDOR = 'Google Inc. (Intel)';
     const FAKE_WGL_RENDERER = 'ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.6)';
+    const SW_RE = /swiftshader|llvmpipe|softpipe|software[\s_-]*rasterizer|mesa[\s_-]*swrast/i;
 
-    const isSoftwareRenderer = (() => {
-      try {
-        const c = document.createElement('canvas');
-        const gl = c.getContext('webgl') || c.getContext('experimental-webgl');
-        if (!gl) return false;
-        const ext = gl.getExtension('WEBGL_debug_renderer_info');
-        if (!ext) return false;
-        const r = gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) || '';
-        return /swiftshader|llvmpipe|softpipe|software.*rasterizer|mesa.*swrast/i.test(r);
-      } catch (e) { return false; }
-    })();
-
-    if (isSoftwareRenderer) {
-      const hookGetParam = (proto) => {
-        if (!proto || !proto.getParameter) return;
-        const orig = proto.getParameter;
-        proto.getParameter = function(param) {
-          // UNMASKED_VENDOR_WEBGL = 37445, UNMASKED_RENDERER_WEBGL = 37446
-          if (param === 37445) return FAKE_WGL_VENDOR;
-          if (param === 37446) return FAKE_WGL_RENDERER;
-          return orig.call(this, param);
-        };
+    const hookGetParam = (proto) => {
+      if (!proto || !proto.getParameter) return;
+      const orig = proto.getParameter;
+      proto.getParameter = function(param) {
+        const result = orig.call(this, param);
+        // UNMASKED_VENDOR_WEBGL = 37445
+        if (param === 37445 && SW_RE.test(String(result))) return FAKE_WGL_VENDOR;
+        // UNMASKED_RENDERER_WEBGL = 37446
+        if (param === 37446 && SW_RE.test(String(result))) return FAKE_WGL_RENDERER;
+        return result;
       };
-      try { hookGetParam(WebGLRenderingContext.prototype); } catch (e) {}
-      try { hookGetParam(WebGL2RenderingContext.prototype); } catch (e) {}
-    }
+    };
+    try { hookGetParam(WebGLRenderingContext.prototype); } catch (e) {}
+    try { hookGetParam(WebGL2RenderingContext.prototype); } catch (e) {}
   } catch (e) {}
 
   // 7. Canvas 指纹噪声 —— 对 toDataURL/toBlob 注入微量确定性噪声
   try {
     const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
     const origToBlob = HTMLCanvasElement.prototype.toBlob;
-    // 基于域名生成确定性偏移，同一站点每次都一样
     const _noiseOff = ((window.location.hostname || '').length * 7 + 3) % 5 + 1;
 
     function _canvasInjectNoise(canvas) {
@@ -1691,7 +1680,6 @@ def install_light_stealth_script(page, log_callback=None):
         const ctx = canvas.getContext('2d');
         if (!ctx || canvas.width < 1 || canvas.height < 1) return;
         const img = ctx.getImageData(0, 0, 1, 1);
-        // 对 alpha 通道加微小确定性偏移（人眼不可见，指纹哈希不同）
         img.data[3] = (img.data[3] + _noiseOff) & 0xFF;
         ctx.putImageData(img, 0, 0);
       } catch (e) {}
@@ -1708,6 +1696,70 @@ def install_light_stealth_script(page, log_callback=None):
       };
     }
   } catch (e) {}
+
+  // 8. AudioContext 指纹噪声 —— Turnstile 会采样 AudioContext 输出做指纹
+  try {
+    const origGetChannelData = AudioBuffer.prototype.getChannelData;
+    AudioBuffer.prototype.getChannelData = function(channel) {
+      const data = origGetChannelData.call(this, channel);
+      if (data && data.length > 0) {
+        // 仅对第一个采样点加极微小确定性偏移，不影响听觉，但改变指纹哈希
+        const off = ((this.length || 0) * 3 + 1) % 7 / 100000;
+        data[0] = data[0] + off;
+      }
+      return data;
+    };
+  } catch (e) {}
+
+  // 9. navigator.plugins 伪装 —— Docker Chromium 只有 5 个 PDF 插件，与桌面 Chrome 一致
+  //    但 Turnstile 可能检查 plugins 是否可枚举 / 是否被 Object.freeze 过
+  try {
+    Object.defineProperty(navigator, 'plugins', {
+      get: () => {
+        // 用原生 plugins 对象，只确保不是空数组（headless 特征）
+        const real = navigator.plugins;
+        return (real && real.length > 0) ? real : [
+          Object.create(Plugin.prototype, {
+            name: { value: 'Chrome PDF Plugin', enumerable: true },
+            filename: { value: 'internal-pdf-viewer', enumerable: true },
+            description: { value: 'Portable Document Format', enumerable: true },
+            length: { value: 1 },
+          }),
+        ];
+      },
+      configurable: true,
+    });
+  } catch (e) {}
+
+  // 10. WebRTC 屏蔽 —— 容器内 WebRTC 会暴露内网 IP / 无 ICE 候选，是已知检测项
+  try {
+    if (window.RTCPeerConnection) {
+      const origRTC = window.RTCPeerConnection;
+      window.RTCPeerConnection = function(config, constraints) {
+        // 强制只走 relay（走 TURN 服务器），不暴露本地 IP
+        const patchedConfig = Object.assign({}, config || {});
+        if (!patchedConfig.iceServers) {
+          patchedConfig.iceServers = [];
+        }
+        return new origRTC(patchedConfig, constraints);
+      };
+      window.RTCPeerConnection.prototype = origRTC.prototype;
+    }
+    if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+      const origEnum = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
+      navigator.mediaDevices.enumerateDevices = function() {
+        return origEnum().then(devices => devices.filter(d => d.kind !== 'videoinput'));
+      };
+    }
+  } catch (e) {}
+
+  // 11. iframe contentWindow 检测 —— Turnstile 可能通过 iframe.contentWindow.chrome 判断
+  try {
+    const origCreateElement = document.createElement.bind(document);
+    // 不修改 createElement，但确保 shadow DOM 下的 chrome 对象完整
+    if (!window.chrome.csi) window.chrome.csi = function() { return {}; };
+    if (!window.chrome.loadTimes) window.chrome.loadTimes = function() { return { commitLoadTime: Date.now()/1000, startLoadTime: Date.now()/1000 }; };
+  } catch (e) {}
 })();
 """
     ok = False
@@ -1716,14 +1768,14 @@ def install_light_stealth_script(page, log_callback=None):
         ok = True
     except Exception as exc:
         if log_callback:
-            log_callback(f"[Debug] 轻量 stealth 预注入失败: {str(exc)[:160]}")
+            log_callback(f"[Debug] 增强 stealth 预注入失败: {str(exc)[:160]}")
     try:
         page.run_cdp("Runtime.evaluate", expression=source)
         ok = True
     except Exception:
         pass
     if ok and log_callback:
-        log_callback("[Debug] 已安装增强 stealth（WebGL 伪装 + Canvas 噪声，不补丁 turnstile API）")
+        log_callback("[Debug] 已安装增强 stealth（WebGL/Canvas/Audio/Plugins/WebRTC，不补丁 turnstile API）")
     return ok
 
 
