@@ -1909,166 +1909,312 @@ def _dispatch_cdp_text(page, text):
     page.run_cdp("Input.insertText", text=str(text or ""))
 
 
-def _click_turnstile_challenge_if_visible(page):
-    """点击可见的 Cloudflare 复选框/挑战框。
+def _click_point_on_page(page, x, y):
+    x, y = int(x), int(y)
+    try:
+        page.run_cdp("Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y, modifiers=0)
+    except Exception:
+        pass
+    _dispatch_cdp_click(page, x, y, include_keyboard=False)
+    return {"x": x, "y": y, "nativeClicked": True}
 
-    本地桌面 Chrome 常渲染成可见的「请验证您是真人」复选框；
-    Docker 里多为 flexible 无框。两者都要支持，不能只被动等 token。
-    """
-    target = page.run_js(
-        r"""
-// turnstile-challenge-target
+
+def _locate_turnstile_target_via_js(page):
+    """主文档 JS 定位（含 open shadow）。跨域 iframe 内文案看不到，但 iframe 元素本身应能看到。"""
+    try:
+        return page.run_js(
+            r"""
 function visible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || '1') > 0;
 }
-function centerOf(node, preferCheckboxLeft) {
-    const rect = node.getBoundingClientRect();
-    // 复选框通常在左侧；点整块 widget 中心容易点到文字/logo 无效
-    const x = preferCheckboxLeft
-        ? Math.round(rect.left + Math.min(Math.max(18, rect.width * 0.12), 36))
-        : Math.round(rect.left + rect.width / 2);
-    const y = Math.round(rect.top + rect.height / 2);
-    return {
-        x, y,
-        width: Math.round(rect.width),
-        height: Math.round(rect.height),
-    };
+function centerLeft(node) {
+  const rect = node.getBoundingClientRect();
+  return {
+    x: Math.round(rect.left + Math.min(Math.max(16, rect.width * 0.1), 34)),
+    y: Math.round(rect.top + rect.height / 2),
+    width: Math.round(rect.width),
+    height: Math.round(rect.height),
+  };
 }
 const frames = [];
 const widgets = [];
-const textHits = [];
-function visit(root) {
-    if (!root || !root.querySelectorAll) return;
-    for (const node of Array.from(root.querySelectorAll('*'))) {
-        if (node.shadowRoot) visit(node.shadowRoot);
-        const tag = String(node.tagName || '').toLowerCase();
-        if (tag === 'iframe') {
-            const marker = [
-                node.getAttribute('src'),
-                node.getAttribute('title'),
-                node.getAttribute('name'),
-                node.id,
-                node.className,
-            ].join(' ').toLowerCase();
-            if (
-                marker.includes('challenge') ||
-                marker.includes('turnstile') ||
-                marker.includes('cloudflare') ||
-                marker.includes('cf-chl')
-            ) {
-                if (visible(node)) frames.push(node);
-            }
-            continue;
-        }
-        const marker = [
-            node.className,
-            node.id,
-            node.getAttribute && node.getAttribute('data-sitekey'),
-            node.getAttribute && node.getAttribute('aria-label'),
-        ].join(' ').toLowerCase();
-        if (
-            visible(node) && (
-                marker.includes('cf-turnstile') ||
-                marker.includes('cf-chl') ||
-                (node.getAttribute && node.getAttribute('data-sitekey'))
-            )
-        ) {
-            widgets.push(node);
-        }
-        const text = String(node.innerText || node.textContent || node.getAttribute?.('aria-label') || '')
-            .replace(/\s+/g, '');
-        if (
-            visible(node) && text && text.length < 40 && (
-                text.includes('请验证您是真人') ||
-                text.includes('确认您是真人') ||
-                text.includes('Verifyyouarehuman') ||
-                text.toLowerCase().includes('verifyyouarehuman') ||
-                text.includes('我不是机器人')
-            )
-        ) {
-            textHits.push(node);
-        }
+const allIframes = [];
+function visit(root, depth) {
+  if (!root || !root.querySelectorAll || depth > 8) return;
+  let nodes;
+  try { nodes = Array.from(root.querySelectorAll('*')); } catch (e) { return; }
+  for (const node of nodes) {
+    try { if (node.shadowRoot) visit(node.shadowRoot, depth + 1); } catch (e) {}
+    const tag = String(node.tagName || '').toLowerCase();
+    if (tag === 'iframe' && visible(node)) {
+      const src = String(node.getAttribute('src') || '');
+      const title = String(node.getAttribute('title') || '');
+      const name = String(node.getAttribute('name') || '');
+      const marker = (src + ' ' + title + ' ' + name + ' ' + (node.className || '') + ' ' + (node.id || '')).toLowerCase();
+      allIframes.push({src: src.slice(0, 120), title: title.slice(0, 60), w: Math.round(node.getBoundingClientRect().width), h: Math.round(node.getBoundingClientRect().height)});
+      if (
+        marker.includes('challenge') || marker.includes('turnstile') ||
+        marker.includes('cloudflare') || marker.includes('cf-chl') ||
+        title.includes('小部件') || title.toLowerCase().includes('widget') ||
+        // 无 src 标记时，尺寸像 turnstile checkbox 条（常见 ~300x65）
+        (node.getBoundingClientRect().width >= 200 && node.getBoundingClientRect().width <= 420 &&
+         node.getBoundingClientRect().height >= 40 && node.getBoundingClientRect().height <= 100)
+      ) {
+        frames.push(node);
+      }
     }
+    const sitekey = node.getAttribute && node.getAttribute('data-sitekey');
+    const cls = String(node.className || '').toLowerCase();
+    if (visible(node) && (sitekey || cls.includes('cf-turnstile') || cls.includes('cf-chl'))) {
+      widgets.push(node);
+    }
+  }
 }
-visit(document);
-
-// 1) 优先点可见 turnstile iframe 左侧复选框位置
+visit(document, 0);
 if (frames.length) {
-    const frame = frames[0];
-    return {
-        state: 'turnstile-challenge-target',
-        via: 'iframe',
-        count: frames.length,
-        src: String(frame.getAttribute('src') || '').slice(0, 160),
-        ...centerOf(frame, true),
-    };
+  return { state: 'turnstile-challenge-target', via: 'js-iframe', count: frames.length, allIframes, ...centerLeft(frames[0]), src: String(frames[0].getAttribute('src')||'').slice(0,160) };
 }
-// 2) 点 cf-turnstile / data-sitekey 容器左侧
 if (widgets.length) {
-    const widget = widgets[0];
-    return {
-        state: 'turnstile-challenge-target',
-        via: 'widget',
-        count: widgets.length,
-        src: String(widget.getAttribute('data-sitekey') || widget.className || '').slice(0, 160),
-        ...centerOf(widget, true),
-    };
+  return { state: 'turnstile-challenge-target', via: 'js-widget', count: widgets.length, allIframes, ...centerLeft(widgets[0]) };
 }
-// 3) 点「请验证您是真人」文字所在区域左侧（截图里的可见复选框文案）
-if (textHits.length) {
-    // 文案节点可能在右侧，向左偏移一点点到 checkbox
-    const node = textHits[0];
-    const rect = node.getBoundingClientRect();
-    // 往父级找更大的可点容器
-    let box = node;
-    for (let i = 0; i < 5 && box.parentElement; i++) {
-        const p = box.parentElement;
-        const pr = p.getBoundingClientRect();
-        if (pr.width > rect.width * 1.2 && pr.width < 520 && pr.height < 120) box = p;
-        else break;
-    }
-    return {
-        state: 'turnstile-challenge-target',
-        via: 'text',
-        count: textHits.length,
-        text: String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80),
-        ...centerOf(box, true),
-    };
-}
-return {
-    state: 'turnstile-challenge-not-found',
-    count: 0,
-    frameCount: frames.length,
-    widgetCount: widgets.length,
-    textCount: textHits.length,
-};
-        """
-    )
+// 兜底：任意“像 checkbox 条”的可见 iframe
+const sized = allIframes.filter((f) => f.w >= 200 && f.w <= 420 && f.h >= 40 && f.h <= 100);
+return { state: 'turnstile-challenge-not-found', via: 'js', frameCount: frames.length, widgetCount: widgets.length, allIframes: allIframes.slice(0, 8), sizedCount: sized.length };
+            """
+        )
+    except Exception as exc:
+        return {"state": "turnstile-js-error", "error": str(exc)[:200]}
+
+
+def _locate_turnstile_target_via_cdp(page):
+    """用 CDP DOM/FrameTree/AX 找跨域 turnstile iframe 并算页面坐标。"""
+    diagnostics = {"via": "cdp"}
+    # 1) FrameTree：子 frame URL 含 cloudflare/turnstile
+    try:
+        tree = page.run_cdp("Page.getFrameTree") or {}
+        frames = []
+
+        def walk(node, depth=0):
+            if not isinstance(node, dict) or depth > 10:
+                return
+            frame = node.get("frame") or {}
+            url = str(frame.get("url") or "")
+            frames.append({"id": frame.get("id"), "url": url[:180], "name": frame.get("name")})
+            for child in node.get("childFrames") or []:
+                walk(child, depth + 1)
+
+        walk(tree.get("frameTree") or tree)
+        diagnostics["frames"] = frames[:12]
+        cloud_frames = [
+            f for f in frames
+            if any(k in str(f.get("url") or "").lower() for k in ("cloudflare", "turnstile", "cf-chl", "challenges."))
+        ]
+        diagnostics["cloudFrameCount"] = len(cloud_frames)
+    except Exception as exc:
+        diagnostics["frameTreeError"] = str(exc)[:160]
+        cloud_frames = []
+
+    # 2) pierce DOM 找 iframe 节点 box
+    try:
+        doc = page.run_cdp("DOM.getDocument", depth=-1, pierce=True) or {}
+        root_id = (doc.get("root") or {}).get("nodeId")
+        if root_id:
+            search = page.run_cdp("DOM.querySelectorAll", nodeId=root_id, selector="iframe") or {}
+            node_ids = search.get("nodeIds") or []
+            diagnostics["iframeNodeCount"] = len(node_ids)
+            for node_id in node_ids[:20]:
+                try:
+                    attrs_resp = page.run_cdp("DOM.getAttributes", nodeId=node_id) or {}
+                    attrs_list = attrs_resp.get("attributes") or []
+                    attrs = {}
+                    for i in range(0, len(attrs_list) - 1, 2):
+                        attrs[str(attrs_list[i]).lower()] = str(attrs_list[i + 1])
+                    src = attrs.get("src", "")
+                    title = attrs.get("title", "")
+                    marker = f"{src} {title}".lower()
+                    box = page.run_cdp("DOM.getBoxModel", nodeId=node_id) or {}
+                    model = box.get("model") or {}
+                    content = model.get("content") or model.get("border") or []
+                    if len(content) < 8:
+                        continue
+                    xs = content[0::2]
+                    ys = content[1::2]
+                    left, right = min(xs), max(xs)
+                    top, bottom = min(ys), max(ys)
+                    width, height = right - left, bottom - top
+                    if width <= 1 or height <= 1:
+                        continue
+                    looks_like = (
+                        any(k in marker for k in ("cloudflare", "turnstile", "challenge", "cf-chl"))
+                        or (200 <= width <= 420 and 40 <= height <= 100)
+                    )
+                    if not looks_like:
+                        continue
+                    return {
+                        "state": "turnstile-challenge-target",
+                        "via": "cdp-iframe",
+                        "x": int(left + min(max(16, width * 0.1), 34)),
+                        "y": int(top + height / 2),
+                        "width": int(width),
+                        "height": int(height),
+                        "src": src[:160],
+                        "title": title[:80],
+                        "diagnostics": diagnostics,
+                    }
+                except Exception:
+                    continue
+    except Exception as exc:
+        diagnostics["domError"] = str(exc)[:160]
+
+    # 3) Accessibility 树：可见 checkbox / 请验证您是真人
+    try:
+        page.run_cdp("Accessibility.enable")
+        ax = page.run_cdp("Accessibility.getFullAXTree") or {}
+        nodes = ax.get("nodes") or []
+        diagnostics["axNodeCount"] = len(nodes)
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            name = str(node.get("name", {}).get("value") if isinstance(node.get("name"), dict) else node.get("name") or "")
+            role = str(node.get("role", {}).get("value") if isinstance(node.get("role"), dict) else node.get("role") or "")
+            compact = name.replace(" ", "")
+            interesting = (
+                "请验证您是真人" in name
+                or "确认您是真人" in name
+                or "Verify you are human" in name
+                or "verify you are human" in name.lower()
+                or (role.lower() == "checkbox" and ("真人" in name or "human" in name.lower() or "cloudflare" in name.lower()))
+            )
+            if not interesting:
+                continue
+            backend_id = node.get("backendDOMNodeId")
+            if not backend_id:
+                continue
+            try:
+                resolved = page.run_cdp("DOM.resolveNode", backendNodeId=backend_id) or {}
+                obj_id = (resolved.get("object") or {}).get("objectId")
+                if not obj_id:
+                    continue
+                desc = page.run_cdp("DOM.describeNode", objectId=obj_id, pierce=True, depth=1) or {}
+                node_id = (desc.get("node") or {}).get("nodeId")
+                if not node_id:
+                    # 尝试 backendDOMNodeId 直接 box
+                    box = page.run_cdp("DOM.getBoxModel", backendNodeId=backend_id) or {}
+                else:
+                    box = page.run_cdp("DOM.getBoxModel", nodeId=node_id) or {}
+                model = box.get("model") or {}
+                content = model.get("content") or model.get("border") or []
+                if len(content) < 8:
+                    continue
+                xs = content[0::2]
+                ys = content[1::2]
+                left, right = min(xs), max(xs)
+                top, bottom = min(ys), max(ys)
+                width, height = right - left, bottom - top
+                return {
+                    "state": "turnstile-challenge-target",
+                    "via": "cdp-ax",
+                    "x": int(left + min(max(16, width * 0.1), 34)),
+                    "y": int(top + height / 2),
+                    "width": int(width),
+                    "height": int(height),
+                    "name": name[:80],
+                    "role": role[:40],
+                    "diagnostics": diagnostics,
+                }
+            except Exception:
+                continue
+    except Exception as exc:
+        diagnostics["axError"] = str(exc)[:160]
+
+    # 4) 若有 cloudflare 子 frame，尝试用 DOM.getFrameOwner 拿 owner 元素 box
+    for frame in cloud_frames[:5]:
+        frame_id = frame.get("id")
+        if not frame_id:
+            continue
+        try:
+            owner = page.run_cdp("DOM.getFrameOwner", frameId=frame_id) or {}
+            backend_id = owner.get("backendNodeId")
+            node_id = owner.get("nodeId")
+            if node_id:
+                box = page.run_cdp("DOM.getBoxModel", nodeId=node_id) or {}
+            elif backend_id:
+                box = page.run_cdp("DOM.getBoxModel", backendNodeId=backend_id) or {}
+            else:
+                continue
+            model = box.get("model") or {}
+            content = model.get("content") or model.get("border") or []
+            if len(content) < 8:
+                continue
+            xs = content[0::2]
+            ys = content[1::2]
+            left, right = min(xs), max(xs)
+            top, bottom = min(ys), max(ys)
+            width, height = right - left, bottom - top
+            if width <= 1 or height <= 1:
+                continue
+            return {
+                "state": "turnstile-challenge-target",
+                "via": "cdp-frame-owner",
+                "x": int(left + min(max(16, width * 0.1), 34)),
+                "y": int(top + height / 2),
+                "width": int(width),
+                "height": int(height),
+                "src": str(frame.get("url") or "")[:160],
+                "diagnostics": diagnostics,
+            }
+        except Exception:
+            continue
+
+    return {"state": "turnstile-challenge-not-found", "diagnostics": diagnostics}
+
+
+def _click_turnstile_challenge_if_visible(page):
+    """点击可见的 Cloudflare 复选框/挑战框。
+
+    本地桌面 Chrome 常渲染成可见的「请验证您是真人」复选框（在跨域 iframe 内）。
+    仅靠主文档 querySelector 经常找不到，需要 CDP FrameTree/AX 兜底。
+    """
+    attempts = []
+    target = _locate_turnstile_target_via_js(page)
+    attempts.append({"method": "js", "state": (target or {}).get("state") if isinstance(target, dict) else type(target).__name__})
+    if not (isinstance(target, dict) and target.get("state") == "turnstile-challenge-target"):
+        cdp_target = _locate_turnstile_target_via_cdp(page)
+        attempts.append({"method": "cdp", "state": (cdp_target or {}).get("state") if isinstance(cdp_target, dict) else type(cdp_target).__name__})
+        if isinstance(cdp_target, dict) and cdp_target.get("state") == "turnstile-challenge-target":
+            target = cdp_target
+        elif isinstance(target, dict):
+            # 合并诊断信息
+            diag = {}
+            if isinstance(target.get("allIframes"), list):
+                diag["jsIframes"] = target.get("allIframes")
+            if isinstance(cdp_target, dict):
+                diag.update(cdp_target.get("diagnostics") or {})
+                diag["cdpState"] = cdp_target.get("state")
+            target = {
+                "state": "turnstile-challenge-not-found",
+                "attempts": attempts,
+                "diagnostics": diag,
+            }
+        else:
+            target = {"state": "turnstile-challenge-not-found", "attempts": attempts}
+
     if not isinstance(target, dict) or target.get("state") != "turnstile-challenge-target":
         return target
     if target.get("x") is None or target.get("y") is None:
         return {"state": "turnstile-challenge-missing-center", **target}
-    # 先 hover 再点，更接近真人
+
+    click_meta = _click_point_on_page(page, target.get("x"), target.get("y"))
+    # 有些实现要点两次才勾选
+    sleep_with_cancel(0.15)
     try:
-        page.run_cdp(
-            "Input.dispatchMouseEvent",
-            type="mouseMoved",
-            x=int(target.get("x")),
-            y=int(target.get("y")),
-            modifiers=0,
-        )
+        _click_point_on_page(page, int(target.get("x")), int(target.get("y")))
     except Exception:
         pass
-    _dispatch_cdp_click(
-        page,
-        int(target.get("x")),
-        int(target.get("y")),
-        include_keyboard=False,
-    )
-    return {**target, "nativeClicked": True}
+    return {**target, **click_meta, "attempts": attempts}
 
 
 def _dispatch_cdp_keypress(page, ch):
@@ -3325,23 +3471,59 @@ return 'submitted';
 """
 
 
+def extract_rejected_email_domain(text, email=""):
+    """从页面文案中提取被 x.ai 拒收的邮箱域名（中英文都支持）。"""
+    combined = str(text or "")
+    patterns = [
+        # EN: email domain example.com has been rejected
+        r"email\s*domain\s+([A-Za-z0-9.-]+\.[A-Za-z]{2,})\s+has\s+been\s+rejected",
+        # EN variants
+        r"domain\s+([A-Za-z0-9.-]+\.[A-Za-z]{2,})\s+(?:is|has been)\s+rejected",
+        r"([A-Za-z0-9.-]+\.[A-Za-z]{2,})\s+has\s+been\s+rejected",
+        # ZH: 邮箱域名 xxx 已被拒绝 / 您的邮箱域名 xxx 已被拒绝
+        r"邮箱域名\s*([A-Za-z0-9.-]+\.[A-Za-z]{2,})\s*已被拒绝",
+        r"域名\s*([A-Za-z0-9.-]+\.[A-Za-z]{2,})\s*已被拒绝",
+        r"([A-Za-z0-9.-]+\.[A-Za-z]{2,})\s*已被拒绝",
+        # 宽松：出现“已被拒绝/拒绝”且附近有域名
+        r"([A-Za-z0-9.-]+\.[A-Za-z]{2,}).{0,12}(?:已被拒绝|被拒绝|拒绝)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, combined, re.IGNORECASE)
+        if match:
+            return match.group(1).strip(".").lower()
+    lowered = combined.lower()
+    rejected_markers = (
+        "has been rejected",
+        "is rejected",
+        "已被拒绝",
+        "被拒绝",
+        "请使用其他邮箱",
+        "use a different email",
+        "use another email",
+    )
+    if any(marker in combined or marker in lowered for marker in rejected_markers):
+        # 优先从当前邮箱地址取后缀
+        email_match = re.search(r"@([A-Za-z0-9.-]+\.[A-Za-z]{2,})", str(email or ""))
+        if email_match:
+            return email_match.group(1).lower()
+        # 再从正文里找域名
+        body_match = re.search(r"\b([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)\b", combined)
+        if body_match:
+            return body_match.group(1).lower()
+    return ""
+
+
 def wait_for_email_verification_step(
     page, email, timeout=20, log_callback=None, cancel_callback=None
 ):
     def _raise_if_domain_rejected(state):
         combined = " ".join(
             str(state.get(key) or "")
-            for key in ("errorText", "bodySnippet", "raw")
+            for key in ("errorText", "bodySnippet", "raw", "title")
         )
-        match = re.search(
-            r"email domain\s+([A-Za-z0-9.-]+\.[A-Za-z]{2,})\s+has been rejected",
-            combined,
-            re.IGNORECASE,
-        )
-        if not match and "has been rejected" in combined.lower():
-            match = re.search(r"@([A-Za-z0-9.-]+\.[A-Za-z]{2,})", email or "")
-        if match:
-            raise EmailDomainRejected(match.group(1))
+        domain = extract_rejected_email_domain(combined, email=email)
+        if domain:
+            raise EmailDomainRejected(domain)
 
     deadline = time.time() + timeout
     last_state = {}
@@ -3358,6 +3540,10 @@ def wait_for_email_verification_step(
             return "otp"
         error_text = str(state.get("errorText") or "").strip()
         if error_text:
+            # 错误文案也可能是中文域名拒收
+            domain = extract_rejected_email_domain(error_text, email=email)
+            if domain:
+                raise EmailDomainRejected(domain)
             raise Exception(f"x.ai 未接受该邮箱: {error_text}")
         sleep_with_cancel(0.8, cancel_callback)
     if log_callback:
@@ -3366,6 +3552,12 @@ def wait_for_email_verification_step(
             + json.dumps(last_state, ensure_ascii=False)[:1200]
         )
     _raise_if_domain_rejected(last_state)
+    # 超时兜底：正文里若有拒收语义，仍写入黑名单
+    fallback = extract_rejected_email_domain(
+        json.dumps(last_state, ensure_ascii=False), email=email
+    )
+    if fallback:
+        raise EmailDomainRejected(fallback)
     raise Exception("邮箱已提交，但未进入验证码页面，x.ai 可能未发送验证码")
 
 
@@ -5963,20 +6155,15 @@ return 'profile-filled';
                     humanize_page_activity(page, log_callback=None, cancel_callback=cancel_callback)
                     last_humanize_at = now
                 # 本地常见：可见「请验证您是真人」复选框。必须主动点，不能只被动等。
-                if now - last_cf_retry_at >= 3:
+                if now - last_cf_retry_at >= 2.5:
                     try:
                         click_result = _click_turnstile_challenge_if_visible(page)
-                        if log_callback and isinstance(click_result, dict):
-                            state = str(click_result.get("state") or "")
-                            if state == "turnstile-challenge-target" or click_result.get("nativeClicked"):
-                                log_callback(
-                                    "[*] 检测到可见 Cloudflare 挑战，尝试点击复选框: "
-                                    + json.dumps(click_result, ensure_ascii=False)[:320]
-                                )
-                            elif state != "turnstile-challenge-not-found":
-                                log_callback(
-                                    f"[Debug] Cloudflare 挑战点击结果: {json.dumps(click_result, ensure_ascii=False)[:240]}"
-                                )
+                        if log_callback:
+                            # 无论找没找到都打日志，避免“看起来完全没点”
+                            log_callback(
+                                "[*] Cloudflare 挑战点击尝试: "
+                                + json.dumps(click_result if isinstance(click_result, dict) else {"raw": str(click_result)}, ensure_ascii=False)[:500]
+                            )
                     except Exception as click_exc:
                         if log_callback:
                             log_callback(f"[Debug] Cloudflare 挑战点击失败: {click_exc}")
@@ -6024,16 +6211,14 @@ return 'profile-filled';
             if now - last_humanize_at >= 5:
                 humanize_page_activity(page, log_callback=None, cancel_callback=cancel_callback)
                 last_humanize_at = now
-            if now - last_cf_retry_at >= 3:
+            if now - last_cf_retry_at >= 2.5:
                 try:
                     click_result = _click_turnstile_challenge_if_visible(page)
-                    if log_callback and isinstance(click_result, dict):
-                        state = str(click_result.get("state") or "")
-                        if state == "turnstile-challenge-target" or click_result.get("nativeClicked"):
-                            log_callback(
-                                "[*] 提交前检测到可见 Cloudflare 挑战，尝试点击: "
-                                + json.dumps(click_result, ensure_ascii=False)[:320]
-                            )
+                    if log_callback:
+                        log_callback(
+                            "[*] 提交前 Cloudflare 挑战点击尝试: "
+                            + json.dumps(click_result if isinstance(click_result, dict) else {"raw": str(click_result)}, ensure_ascii=False)[:500]
+                        )
                 except Exception as click_exc:
                     if log_callback:
                         log_callback(f"[Debug] 提交前挑战点击失败: {click_exc}")

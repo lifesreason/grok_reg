@@ -828,6 +828,28 @@ def test_rejected_email_domains_are_persisted_and_reloaded(monkeypatch, tmp_path
     assert "100811.xyz" in reg.list_rejected_email_domains()
 
 
+def test_extract_rejected_email_domain_supports_chinese_copy():
+    text = (
+        "您正在登录 使用您的邮箱注册 邮箱 您的邮箱域名 07210d00.dpdns.org 已被拒绝。"
+        "请使用其他邮箱地址。如果您认为这是错误，请联系 support@x.ai。"
+    )
+    assert reg.extract_rejected_email_domain(text) == "07210d00.dpdns.org"
+    assert (
+        reg.extract_rejected_email_domain(
+            "email domain bad.example.com has been rejected"
+        )
+        == "bad.example.com"
+    )
+    # 仅有“已被拒绝”时，回退到当前邮箱后缀
+    assert (
+        reg.extract_rejected_email_domain(
+            "请使用其他邮箱地址。域名已被拒绝。",
+            email="user@100811.xyz",
+        )
+        == "100811.xyz"
+    )
+
+
 def test_list_registered_accounts_reads_accounts_files(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     tmp_path.joinpath("accounts_20260630_140000_job.txt").write_text(
@@ -1708,29 +1730,20 @@ def test_turnstile_hook_records_terminal_challenge_callbacks():
     assert "errors: Array.isArray(rawHook.errors)" in source
 
 
-def test_turnstile_challenge_target_uses_a_real_cdp_click():
+def test_turnstile_challenge_target_uses_a_real_cdp_click(monkeypatch):
     events = []
 
     class FakePage:
         def run_js(self, script):
-            assert "turnstile-challenge-target" in script
-            # 新逻辑会找 iframe / widget /「请验证您是真人」文案
-            assert "请验证您是真人" in script
-            return {"state": "turnstile-challenge-target", "x": 111, "y": 222, "via": "text"}
+            return {"state": "turnstile-challenge-target", "x": 111, "y": 222, "via": "js-iframe"}
 
         def run_cdp(self, method, **params):
             events.append((method, params))
 
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda *args, **kwargs: None)
     result = reg._click_turnstile_challenge_if_visible(FakePage())
 
     assert result["nativeClicked"] is True
-    assert any(
-        method == "Input.dispatchMouseEvent"
-        and params.get("type") == "mouseMoved"
-        and params.get("x") == 111
-        and params.get("y") == 222
-        for method, params in events
-    )
     assert any(
         method == "Input.dispatchMouseEvent"
         and params.get("type") == "mousePressed"
@@ -1738,6 +1751,46 @@ def test_turnstile_challenge_target_uses_a_real_cdp_click():
         and params.get("y") == 222
         for method, params in events
     )
+
+
+def test_turnstile_challenge_falls_back_to_cdp_when_js_misses(monkeypatch):
+    events = []
+
+    class FakePage:
+        def run_js(self, script):
+            return {"state": "turnstile-challenge-not-found", "allIframes": []}
+
+        def run_cdp(self, method, **params):
+            events.append((method, params))
+            if method == "Page.getFrameTree":
+                return {
+                    "frameTree": {
+                        "frame": {"id": "root", "url": "https://accounts.x.ai/sign-up"},
+                        "childFrames": [
+                            {"frame": {"id": "cf1", "url": "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/ov2/xx"}}
+                        ],
+                    }
+                }
+            if method == "DOM.getDocument":
+                return {"root": {"nodeId": 1}}
+            if method == "DOM.querySelectorAll":
+                return {"nodeIds": [9]}
+            if method == "DOM.getAttributes":
+                return {"attributes": ["src", "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/ov2/xx", "title", "小部件包含 Cloudflare 安全质询"]}
+            if method == "DOM.getBoxModel":
+                # content quad: x,y pairs for rectangle 100,200 - 400,265
+                return {"model": {"content": [100, 200, 400, 200, 400, 265, 100, 265]}}
+            if method == "Accessibility.enable":
+                return {}
+            if method == "Accessibility.getFullAXTree":
+                return {"nodes": []}
+            return {}
+
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda *args, **kwargs: None)
+    result = reg._click_turnstile_challenge_if_visible(FakePage())
+    assert result["nativeClicked"] is True
+    assert result["via"] in {"cdp-iframe", "cdp-frame-owner", "cdp-ax"}
+    assert any(method == "Input.dispatchMouseEvent" and params.get("type") == "mousePressed" for method, params in events)
 
 
 def test_wait_for_sso_cookie_uses_native_click_for_final_page(monkeypatch):
