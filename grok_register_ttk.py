@@ -5837,23 +5837,10 @@ return 'clicked';
     raise Exception("验证码已获取，但自动填写/提交失败")
 
 
-def getTurnstileToken(log_callback=None, cancel_callback=None):
-    page = _get_page()
-    if page is None:
-        raise Exception("页面未就绪，无法执行 Turnstile")
-
+def _read_turnstile_token_from_page(page):
     try:
-        page.run_js(
-            "try { if (window.turnstile && typeof turnstile.reset === 'function') turnstile.reset(); } catch(e) {}"
-        )
-    except Exception:
-        pass
-
-    for _ in range(0, 20):
-        raise_if_cancelled(cancel_callback)
-        try:
-            token = page.run_js(
-                """
+        token = page.run_js(
+            """
 try {
   const byInput = String((document.querySelector('input[name="cf-turnstile-response"]') || {}).value || '').trim();
   if (byInput) return byInput;
@@ -5862,57 +5849,221 @@ try {
   }
   return '';
 } catch(e) { return ''; }
-                """
-            )
-            token = str(token or "").strip()
-            if len(token) >= 80:
-                if log_callback:
-                    log_callback(f"[*] Turnstile 已通过，token长度={len(token)}")
-                return token
+            """
+        )
+        return str(token or "").strip()
+    except Exception:
+        return ""
 
-            challenge_input = page.ele("@name=cf-turnstile-response")
+
+def _click_turnstile_via_shadow_dom(page, log_callback=None):
+    """参考 grok-auto-register：通过 DrissionPage shadow_root 点 Cloudflare 复选框。
+
+    可见「请验证您是真人」复选框在 closed shadow + iframe 内，
+    主文档 querySelector / 普通 CDP DOM 都看不到，必须走元素 API 穿透。
+    """
+    actions = []
+    try:
+        challenge_input = None
+        # 多种定位 cf-turnstile-response
+        for locator in (
+            "@name=cf-turnstile-response",
+            'css:input[name="cf-turnstile-response"]',
+            "css:input[name*=turnstile]",
+        ):
+            try:
+                challenge_input = page.ele(locator, timeout=0.2)
+            except Exception:
+                challenge_input = None
             if challenge_input:
-                wrapper = challenge_input.parent()
-                iframe = None
+                actions.append(f"found-input:{locator}")
+                break
+
+        if not challenge_input:
+            # 直接找 turnstile 容器 / iframe
+            for locator in (
+                "css:div.cf-turnstile",
+                "css:[data-sitekey]",
+                "css:iframe[src*='turnstile']",
+                "css:iframe[src*='challenges.cloudflare.com']",
+                "css:iframe[title*='Cloudflare']",
+                "css:iframe[title*='小部件']",
+            ):
                 try:
-                    iframe = wrapper.shadow_root.ele("tag:iframe")
+                    node = page.ele(locator, timeout=0.2)
                 except Exception:
-                    iframe = None
-                if iframe:
+                    node = None
+                if node:
+                    actions.append(f"found-node:{locator}")
                     try:
-                        iframe.run_js(
-                            """
+                        node.click(by_js=False)
+                        actions.append("clicked-node")
+                    except Exception as exc:
+                        actions.append(f"click-node-fail:{exc}")
+                    return {"ok": True, "actions": actions}
+            return {"ok": False, "actions": actions or ["no-cf-input"]}
+
+        # 从 input 向上找 wrapper，再进 shadow_root 的 iframe
+        wrapper = challenge_input
+        iframe = None
+        for depth in range(0, 6):
+            try:
+                if hasattr(wrapper, "shadow_root") and wrapper.shadow_root:
+                    try:
+                        iframe = wrapper.shadow_root.ele("tag:iframe", timeout=0.2)
+                    except Exception:
+                        iframe = None
+                    if iframe:
+                        actions.append(f"iframe-via-shadow-depth:{depth}")
+                        break
+            except Exception:
+                pass
+            try:
+                parent = wrapper.parent()
+            except Exception:
+                parent = None
+            if not parent:
+                break
+            wrapper = parent
+
+        if not iframe:
+            # 再试：页面级找 iframe
+            try:
+                iframe = page.ele("tag:iframe@src():turnstile", timeout=0.2)
+            except Exception:
+                iframe = None
+            if iframe:
+                actions.append("iframe-via-page-src")
+
+        if not iframe:
+            try:
+                # 任意 iframe 尺寸像 checkbox 条
+                frames = page.eles("tag:iframe") or []
+                for fr in frames[:12]:
+                    try:
+                        rect = fr.rect
+                        size = getattr(rect, "size", None) or {}
+                        w = float(size.get("width") or getattr(rect, "width", 0) or 0)
+                        h = float(size.get("height") or getattr(rect, "height", 0) or 0)
+                    except Exception:
+                        w = h = 0
+                    if 180 <= w <= 560 and 36 <= h <= 120:
+                        iframe = fr
+                        actions.append(f"iframe-via-size:{int(w)}x{int(h)}")
+                        break
+            except Exception as exc:
+                actions.append(f"iframe-scan-fail:{exc}")
+
+        if not iframe:
+            return {"ok": False, "actions": actions + ["no-iframe"]}
+
+        # 参考项目：伪造 screenX/screenY，再点 shadow 内 input
+        try:
+            iframe.run_js(
+                """
 window.dtp = 1;
 function getRandomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 let sx = getRandomInt(800, 1200);
 let sy = getRandomInt(400, 700);
-Object.defineProperty(MouseEvent.prototype, 'screenX', { value: sx });
-Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sy });
-                            """
-                        )
-                    except Exception:
-                        pass
+try {
+  Object.defineProperty(MouseEvent.prototype, 'screenX', { get: function(){ return sx; } });
+  Object.defineProperty(MouseEvent.prototype, 'screenY', { get: function(){ return sy; } });
+} catch (e) {}
+                """
+            )
+            actions.append("patched-mouse-screen")
+        except Exception as exc:
+            actions.append(f"patch-mouse-fail:{exc}")
+
+        clicked = False
+        # 1) iframe body shadow_root 内的 input checkbox
+        try:
+            body = iframe.ele("tag:body", timeout=0.5)
+            body_sr = body.shadow_root if body else None
+            btn = None
+            if body_sr:
+                for sel in ("tag:input", "css:input[type=checkbox]", "css:.cb-lb", "css:label"):
                     try:
-                        body_sr = iframe.ele("tag:body").shadow_root
-                        btn = body_sr.ele("tag:input")
-                        if btn:
-                            btn.click()
+                        btn = body_sr.ele(sel, timeout=0.2)
                     except Exception:
-                        pass
-            else:
-                # 兜底：尝试触发页面上可见的 Turnstile 容器
-                page.run_js(
-                    """
-const nodes = Array.from(document.querySelectorAll('div,span,iframe')).filter((n) => {
-  const txt = (n.className || '') + ' ' + (n.id || '') + ' ' + (n.getAttribute?.('src') || '');
-  return String(txt).toLowerCase().includes('turnstile');
-});
-if (nodes.length && typeof nodes[0].click === 'function') nodes[0].click();
-                    """
-                )
-        except Exception:
-            pass
+                        btn = None
+                    if btn:
+                        actions.append(f"btn:{sel}")
+                        break
+            if btn:
+                btn.click()
+                clicked = True
+                actions.append("clicked-shadow-input")
+        except Exception as exc:
+            actions.append(f"shadow-click-fail:{exc}")
+
+        # 2) 直接点 iframe 元素左侧
+        if not clicked:
+            try:
+                iframe.click(by_js=False)
+                clicked = True
+                actions.append("clicked-iframe")
+            except Exception as exc:
+                actions.append(f"iframe-click-fail:{exc}")
+
+        # 3) CDP 点 iframe 矩形左侧
+        if not clicked:
+            try:
+                box = iframe.rect
+                loc = getattr(box, "location", None) or {}
+                size = getattr(box, "size", None) or {}
+                x = int(float(loc.get("x") or 0) + 24)
+                y = int(float(loc.get("y") or 0) + float(size.get("height") or 65) / 2)
+                _click_point_on_page(page, x, y)
+                clicked = True
+                actions.append(f"cdp-click:{x},{y}")
+            except Exception as exc:
+                actions.append(f"cdp-click-fail:{exc}")
+
+        return {"ok": clicked, "actions": actions}
+    except Exception as exc:
+        return {"ok": False, "actions": actions + [f"fatal:{exc}"]}
+
+
+def getTurnstileToken(log_callback=None, cancel_callback=None, attempts=15):
+    """参考 grok-auto-register 的 Turnstile 复用：shadow_root 点选 + 读 token。"""
+    page = _get_page()
+    if page is None:
+        raise Exception("页面未就绪，无法执行 Turnstile")
+
+    for i in range(max(1, int(attempts))):
+        raise_if_cancelled(cancel_callback)
+        token = _read_turnstile_token_from_page(page)
+        if len(token) >= 80:
+            if log_callback:
+                log_callback(f"[*] Turnstile 已通过，token长度={len(token)}")
+            return token
+
+        click_info = _click_turnstile_via_shadow_dom(page, log_callback=log_callback)
+        if log_callback and (i == 0 or i % 3 == 0 or (isinstance(click_info, dict) and click_info.get("ok"))):
+            log_callback(
+                f"[*] Turnstile shadow 点击尝试 #{i+1}: "
+                + json.dumps(click_info, ensure_ascii=False)[:400]
+            )
+        # 再兜底一次旧的 CDP 定位
+        if not (isinstance(click_info, dict) and click_info.get("ok")):
+            try:
+                cdp_info = _click_turnstile_challenge_if_visible(page)
+                if log_callback and i == 0:
+                    log_callback(
+                        "[Debug] Turnstile CDP 兜底: "
+                        + json.dumps(cdp_info if isinstance(cdp_info, dict) else {"raw": str(cdp_info)}, ensure_ascii=False)[:300]
+                    )
+            except Exception as exc:
+                if log_callback and i == 0:
+                    log_callback(f"[Debug] Turnstile CDP 兜底失败: {exc}")
+
         sleep_with_cancel(1, cancel_callback)
+        token = _read_turnstile_token_from_page(page)
+        if len(token) >= 80:
+            if log_callback:
+                log_callback(f"[*] Turnstile 已通过，token长度={len(token)}")
+            return token
 
     raise Exception("Turnstile 获取 token 失败")
 
@@ -6185,27 +6336,46 @@ return 'profile-filled';
                 if now - wait_cf_since >= wait_limit and str(token_len) in {"0", ""}:
                     raise Exception(
                         f"Cloudflare Turnstile {wait_limit:.0f}s 内未签发 token（token长度=0）。"
-                        "若页面上有可见复选框却未点中，请看日志里的 challengeClick；"
-                        "若始终无框且 token=0，则多为自动化环境被拒"
+                        "已尝试 shadow_root 点选（参考 grok-auto-register）；若仍失败请人工确认页面复选框是否可点"
                     )
-                # 全程保持轻微交互
+                # 参考 grok-auto-register：token 为空时短暂停顿 + shadow DOM 点选复用
+                if str(token_len) in {"0", ""}:
+                    pause_seconds = random.uniform(1.0, 2.5)
+                    if log_callback and should_log_cloudflare_wait(cf_wait_log_state, "profile-pause", "0"):
+                        log_callback(f"[*] Cloudflare token 为空，暂停 {pause_seconds:.1f}s 后 shadow 点选")
+                    sleep_with_cancel(pause_seconds, cancel_callback)
                 if now - last_humanize_at >= 5:
                     humanize_page_activity(page, log_callback=None, cancel_callback=cancel_callback)
                     last_humanize_at = now
-                # 本地常见：可见「请验证您是真人」复选框。必须主动点，不能只被动等。
-                if now - last_cf_retry_at >= 2.5:
+                if now - last_cf_retry_at >= 2.0:
                     try:
-                        click_result = _click_turnstile_challenge_if_visible(page)
-                        if log_callback:
-                            # 无论找没找到都打日志，避免“看起来完全没点”
-                            log_callback(
-                                "[*] Cloudflare 挑战点击尝试: "
-                                + json.dumps(click_result if isinstance(click_result, dict) else {"raw": str(click_result)}, ensure_ascii=False)[:500]
+                        # 关键：用参考项目同款 shadow_root 点击，而不是无效的主文档 CDP 搜索
+                        token = getTurnstileToken(
+                            log_callback=log_callback,
+                            cancel_callback=cancel_callback,
+                            attempts=4,
+                        )
+                        if token:
+                            synced = page.run_js(
+                                """
+const token = String(arguments[0] || '').trim();
+const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+if (!cfInput || !token) return 0;
+const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+if (nativeSetter) nativeSetter.call(cfInput, token);
+else cfInput.value = token;
+cfInput.dispatchEvent(new Event('input', { bubbles: true }));
+cfInput.dispatchEvent(new Event('change', { bubbles: true }));
+return String(cfInput.value || '').trim().length;
+                                """,
+                                token,
                             )
-                    except Exception as click_exc:
+                            if log_callback:
+                                log_callback(f"[*] Turnstile 复用完成，回填长度={synced}")
+                    except Exception as cf_exc:
                         if log_callback:
-                            log_callback(f"[Debug] Cloudflare 挑战点击失败: {click_exc}")
-                    if force_execute and now - wait_cf_since >= 20:
+                            log_callback(f"[Debug] Turnstile shadow 复用未完成: {cf_exc}")
+                    if force_execute:
                         try:
                             trig = page.run_js(build_profile_submit_script("trigger"))
                             if log_callback:
@@ -6244,23 +6414,39 @@ return 'profile-filled';
             if now - wait_cf_since >= wait_limit and str(token_len) in {"0", ""}:
                 raise Exception(
                     f"Cloudflare Turnstile {wait_limit:.0f}s 内未签发 token（token长度=0）。"
-                    "若页面上有可见复选框却未点中，请看日志里的 challengeClick"
+                    "已尝试 shadow_root 点选（参考 grok-auto-register）"
                 )
             if now - last_humanize_at >= 5:
                 humanize_page_activity(page, log_callback=None, cancel_callback=cancel_callback)
                 last_humanize_at = now
-            if now - last_cf_retry_at >= 2.5:
+            if now - last_cf_retry_at >= 2.0:
                 try:
-                    click_result = _click_turnstile_challenge_if_visible(page)
-                    if log_callback:
-                        log_callback(
-                            "[*] 提交前 Cloudflare 挑战点击尝试: "
-                            + json.dumps(click_result if isinstance(click_result, dict) else {"raw": str(click_result)}, ensure_ascii=False)[:500]
+                    token = getTurnstileToken(
+                        log_callback=log_callback,
+                        cancel_callback=cancel_callback,
+                        attempts=4,
+                    )
+                    if token:
+                        synced = page.run_js(
+                            """
+const token = String(arguments[0] || '').trim();
+const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+if (!cfInput || !token) return 0;
+const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+if (nativeSetter) nativeSetter.call(cfInput, token);
+else cfInput.value = token;
+cfInput.dispatchEvent(new Event('input', { bubbles: true }));
+cfInput.dispatchEvent(new Event('change', { bubbles: true }));
+return String(cfInput.value || '').trim().length;
+                            """,
+                            token,
                         )
+                        if log_callback:
+                            log_callback(f"[*] 提交前 Turnstile 复用完成，回填长度={synced}")
                 except Exception as click_exc:
                     if log_callback:
-                        log_callback(f"[Debug] 提交前挑战点击失败: {click_exc}")
-                if force_execute and now - wait_cf_since >= 20:
+                        log_callback(f"[Debug] 提交前 Turnstile shadow 复用未完成: {click_exc}")
+                if force_execute:
                     try:
                         trig = page.run_js(build_profile_submit_script("trigger"))
                         if log_callback:
