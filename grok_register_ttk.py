@@ -1451,24 +1451,20 @@ def create_browser_options():
         pass
 
     # turnstilePatch 扩展负责 document_start 隐藏 webdriver / 自动点选。
-    if os.path.isdir(EXTENSION_PATH):
+    # Docker 中跳过扩展加载：--load-extension / --enable-unsafe-extension-debugging 是已知自动化检测向量，
+    # stealth 功能已由 CDP Page.addScriptToEvaluateOnNewDocument 完全覆盖。
+    in_docker_mode = _env_truthy("GROK_REG_IN_DOCKER")
+    if not in_docker_mode and os.path.isdir(EXTENSION_PATH):
         ext_path = os.path.abspath(EXTENSION_PATH)
-        loaded = False
         try:
             if hasattr(options, "add_extension"):
                 options.add_extension(ext_path)
-                loaded = True
         except Exception:
-            loaded = False
-        # 再补一层命令行加载，兼容部分 Chromium 对 unpacked 扩展的限制。
+            pass
         try:
             options.set_argument(f"--load-extension={ext_path}")
             options.set_argument(f"--disable-extensions-except={ext_path}")
-            options.set_argument("--enable-unsafe-extension-debugging")
-            loaded = True
         except Exception:
-            pass
-        if not loaded:
             pass
 
     if should_apply_container_chrome_flags():
@@ -1637,13 +1633,24 @@ def install_light_stealth_script(page, log_callback=None):
     });
   } catch (e) {}
 
-  // 5. platform —— 根据 UA 动态推导
+  // 5. platform + userAgent —— 根据 UA 动态推导，Linux UA 替换为 Windows 画像
   try {
     const ua = navigator.userAgent || '';
     let p = 'Linux x86_64';
-    if (/Windows/.test(ua)) p = 'Win32';
-    else if (/Macintosh/.test(ua)) p = 'MacIntel';
+    let fakeUa = ua;
+    if (/Windows/.test(ua)) {
+      p = 'Win32';
+    } else if (/Macintosh/.test(ua)) {
+      p = 'MacIntel';
+    } else if (/Linux/.test(ua)) {
+      // Linux UA 改为 Windows 画像（保持 Chrome 版本号一致）
+      p = 'Win32';
+      fakeUa = ua.replace('X11; Linux x86_64', 'Windows NT 10.0; Win64; x64');
+    }
     Object.defineProperty(navigator, 'platform', { get: () => p, configurable: true });
+    if (fakeUa !== ua) {
+      Object.defineProperty(navigator, 'userAgent', { get: () => fakeUa, configurable: true });
+    }
   } catch (e) {}
 
   // 6. WebGL vendor/renderer —— 始终 hook getParameter，在调用时才判断是否需要伪装
@@ -5477,6 +5484,27 @@ def _set_page(value):
     _thread_ctx.page = value
 
 
+def override_user_agent_for_docker(page, log_callback=None):
+    """Docker 中将 Linux UA 覆盖为 Windows UA（保持 Chrome 版本一致），同时覆盖 HTTP 头和 JS 层。"""
+    if not page or not _env_truthy("GROK_REG_IN_DOCKER"):
+        return
+    try:
+        actual_ua = page.run_js("return navigator.userAgent;") or ""
+        if not actual_ua:
+            return
+        # 仅替换平台部分，保持 Chrome 版本号一致
+        windows_ua = actual_ua.replace("X11; Linux x86_64", "Windows NT 10.0; Win64; x64")
+        if windows_ua == actual_ua:
+            return  # 不是 Linux UA，无需修改
+        # CDP 覆盖 HTTP 头中的 UA
+        page.run_cdp("Network.setUserAgentOverride", userAgent=windows_ua)
+        if log_callback:
+            log_callback(f"[Debug] UA 已覆盖为 Windows: {windows_ua}")
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] UA 覆盖失败: {str(exc)[:160]}")
+
+
 def start_browser(log_callback=None):
     last_exc = None
     for attempt in range(1, 5):
@@ -5489,6 +5517,11 @@ def start_browser(log_callback=None):
                 page = tabs[-1] if tabs else browser.new_tab()
             _set_browser(browser)
             _set_page(page)
+            # Docker 中先覆盖 UA（HTTP 头 + JS 层），再装 stealth
+            try:
+                override_user_agent_for_docker(page, log_callback=log_callback)
+            except Exception:
+                pass
             # 启动时只装轻量 stealth，绝不补丁 turnstile API。
             # pageHook（补丁 window.turnstile）默认关闭，手动能过时补丁反而容易干扰 flexible 模式。
             try:

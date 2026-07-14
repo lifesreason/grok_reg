@@ -39,13 +39,23 @@
         });
     } catch (e) {}
 
-    // 5. platform —— 根据 UA 动态推导
+    // 5. platform + userAgent —— 根据 UA 动态推导，Linux UA 替换为 Windows 画像
     try {
         var ua = navigator.userAgent || "";
         var p = "Linux x86_64";
-        if (/Windows/.test(ua)) p = "Win32";
-        else if (/Macintosh/.test(ua)) p = "MacIntel";
+        var fakeUa = ua;
+        if (/Windows/.test(ua)) {
+            p = "Win32";
+        } else if (/Macintosh/.test(ua)) {
+            p = "MacIntel";
+        } else if (/Linux/.test(ua)) {
+            p = "Win32";
+            fakeUa = ua.replace("X11; Linux x86_64", "Windows NT 10.0; Win64; x64");
+        }
         Object.defineProperty(navigator, "platform", { get: function () { return p; }, configurable: true });
+        if (fakeUa !== ua) {
+            Object.defineProperty(navigator, "userAgent", { get: function () { return fakeUa; }, configurable: true });
+        }
     } catch (e) {}
 
     // 6. WebGL vendor/renderer —— 始终 hook getParameter，调用时判断是否需要伪装
