@@ -1470,21 +1470,20 @@ def create_browser_options():
     if should_apply_container_chrome_flags():
         options.set_argument("--no-sandbox")
         options.set_argument("--disable-dev-shm-usage")
-        # 不要 --disable-gpu：flexible Turnstile 会看 WebGL/Canvas；容器用 ANGLE/SwiftShader。
+        # 注意：不要 --disable-gpu，Turnstile 需要 WebGL。
+        # 不指定 --use-angle=swiftshader-webgl：该参数可被 Turnstile 检测到。
+        # Chrome 在无 GPU 时会自动回退到 SwiftShader，无需显式指定。
         options.set_argument("--use-gl=angle")
-        options.set_argument("--use-angle=swiftshader-webgl")
         options.set_argument("--enable-webgl")
         options.set_argument("--enable-webgl2-compute-context")
         options.set_argument("--ignore-gpu-blocklist")
-        options.set_argument("--enable-features=NetworkService,NetworkServiceInProcess")
+        # 不要 --enable-features=NetworkService,NetworkServiceInProcess —— 这是 Electron/自动化常用参数
         # 更接近常见桌面分辨率，避免 1365x900 这种少见尺寸成为指纹。
         options.set_argument("--window-size", "1920,1080")
         options.set_argument("--window-position", "0,0")
         options.set_argument("--lang", "en-US")
         options.set_argument("--accept-lang", "en-US,en")
-        options.set_argument("--disable-background-timer-throttling")
-        options.set_argument("--disable-renderer-backgrounding")
-        options.set_argument("--disable-backgrounding-occluded-windows")
+        # 不要 --disable-background-timer-throttling / --disable-renderer-backgrounding —— 自动化常用参数
     if should_run_headless():
         options.headless(True)
     return options
@@ -1509,6 +1508,14 @@ return {
   hasOwnPlatform: navigator.hasOwnProperty('platform'),
   hasOwnUA: navigator.hasOwnProperty('userAgent'),
   hasOwnWebdriver: navigator.hasOwnProperty('webdriver'),
+  toStringCheck: (function() {
+    try {
+      const desc = Object.getOwnPropertyDescriptor(Navigator.prototype, 'userAgent');
+      if (!desc || !desc.get) return 'no-getter';
+      const s = desc.get.toString();
+      return s.indexOf('[native code]') >= 0 ? 'native' : 'HOOKED:' + s.slice(0, 60);
+    } catch(e) { return 'error:' + String(e).slice(0, 40); }
+  })(),
   userAgentData: navigator.userAgentData ? {
     platform: navigator.userAgentData.platform,
     brands: navigator.userAgentData.brands,
@@ -1612,69 +1619,110 @@ def install_light_stealth_script(page, log_callback=None):
         return False
     source = r"""
 (() => {
+  // ====== 0. Function.prototype.toString 保护 ======
+  // 核心防线：Cloudflare 通过 fn.toString() 检查函数是否为原生代码。
+  // 原生 getter: "function get userAgent() { [native code] }"
+  // 我们替换的: "function () { return fakeUa; }" ← 一行代码即可检测。
+  // 解决方法：劫持 toString，对所有被替换的函数返回正确的 [native code] 字符串。
+  const _origToString = Function.prototype.toString;
+  const _nativeStrMap = new WeakMap();
+
+  const _initToString = function() {
+    const outStr = _nativeStrMap.has(this) ? _nativeStrMap.get(this) : _origToString.call(this);
+    return outStr;
+  };
+  // 把 toString 自身也伪装为 native
+  _nativeStrMap.set(_initToString, 'function toString() { [native code] }');
+  Function.prototype.toString = _initToString;
+
+  // 工具函数：在原型上覆盖 getter，并注册 native toString
+  function _hookGetter(obj, prop, getterFn, nativeStr) {
+    try {
+      _nativeStrMap.set(getterFn, nativeStr || ('function get ' + prop + '() { [native code] }'));
+      Object.defineProperty(obj, prop, { get: getterFn, configurable: true, enumerable: true });
+    } catch (e) {}
+  }
+  // 工具函数：在原型上覆盖 value，并注册 native toString
+  function _hookValue(obj, prop, valueFn, nativeStr) {
+    try {
+      _nativeStrMap.set(valueFn, nativeStr || ('function ' + prop + '() { [native code] }'));
+      Object.defineProperty(obj, prop, { value: valueFn, configurable: true, writable: true });
+    } catch (e) {}
+  }
+
   const isTop = (window.top === window.self);
 
-  // 1. navigator.webdriver —— --disable-blink-features=AutomationControlled 已处理为 false。
-  //    仅当仍为 true/undefined 时在原型上覆盖为 false。
-  //    关键：不在实例上覆盖，否则 navigator.hasOwnProperty('webdriver') 返回 true（真实 Chrome 为 false）。
+  // ====== 1. navigator.webdriver ======
   try {
     const wd = navigator.webdriver;
     if (wd === true || wd === undefined) {
-      Object.defineProperty(Navigator.prototype, 'webdriver', { get: () => false, configurable: true, enumerable: true });
+      _hookGetter(Navigator.prototype, 'webdriver', function() { return false; });
     }
   } catch (e) {}
 
-  // 2. chrome 对象 —— 仅在顶层 frame 添加。
-  //    关键：真实 Chrome 中 chrome.runtime/csi/loadTimes 仅存在于主页面，跨域 iframe 中为 undefined。
-  //    旧代码在所有 frame 注入，Turnstile iframe 中检测到这些属性就知道是自动化环境。
+  // ====== 2. chrome 对象 —— 仅顶层 frame ======
   try {
     if (isTop) {
       if (!window.chrome) window.chrome = {};
       if (!window.chrome.runtime) window.chrome.runtime = {};
+      if (!window.chrome.app) {
+        window.chrome.app = {
+          getDetails: function() { return null; },
+          getIsInstalled: function() { return false; },
+          runningState: function() { return 'cannot_run'; },
+          installState: function() { return 'disabled'; },
+          isInstalled: false,
+        };
+        _nativeStrMap.set(window.chrome.app.getDetails, 'function getDetails() { [native code] }');
+        _nativeStrMap.set(window.chrome.app.getIsInstalled, 'function getIsInstalled() { [native code] }');
+        _nativeStrMap.set(window.chrome.app.runningState, 'function runningState() { [native code] }');
+        _nativeStrMap.set(window.chrome.app.installState, 'function installState() { [native code] }');
+      }
       if (!window.chrome.csi) {
-        const _t = Date.now();
-        window.chrome.csi = function() { return { startE: _t - 2000, onloadT: _t - 500, pageT: 2000, tran: 15 }; };
+        const _csi = function() {
+          const _t = performance.timing || {};
+          return { startE: _t.navigationStart || Date.now() - 2000, onloadT: _t.loadEventEnd || Date.now() - 500, pageT: 2000, tran: 15 };
+        };
+        _nativeStrMap.set(_csi, 'function csi() { [native code] }');
+        window.chrome.csi = _csi;
       }
       if (!window.chrome.loadTimes) {
-        window.chrome.loadTimes = function() {
-          const now = Date.now() / 1000;
+        const _lt = function() {
+          const _t = performance.timing || {};
+          const base = (_t.navigationStart || Date.now()) / 1000;
           return {
-            commitLoadTime: now - 2, connectionInfo: 'h2',
-            finishDocumentLoadTime: now - 1, finishLoadTime: now - 0.5,
-            firstPaintAfterLoadTime: 0, firstPaintTime: now - 1.5,
+            commitLoadTime: base + 0.5, connectionInfo: 'h2',
+            finishDocumentLoadTime: base + 1.5, finishLoadTime: base + 2,
+            firstPaintAfterLoadTime: 0, firstPaintTime: base + 1,
             navigationType: 'Other', npnNegotiatedProtocol: 'h2',
-            requestTime: now - 3, startLoadTime: now - 2.5,
+            requestTime: base - 0.5, startLoadTime: base,
             wasAlternateProtocolAvailable: false, wasFetchedViaSPDY: true,
             wasNpnNegotiated: true
           };
         };
+        _nativeStrMap.set(_lt, 'function loadTimes() { [native code] }');
+        window.chrome.loadTimes = _lt;
       }
     }
   } catch (e) {}
 
-  // 3. permissions.query —— 在 Permissions.prototype 上覆盖（避免实例级检测）
+  // ====== 3. permissions.query ======
   try {
     if (window.navigator.permissions && window.navigator.permissions.query) {
       const origQuery = Permissions.prototype.query;
-      Object.defineProperty(Permissions.prototype, 'query', {
-        value: function(parameters) {
-          if (parameters && parameters.name === 'notifications') {
-            return Promise.resolve({ state: Notification.permission });
-          }
-          return origQuery.call(this, parameters);
-        },
-        configurable: true, writable: true,
-      });
+      _hookValue(Permissions.prototype, 'query', function(parameters) {
+        if (parameters && parameters.name === 'notifications') {
+          return Promise.resolve({ state: Notification.permission });
+        }
+        return origQuery.call(this, parameters);
+      }, 'function query() { [native code] }');
     }
   } catch (e) {}
 
-  // 4. languages —— 在 Navigator.prototype 上覆盖
-  try {
-    Object.defineProperty(Navigator.prototype, 'languages', { get: () => ['en-US', 'en'], configurable: true, enumerable: true });
-  } catch (e) {}
+  // ====== 4. languages ======
+  _hookGetter(Navigator.prototype, 'languages', function() { return ['en-US', 'en']; });
 
-  // 5. platform + userAgent + appVersion —— 全部在 Navigator.prototype 上覆盖。
-  //    关键：实例级覆盖会被 navigator.hasOwnProperty('platform') 检测（真实 Chrome 为 false）。
+  // ====== 5. platform + userAgent + appVersion ======
   try {
     const ua = navigator.userAgent || '';
     let p = 'Linux x86_64';
@@ -1682,30 +1730,27 @@ def install_light_stealth_script(page, log_callback=None):
     if (/Windows/.test(ua)) { p = 'Win32'; }
     else if (/Macintosh/.test(ua)) { p = 'MacIntel'; }
     else if (/Linux/.test(ua)) { p = 'Win32'; fakeUa = ua.replace('X11; Linux x86_64', 'Windows NT 10.0; Win64; x64'); }
-    Object.defineProperty(Navigator.prototype, 'platform', { get: () => p, configurable: true, enumerable: true });
+    _hookGetter(Navigator.prototype, 'platform', function() { return p; });
     if (fakeUa !== ua) {
-      Object.defineProperty(Navigator.prototype, 'userAgent', { get: () => fakeUa, configurable: true, enumerable: true });
+      _hookGetter(Navigator.prototype, 'userAgent', function() { return fakeUa; });
     }
     const effectiveUa = fakeUa !== ua ? fakeUa : ua;
-    Object.defineProperty(Navigator.prototype, 'appVersion', { get: () => effectiveUa.replace('Mozilla/', ''), configurable: true, enumerable: true });
+    _hookGetter(Navigator.prototype, 'appVersion', function() { return effectiveUa.replace('Mozilla/', ''); });
   } catch (e) {}
 
-  // 6. maxTouchPoints —— 桌面应为 0
-  try {
-    Object.defineProperty(Navigator.prototype, 'maxTouchPoints', { get: () => 0, configurable: true, enumerable: true });
-  } catch (e) {}
+  // ====== 6. maxTouchPoints ======
+  _hookGetter(Navigator.prototype, 'maxTouchPoints', function() { return 0; });
 
-  // 7. navigator.connection —— 容器中可能缺失
+  // ====== 7. navigator.connection ======
   try {
     if (!navigator.connection) {
-      Object.defineProperty(Navigator.prototype, 'connection', {
-        get: () => ({ effectiveType: '4g', rtt: 50, downlink: 10, saveData: false }),
-        configurable: true, enumerable: true,
+      _hookGetter(Navigator.prototype, 'connection', function() {
+        return { effectiveType: '4g', rtt: 50, downlink: 10, saveData: false };
       });
     }
   } catch (e) {}
 
-  // 8. navigator.userAgentData —— Docker Chrome 中 platform 为 "Linux"，需覆盖为 "Windows"
+  // ====== 8. navigator.userAgentData ======
   try {
     if (navigator.userAgentData) {
       const ua = navigator.userAgent || '';
@@ -1720,41 +1765,31 @@ def install_light_stealth_script(page, log_callback=None):
         ],
         mobile: false,
         platform: isWin ? 'Windows' : 'macOS',
-        getHighEntropyValues: (hints) => Promise.resolve({
-          brands: [
-            { brand: 'Google Chrome', version: cv },
-            { brand: 'Chromium', version: cv },
-            { brand: 'Not_A Brand', version: '24' },
-          ],
-          mobile: false,
+      };
+      const _hev = function(hints) {
+        return Promise.resolve({
+          brands: fakeUAD.brands, mobile: false,
           platform: isWin ? 'Windows' : 'macOS',
           platformVersion: isWin ? '10.0.0' : '13.6.0',
-          architecture: 'x86',
-          bitness: '64',
-          model: '',
+          architecture: 'x86', bitness: '64', model: '',
           uaFullVersion: cv + '.0.0.0',
           fullVersionList: [
             { brand: 'Google Chrome', version: cv + '.0.0.0' },
             { brand: 'Chromium', version: cv + '.0.0.0' },
             { brand: 'Not_A Brand', version: '24.0.0.0' },
           ],
-        }),
-        toJSON: () => ({
-          brands: [
-            { brand: 'Google Chrome', version: cv },
-            { brand: 'Chromium', version: cv },
-            { brand: 'Not_A Brand', version: '24' },
-          ],
-          mobile: false,
-          platform: isWin ? 'Windows' : 'macOS',
-        }),
+        });
       };
-      Object.defineProperty(Navigator.prototype, 'userAgentData', { get: () => fakeUAD, configurable: true, enumerable: true });
+      _nativeStrMap.set(_hev, 'function getHighEntropyValues() { [native code] }');
+      fakeUAD.getHighEntropyValues = _hev;
+      const _toJSON = function() { return { brands: fakeUAD.brands, mobile: false, platform: fakeUAD.platform }; };
+      _nativeStrMap.set(_toJSON, 'function toJSON() { [native code] }');
+      fakeUAD.toJSON = _toJSON;
+      _hookGetter(Navigator.prototype, 'userAgentData', function() { return fakeUAD; });
     }
   } catch (e) {}
 
-  // 9. WebGL vendor/renderer/extensions —— 始终 hook，调用时判断。
-  //    关键：vendor+renderer 必须同时替换；getSupportedExtensions 也要替换（SwiftShader 扩展列表不同）
+  // ====== 9. WebGL vendor/renderer/extensions ======
   try {
     const FAKE_WGL_VENDOR = 'Google Inc. (Intel)';
     const FAKE_WGL_RENDERER = 'ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.6)';
@@ -1788,24 +1823,29 @@ def install_light_stealth_script(page, log_callback=None):
       const origGetExts = proto.getSupportedExtensions;
       const isSW = (gl) => { try { return SW_RE.test(String(origGetParam.call(gl, 37446))); } catch(e) { return false; } };
 
-      proto.getParameter = function(param) {
+      const _getParam = function(param) {
         const result = origGetParam.call(this, param);
         if (param === 37446 && SW_RE.test(String(result))) return FAKE_WGL_RENDERER;
         if (param === 37445 && isSW(this)) return FAKE_WGL_VENDOR;
         return result;
       };
+      _nativeStrMap.set(_getParam, 'function getParameter() { [native code] }');
+      proto.getParameter = _getParam;
+
       if (origGetExts) {
-        proto.getSupportedExtensions = function() {
+        const _getExts = function() {
           if (isSW(this)) return fakeExts;
           return origGetExts.call(this);
         };
+        _nativeStrMap.set(_getExts, 'function getSupportedExtensions() { [native code] }');
+        proto.getSupportedExtensions = _getExts;
       }
     };
     try { hookWebGL(WebGLRenderingContext.prototype, FAKE_WGL1_EXTS); } catch (e) {}
     try { hookWebGL(WebGL2RenderingContext.prototype, FAKE_WGL2_EXTS); } catch (e) {}
   } catch (e) {}
 
-  // 10. Canvas 指纹噪声 —— 对 toDataURL/toBlob 注入微量确定性噪声
+  // ====== 10. Canvas 指纹噪声 ======
   try {
     const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
     const origToBlob = HTMLCanvasElement.prototype.toBlob;
@@ -1821,22 +1861,21 @@ def install_light_stealth_script(page, log_callback=None):
       } catch (e) {}
     }
 
-    HTMLCanvasElement.prototype.toDataURL = function() {
-      _canvasInjectNoise(this);
-      return origToDataURL.apply(this, arguments);
-    };
+    const _toDataURL = function() { _canvasInjectNoise(this); return origToDataURL.apply(this, arguments); };
+    _nativeStrMap.set(_toDataURL, 'function toDataURL() { [native code] }');
+    HTMLCanvasElement.prototype.toDataURL = _toDataURL;
+
     if (origToBlob) {
-      HTMLCanvasElement.prototype.toBlob = function() {
-        _canvasInjectNoise(this);
-        return origToBlob.apply(this, arguments);
-      };
+      const _toBlob = function() { _canvasInjectNoise(this); return origToBlob.apply(this, arguments); };
+      _nativeStrMap.set(_toBlob, 'function toBlob() { [native code] }');
+      HTMLCanvasElement.prototype.toBlob = _toBlob;
     }
   } catch (e) {}
 
-  // 11. AudioContext 指纹噪声
+  // ====== 11. AudioContext 指纹噪声 ======
   try {
     const origGetChannelData = AudioBuffer.prototype.getChannelData;
-    AudioBuffer.prototype.getChannelData = function(channel) {
+    const _gcd = function(channel) {
       const data = origGetChannelData.call(this, channel);
       if (data && data.length > 0) {
         const off = ((this.length || 0) * 3 + 1) % 7 / 100000;
@@ -1844,29 +1883,37 @@ def install_light_stealth_script(page, log_callback=None):
       }
       return data;
     };
+    _nativeStrMap.set(_gcd, 'function getChannelData() { [native code] }');
+    AudioBuffer.prototype.getChannelData = _gcd;
   } catch (e) {}
 
-  // 12. WebRTC 屏蔽 + enumerateDevices —— 在原型上覆盖
+  // ====== 12. WebRTC + enumerateDevices ======
   try {
     if (window.RTCPeerConnection || window.webkitRTCPeerConnection) {
       const _RTC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
       const _origSetConfig = _RTC.prototype.setConfiguration;
       if (_origSetConfig) {
-        _RTC.prototype.setConfiguration = function(config) {
-          if (config && config.iceTransportPolicy === undefined) {
-            config.iceTransportPolicy = 'relay';
-          }
+        const _setConfig = function(config) {
+          if (config && config.iceTransportPolicy === undefined) { config.iceTransportPolicy = 'relay'; }
           return _origSetConfig.call(this, config);
         };
+        _nativeStrMap.set(_setConfig, 'function setConfiguration() { [native code] }');
+        _RTC.prototype.setConfiguration = _setConfig;
       }
     }
     if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
       const _origEnum = MediaDevices.prototype.enumerateDevices;
-      MediaDevices.prototype.enumerateDevices = function() {
-        return _origEnum.call(this).then(d => d.filter(x => x.kind !== 'videoinput'));
-      };
+      const _enum = function() { return _origEnum.call(this).then(d => d.filter(x => x.kind !== 'videoinput')); };
+      _nativeStrMap.set(_enum, 'function enumerateDevices() { [native code] }');
+      MediaDevices.prototype.enumerateDevices = _enum;
     }
   } catch (e) {}
+
+  // ====== 13. iframe contentWindow.chrome 检测修复 ======
+  // 真实 Chrome 中，主页面创建的 iframe 的 contentWindow 也有 chrome 对象（同源），
+  // 但跨域 iframe 的 chrome 为 undefined。之前的修复跳过了所有 iframe 的 chrome 注入，
+  // 但同源 iframe 仍需要 chrome 对象，否则也是一种检测方式。
+  // 此处不额外处理：跨域 iframe 不注入 chrome 已经正确，同源 iframe 会从原型继承。
 })();
 """
     ok = False
@@ -1882,7 +1929,7 @@ def install_light_stealth_script(page, log_callback=None):
     except Exception:
         pass
     if ok and log_callback:
-        log_callback("[Debug] 已安装增强 stealth（原型级覆盖+帧隔离+userAgentData+WebGL扩展+Canvas/Audio/WebRTC）")
+        log_callback("[Debug] 已安装增强 stealth（toString保护+原型级覆盖+帧隔离+userAgentData+WebGL扩展）")
     return ok
 
 

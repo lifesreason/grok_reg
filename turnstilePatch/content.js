@@ -1,76 +1,117 @@
-// Turnstile Patch - 全面 stealth + 原型级反指纹 + 帧隔离，不在注册早期页面补丁 turnstile API。
+// Turnstile Patch - toString 保护 + 原型级反指纹 + 帧隔离，不在注册早期页面补丁 turnstile API。
 // 原因：在 OTP/邮箱路由阶段注入 pageHook 会干扰 xAI SPA 过渡，
 // 表现为 verify-email 200 后长期停在 "An error occurred"。
 // Turnstile 观测 hook 改由 Python 在资料页 fill_profile_and_submit 时 CDP 注入。
 //
 // 关键修复（与 Python stealth 脚本同步）：
+// 0. Function.prototype.toString 保护——Cloudflare 通过 fn.toString() 检查函数是否为 native code
 // 1. 所有 navigator 属性在 Navigator.prototype 上覆盖，避免 hasOwnProperty 检测
 // 2. webdriver 返回 false 而非 undefined
-// 3. chrome.runtime/csi/loadTimes 仅在顶层 frame 注入（跨域 iframe 中不应存在）
-// 4. chrome.csi/loadTimes 返回完整字段
+// 3. chrome.runtime/csi/loadTimes 仅在顶层 frame 注入
+// 4. 新增 chrome.app（真实 Chrome 有此属性）
 // 5. 新增 userAgentData / maxTouchPoints / connection 覆盖
-// 6. WebGL getSupportedExtensions 也替换（SwiftShader 扩展列表不同）
+// 6. WebGL getSupportedExtensions 也替换
 
 (function () {
     "use strict";
+
+    // ====== 0. Function.prototype.toString 保护 ======
+    var _origToString = Function.prototype.toString;
+    var _nativeStrMap = new WeakMap();
+
+    var _initToString = function () {
+        var outStr = _nativeStrMap.has(this) ? _nativeStrMap.get(this) : _origToString.call(this);
+        return outStr;
+    };
+    _nativeStrMap.set(_initToString, "function toString() { [native code] }");
+    Function.prototype.toString = _initToString;
+
+    function _hookGetter(obj, prop, getterFn, nativeStr) {
+        try {
+            _nativeStrMap.set(getterFn, nativeStr || ("function get " + prop + "() { [native code] }"));
+            Object.defineProperty(obj, prop, { get: getterFn, configurable: true, enumerable: true });
+        } catch (e) {}
+    }
+    function _hookValue(obj, prop, valueFn, nativeStr) {
+        try {
+            _nativeStrMap.set(valueFn, nativeStr || ("function " + prop + "() { [native code] }"));
+            Object.defineProperty(obj, prop, { value: valueFn, configurable: true, writable: true });
+        } catch (e) {}
+    }
+
     var isTop = (window.top === window.self);
 
-    // 1. navigator.webdriver —— 仅当仍为 true/undefined 时在原型上覆盖为 false
+    // ====== 1. navigator.webdriver ======
     try {
         var wd = navigator.webdriver;
         if (wd === true || wd === undefined) {
-            Object.defineProperty(Navigator.prototype, "webdriver", { get: function () { return false; }, configurable: true, enumerable: true });
+            _hookGetter(Navigator.prototype, "webdriver", function () { return false; });
         }
     } catch (e) {}
 
-    // 2. chrome 对象 —— 仅在顶层 frame 添加（跨域 iframe 中不应有 chrome.runtime/csi/loadTimes）
+    // ====== 2. chrome 对象 —— 仅顶层 frame ======
     try {
         if (isTop) {
             if (!window.chrome) window.chrome = {};
             if (!window.chrome.runtime) window.chrome.runtime = {};
+            if (!window.chrome.app) {
+                window.chrome.app = {
+                    getDetails: function () { return null; },
+                    getIsInstalled: function () { return false; },
+                    runningState: function () { return "cannot_run"; },
+                    installState: function () { return "disabled"; },
+                    isInstalled: false,
+                };
+                _nativeStrMap.set(window.chrome.app.getDetails, "function getDetails() { [native code] }");
+                _nativeStrMap.set(window.chrome.app.getIsInstalled, "function getIsInstalled() { [native code] }");
+                _nativeStrMap.set(window.chrome.app.runningState, "function runningState() { [native code] }");
+                _nativeStrMap.set(window.chrome.app.installState, "function installState() { [native code] }");
+            }
             if (!window.chrome.csi) {
-                var _t = Date.now();
-                window.chrome.csi = function () { return { startE: _t - 2000, onloadT: _t - 500, pageT: 2000, tran: 15 }; };
+                var _csi = function () {
+                    var _t = performance.timing || {};
+                    return { startE: _t.navigationStart || Date.now() - 2000, onloadT: _t.loadEventEnd || Date.now() - 500, pageT: 2000, tran: 15 };
+                };
+                _nativeStrMap.set(_csi, "function csi() { [native code] }");
+                window.chrome.csi = _csi;
             }
             if (!window.chrome.loadTimes) {
-                window.chrome.loadTimes = function () {
-                    var now = Date.now() / 1000;
+                var _lt = function () {
+                    var _t = performance.timing || {};
+                    var base = (_t.navigationStart || Date.now()) / 1000;
                     return {
-                        commitLoadTime: now - 2, connectionInfo: "h2",
-                        finishDocumentLoadTime: now - 1, finishLoadTime: now - 0.5,
-                        firstPaintAfterLoadTime: 0, firstPaintTime: now - 1.5,
+                        commitLoadTime: base + 0.5, connectionInfo: "h2",
+                        finishDocumentLoadTime: base + 1.5, finishLoadTime: base + 2,
+                        firstPaintAfterLoadTime: 0, firstPaintTime: base + 1,
                         navigationType: "Other", npnNegotiatedProtocol: "h2",
-                        requestTime: now - 3, startLoadTime: now - 2.5,
+                        requestTime: base - 0.5, startLoadTime: base,
                         wasAlternateProtocolAvailable: false, wasFetchedViaSPDY: true,
                         wasNpnNegotiated: true
                     };
                 };
+                _nativeStrMap.set(_lt, "function loadTimes() { [native code] }");
+                window.chrome.loadTimes = _lt;
             }
         }
     } catch (e) {}
 
-    // 3. permissions.query —— 在 Permissions.prototype 上覆盖
+    // ====== 3. permissions.query ======
     try {
         if (window.navigator.permissions && window.navigator.permissions.query) {
             var origQuery = Permissions.prototype.query;
-            Object.defineProperty(Permissions.prototype, "query", {
-                value: function (parameters) {
-                    if (parameters && parameters.name === "notifications") {
-                        return Promise.resolve({ state: Notification.permission });
-                    }
-                    return origQuery.call(this, parameters);
-                },
-                configurable: true, writable: true,
-            });
+            _hookValue(Permissions.prototype, "query", function (parameters) {
+                if (parameters && parameters.name === "notifications") {
+                    return Promise.resolve({ state: Notification.permission });
+                }
+                return origQuery.call(this, parameters);
+            }, "function query() { [native code] }");
         }
     } catch (e) {}
 
-    // 4. languages —— 在 Navigator.prototype 上覆盖
-    try {
-        Object.defineProperty(Navigator.prototype, "languages", { get: function () { return ["en-US", "en"]; }, configurable: true, enumerable: true });
-    } catch (e) {}
+    // ====== 4. languages ======
+    _hookGetter(Navigator.prototype, "languages", function () { return ["en-US", "en"]; });
 
-    // 5. platform + userAgent + appVersion —— 全部在 Navigator.prototype 上覆盖
+    // ====== 5. platform + userAgent + appVersion ======
     try {
         var ua = navigator.userAgent || "";
         var p = "Linux x86_64";
@@ -78,30 +119,27 @@
         if (/Windows/.test(ua)) { p = "Win32"; }
         else if (/Macintosh/.test(ua)) { p = "MacIntel"; }
         else if (/Linux/.test(ua)) { p = "Win32"; fakeUa = ua.replace("X11; Linux x86_64", "Windows NT 10.0; Win64; x64"); }
-        Object.defineProperty(Navigator.prototype, "platform", { get: function () { return p; }, configurable: true, enumerable: true });
+        _hookGetter(Navigator.prototype, "platform", function () { return p; });
         if (fakeUa !== ua) {
-            Object.defineProperty(Navigator.prototype, "userAgent", { get: function () { return fakeUa; }, configurable: true, enumerable: true });
+            _hookGetter(Navigator.prototype, "userAgent", function () { return fakeUa; });
         }
         var effectiveUa = fakeUa !== ua ? fakeUa : ua;
-        Object.defineProperty(Navigator.prototype, "appVersion", { get: function () { return effectiveUa.replace("Mozilla/", ""); }, configurable: true, enumerable: true });
+        _hookGetter(Navigator.prototype, "appVersion", function () { return effectiveUa.replace("Mozilla/", ""); });
     } catch (e) {}
 
-    // 6. maxTouchPoints —— 桌面为 0
-    try {
-        Object.defineProperty(Navigator.prototype, "maxTouchPoints", { get: function () { return 0; }, configurable: true, enumerable: true });
-    } catch (e) {}
+    // ====== 6. maxTouchPoints ======
+    _hookGetter(Navigator.prototype, "maxTouchPoints", function () { return 0; });
 
-    // 7. navigator.connection —— 容器中可能缺失
+    // ====== 7. navigator.connection ======
     try {
         if (!navigator.connection) {
-            Object.defineProperty(Navigator.prototype, "connection", {
-                get: function () { return { effectiveType: "4g", rtt: 50, downlink: 10, saveData: false }; },
-                configurable: true, enumerable: true,
+            _hookGetter(Navigator.prototype, "connection", function () {
+                return { effectiveType: "4g", rtt: 50, downlink: 10, saveData: false };
             });
         }
     } catch (e) {}
 
-    // 8. navigator.userAgentData —— Docker Chrome 中 platform 为 "Linux"，需覆盖为 "Windows"
+    // ====== 8. navigator.userAgentData ======
     try {
         if (navigator.userAgentData) {
             var ua2 = navigator.userAgent || "";
@@ -116,42 +154,31 @@
                 ],
                 mobile: false,
                 platform: isWin ? "Windows" : "macOS",
-                getHighEntropyValues: function (hints) {
-                    return Promise.resolve({
-                        brands: [
-                            { brand: "Google Chrome", version: cv },
-                            { brand: "Chromium", version: cv },
-                            { brand: "Not_A Brand", version: "24" },
-                        ],
-                        mobile: false,
-                        platform: isWin ? "Windows" : "macOS",
-                        platformVersion: isWin ? "10.0.0" : "13.6.0",
-                        architecture: "x86", bitness: "64", model: "",
-                        uaFullVersion: cv + ".0.0.0",
-                        fullVersionList: [
-                            { brand: "Google Chrome", version: cv + ".0.0.0" },
-                            { brand: "Chromium", version: cv + ".0.0.0" },
-                            { brand: "Not_A Brand", version: "24.0.0.0" },
-                        ],
-                    });
-                },
-                toJSON: function () {
-                    return {
-                        brands: [
-                            { brand: "Google Chrome", version: cv },
-                            { brand: "Chromium", version: cv },
-                            { brand: "Not_A Brand", version: "24" },
-                        ],
-                        mobile: false,
-                        platform: isWin ? "Windows" : "macOS",
-                    };
-                },
             };
-            Object.defineProperty(Navigator.prototype, "userAgentData", { get: function () { return fakeUAD; }, configurable: true, enumerable: true });
+            var _hev = function (hints) {
+                return Promise.resolve({
+                    brands: fakeUAD.brands, mobile: false,
+                    platform: isWin ? "Windows" : "macOS",
+                    platformVersion: isWin ? "10.0.0" : "13.6.0",
+                    architecture: "x86", bitness: "64", model: "",
+                    uaFullVersion: cv + ".0.0.0",
+                    fullVersionList: [
+                        { brand: "Google Chrome", version: cv + ".0.0.0" },
+                        { brand: "Chromium", version: cv + ".0.0.0" },
+                        { brand: "Not_A Brand", version: "24.0.0.0" },
+                    ],
+                });
+            };
+            _nativeStrMap.set(_hev, "function getHighEntropyValues() { [native code] }");
+            fakeUAD.getHighEntropyValues = _hev;
+            var _toJSON = function () { return { brands: fakeUAD.brands, mobile: false, platform: fakeUAD.platform }; };
+            _nativeStrMap.set(_toJSON, "function toJSON() { [native code] }");
+            fakeUAD.toJSON = _toJSON;
+            _hookGetter(Navigator.prototype, "userAgentData", function () { return fakeUAD; });
         }
     } catch (e) {}
 
-    // 9. WebGL vendor/renderer/extensions —— 始终 hook，调用时判断
+    // ====== 9. WebGL vendor/renderer/extensions ======
     try {
         var FAKE_WGL_VENDOR = "Google Inc. (Intel)";
         var FAKE_WGL_RENDERER = "ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.6)";
@@ -185,24 +212,29 @@
             var origGetExts = proto.getSupportedExtensions;
             var isSW = function (gl) { try { return SW_RE.test(String(origGetParam.call(gl, 37446))); } catch (e) { return false; } };
 
-            proto.getParameter = function (param) {
+            var _getParam = function (param) {
                 var result = origGetParam.call(this, param);
                 if (param === 37446 && SW_RE.test(String(result))) return FAKE_WGL_RENDERER;
                 if (param === 37445 && isSW(this)) return FAKE_WGL_VENDOR;
                 return result;
             };
+            _nativeStrMap.set(_getParam, "function getParameter() { [native code] }");
+            proto.getParameter = _getParam;
+
             if (origGetExts) {
-                proto.getSupportedExtensions = function () {
+                var _getExts = function () {
                     if (isSW(this)) return fakeExts;
                     return origGetExts.call(this);
                 };
+                _nativeStrMap.set(_getExts, "function getSupportedExtensions() { [native code] }");
+                proto.getSupportedExtensions = _getExts;
             }
         };
         try { hookWebGL(WebGLRenderingContext.prototype, FAKE_WGL1_EXTS); } catch (e) {}
         try { hookWebGL(WebGL2RenderingContext.prototype, FAKE_WGL2_EXTS); } catch (e) {}
     } catch (e) {}
 
-    // 10. Canvas 指纹噪声
+    // ====== 10. Canvas 指纹噪声 ======
     try {
         var origToDataURL = HTMLCanvasElement.prototype.toDataURL;
         var origToBlob = HTMLCanvasElement.prototype.toBlob;
@@ -218,22 +250,20 @@
             } catch (e) {}
         }
 
-        HTMLCanvasElement.prototype.toDataURL = function () {
-            _canvasInjectNoise(this);
-            return origToDataURL.apply(this, arguments);
-        };
+        var _toDataURL = function () { _canvasInjectNoise(this); return origToDataURL.apply(this, arguments); };
+        _nativeStrMap.set(_toDataURL, "function toDataURL() { [native code] }");
+        HTMLCanvasElement.prototype.toDataURL = _toDataURL;
         if (origToBlob) {
-            HTMLCanvasElement.prototype.toBlob = function () {
-                _canvasInjectNoise(this);
-                return origToBlob.apply(this, arguments);
-            };
+            var _toBlob = function () { _canvasInjectNoise(this); return origToBlob.apply(this, arguments); };
+            _nativeStrMap.set(_toBlob, "function toBlob() { [native code] }");
+            HTMLCanvasElement.prototype.toBlob = _toBlob;
         }
     } catch (e) {}
 
-    // 11. AudioContext 指纹噪声
+    // ====== 11. AudioContext 指纹噪声 ======
     try {
         var origGetChannelData = AudioBuffer.prototype.getChannelData;
-        AudioBuffer.prototype.getChannelData = function (channel) {
+        var _gcd = function (channel) {
             var data = origGetChannelData.call(this, channel);
             if (data && data.length > 0) {
                 var off = ((this.length || 0) * 3 + 1) % 7 / 100000;
@@ -241,59 +271,54 @@
             }
             return data;
         };
+        _nativeStrMap.set(_gcd, "function getChannelData() { [native code] }");
+        AudioBuffer.prototype.getChannelData = _gcd;
     } catch (e) {}
 
-    // 12. WebRTC 屏蔽 + enumerateDevices —— 在原型上覆盖
+    // ====== 12. WebRTC + enumerateDevices ======
     try {
         if (window.RTCPeerConnection || window.webkitRTCPeerConnection) {
             var _RTC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
             var _origSetConfig = _RTC.prototype.setConfiguration;
             if (_origSetConfig) {
-                _RTC.prototype.setConfiguration = function (config) {
-                    if (config && config.iceTransportPolicy === undefined) {
-                        config.iceTransportPolicy = "relay";
-                    }
+                var _setConfig = function (config) {
+                    if (config && config.iceTransportPolicy === undefined) { config.iceTransportPolicy = "relay"; }
                     return _origSetConfig.call(this, config);
                 };
+                _nativeStrMap.set(_setConfig, "function setConfiguration() { [native code] }");
+                _RTC.prototype.setConfiguration = _setConfig;
             }
         }
         if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
             var _origEnum = MediaDevices.prototype.enumerateDevices;
-            MediaDevices.prototype.enumerateDevices = function () {
-                return _origEnum.call(this).then(function (d) { return d.filter(function (x) { return x.kind !== "videoinput"; }); });
-            };
+            var _enum = function () { return _origEnum.call(this).then(function (d) { return d.filter(function (x) { return x.kind !== "videoinput"; }); }); };
+            _nativeStrMap.set(_enum, "function enumerateDevices() { [native code] }");
+            MediaDevices.prototype.enumerateDevices = _enum;
         }
     } catch (e) {}
 
-    // 13. 资料页若出现可见 Turnstile iframe，尝试轻点（跨域失败则忽略）
+    // ====== 13. 资料页若出现可见 Turnstile iframe，尝试轻点 ======
     function autoClickTurnstile() {
         var checkCount = 0;
         var maxChecks = 80;
         var timer = setInterval(function () {
             checkCount++;
-            if (checkCount > maxChecks) {
-                clearInterval(timer);
-                return;
-            }
+            if (checkCount > maxChecks) { clearInterval(timer); return; }
             try {
                 var iframes = document.querySelectorAll(
                     'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]'
                 );
                 if (!iframes.length) return;
                 for (var i = 0; i < iframes.length; i++) {
-                    var iframe = iframes[i];
                     try {
-                        var body = iframe.contentDocument || iframe.contentWindow.document;
+                        var body = iframes[i].contentDocument || iframes[i].contentWindow.document;
                         var checkbox = body.querySelector('input[type="checkbox"], .mark');
                         if (checkbox && !checkbox.checked) checkbox.click();
-                    } catch (e) {
-                        // 跨域，无法直接点
-                    }
+                    } catch (e) {}
                 }
             } catch (e) {}
         }, 500);
     }
-
     if (document.readyState === "loading") {
         document.addEventListener("DOMContentLoaded", autoClickTurnstile);
     } else {
