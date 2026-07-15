@@ -434,8 +434,8 @@ def pick_configured_mail_domain(log_callback=None):
     domains = settings.get("main_domains") or []
     if not domains:
         raise Exception("未配置 mail_domains / defaultDomains，无法生成邮箱域名")
-    rejected = set(list_rejected_email_domains())
-    main = mdp.pick_main_domain(settings, rejected=rejected)
+    # 不读永久拒收黑名单；仅依赖域名池冷却/禁用主域（对齐 openai-cpa）
+    main = mdp.pick_main_domain(settings, rejected=set())
     if log_callback:
         mode_bits = []
         if settings.get("enable_sub_domains"):
@@ -4834,13 +4834,13 @@ class RegistrationJob:
                     mail_ok = True
                     break
                 except EmailDomainRejected as rejected:
-                    remembered = remember_rejected_email_domain(
-                        getattr(rejected, "domain", None) or str(rejected)
+                    remember_rejected_email_domain(
+                        getattr(rejected, "domain", None) or str(rejected),
+                        log_callback=logf,
                     )
                     if mail_try < max_mail_retry:
                         logf(
                             f"[!] 邮箱域名被拒，换后缀重试: {getattr(rejected, 'domain', rejected)}"
-                            f"（黑名单 {len(remembered)}）"
                         )
                         sleep_with_cancel(1, self.should_stop)
                         continue
@@ -4875,11 +4875,10 @@ class RegistrationJob:
                         log_callback=logf, cancel_callback=self.should_stop
                     )
                 except EmailDomainRejected as rejected:
-                    remembered = remember_rejected_email_domain(rejected.domain)
+                    remember_rejected_email_domain(rejected.domain, log_callback=logf)
                     if mail_try < max_mail_retry:
                         logf(
-                            f"[!] 邮箱域名被 x.ai 拒收，已加入黑名单并换后缀重试: {rejected.domain}"
-                            f"（当前共 {len(remembered)} 个拒收域名）"
+                            f"[!] 邮箱域名被 x.ai 拒收，冷却主域并换后缀重试: {rejected.domain}"
                         )
                         restart_browser(log_callback=logf)
                         sleep_with_cancel(1, self.should_stop)
@@ -5079,13 +5078,7 @@ class RegistrationJob:
             f"连续封禁熔断 {block_threshold or '关闭'}，"
             f"注册后 NSFW={'开' if self.settings.get('enable_nsfw') else '关'}"
         )
-        rejected_domains = list_rejected_email_domains()
-        if rejected_domains:
-            preview = ", ".join(rejected_domains[:12])
-            extra = f" 等{len(rejected_domains)}个" if len(rejected_domains) > 12 else f" 共{len(rejected_domains)}个"
-            self.log(f"[*] 已加载历史拒收邮箱后缀，将自动跳过: {preview}{extra}")
-        else:
-            self.log("[*] 历史拒收邮箱后缀: 无")
+        # 域名拒收只走内存池冷却，不加载永久黑名单（对齐 openai-cpa）
         self.log(f"[*] 成功账号将实时保存到: {os.path.join(get_data_dir(), self.output_file)}")
         try:
             start_interval = float(self.settings.get("thread_start_interval", 2.0))
@@ -5368,19 +5361,14 @@ def yyds_pick_domain(api_key=None, jwt=None):
     domains = yyds_get_domains(api_key=api_key, jwt=jwt)
     if not domains:
         raise Exception("YYDS 没有返回任何可用域名")
+    # 仅跳过域名池冷却中的主域，不使用永久拒收黑名单
+    import mail_domain_pool as mdp
     candidates = [
         d for d in domains
-        if not is_email_domain_rejected(d.get("domain"))
-    ]
+        if d.get("domain") and not mdp.is_domain_cooling(str(d.get("domain") or ""))
+    ] or list(domains)
     if not candidates:
-        rejected = sorted(
-            {
-                str(d.get("domain") or "").strip().lower()
-                for d in domains
-                if d.get("domain")
-            }
-        )
-        raise EmailProviderUnavailable(f"YYDS 可用域名已被 x.ai 拒收: {', '.join(rejected)}")
+        raise EmailProviderUnavailable("YYDS 无可用域名（可能均在冷却）")
     private = [d for d in candidates if d.get("isVerified") and not d.get("isPublic")]
     if private:
         return pick_rotating_domain(private, "_yyds_domain_index")
@@ -5565,28 +5553,35 @@ def save_rejected_email_domains():
     return path
 
 
-def remember_rejected_email_domain(domain):
-    """只记录被拒的精确后缀，不自动记父域；并触发域名池冷却。"""
-    load_rejected_email_domains()
+def remember_rejected_email_domain(domain, log_callback=None):
+    """域名被 x.ai 拒收时：只做域名池临时冷却，不写永久黑名单。
+
+    对齐 openai-cpa：不把后缀永久写入 rejected_email_domains.json。
+    """
     exact = normalize_rejected_email_domain(domain)
     if not exact:
         return set()
-    with _rejected_email_domains_lock:
-        before = set(_rejected_email_domains)
-        _rejected_email_domains.add(exact)
-        changed = _rejected_email_domains != before
-        snapshot = set(_rejected_email_domains)
-    if changed:
-        try:
-            save_rejected_email_domains()
-        except Exception:
-            pass
-    # 域名池：记失败，必要时冷却主域
     try:
-        note_mail_domain_outcome(exact, success=False, reason="discarded_email")
+        note_mail_domain_outcome(
+            exact, success=False, reason="discarded_email", log_callback=log_callback
+        )
     except Exception:
         pass
-    return snapshot
+    if log_callback:
+        log_callback(f"[!] 域名被拒，仅冷却主域（不写永久黑名单）: {exact}")
+    # 返回当前运行时冷却快照（兼容旧调用方期望 set）
+    try:
+        import mail_domain_pool as mdp
+
+        settings = _mail_pool_settings()
+        cooling = {
+            row["domain"]
+            for row in (mdp.runtime_summary(settings).get("domains") or [])
+            if row.get("cooldown_remaining_sec", 0) > 0
+        }
+        return cooling
+    except Exception:
+        return {exact}
 
 
 def is_email_domain_rejected(domain):
@@ -5628,19 +5623,13 @@ def pick_domain(api_key=None):
     domains = get_domains(api_key=api_key)
     if not domains:
         raise Exception("DuckMail 没有返回任何可用域名")
+    import mail_domain_pool as mdp
     candidates = [
         d for d in domains
-        if not is_email_domain_rejected(d.get("domain"))
-    ]
+        if d.get("domain") and not mdp.is_domain_cooling(str(d.get("domain") or ""))
+    ] or list(domains)
     if not candidates:
-        rejected = sorted(
-            {
-                str(d.get("domain") or "").strip().lower()
-                for d in domains
-                if d.get("domain")
-            }
-        )
-        raise EmailProviderUnavailable(f"DuckMail 可用域名已被 x.ai 拒收: {', '.join(rejected)}")
+        raise EmailProviderUnavailable("DuckMail 无可用域名（可能均在冷却）")
     private = [d for d in candidates if d.get("ownerId")]
     verified_private = [d for d in private if d.get("isVerified")]
     if verified_private:
@@ -5915,25 +5904,24 @@ def _get_email_and_token_once(api_key=None):
             raise Exception("Cloudflare API Base 未配置")
         try:
             address, token = cloudflare_create_temp_address(api_base)
-            if address and is_email_domain_rejected(address):
-                note_mail_domain_outcome(address, success=False, reason="discarded_email")
-                raise Exception(f"临时邮箱域名已在拒收黑名单: {address}")
             return address, token
         except Exception as primary_exc:
             key = api_key or get_cloudflare_api_key()
             domains = cloudflare_get_domains(api_base, api_key=key)
             if not domains:
                 raise Exception(f"Cloudflare 创建邮箱失败: {primary_exc}") from primary_exc
-            verified = [
-                d for d in domains
-                if d.get("isVerified") and not is_email_domain_rejected(d.get("domain"))
-            ]
-            candidates = verified or [
-                d for d in domains if not is_email_domain_rejected(d.get("domain"))
-            ]
+            # 仅跳过域名池冷却中的主域，不读永久拒收黑名单
+            verified = [d for d in domains if d.get("isVerified")]
+            candidates = verified or list(domains)
+            filtered = []
+            for d in candidates:
+                root = str(d.get("domain") or "").strip()
+                if root and not __import__("mail_domain_pool").is_domain_cooling(root):
+                    filtered.append(d)
+            candidates = filtered or candidates
             if not candidates:
                 raise EmailProviderUnavailable(
-                    f"Cloudflare 可用域名均已被 x.ai 拒收（含历史黑名单）: {primary_exc}"
+                    f"Cloudflare 无可用域名（可能均在冷却）: {primary_exc}"
                 )
             target = candidates[0]
             domain = target.get("domain")
@@ -7876,7 +7864,7 @@ def register_via_pure_http(log_callback=None, cancel_callback=None):
             if "reject" in msg.lower() or "domain" in msg.lower():
                 domain = email.split("@")[-1] if "@" in email else ""
                 if domain:
-                    remember_rejected_email_domain(domain)
+                    remember_rejected_email_domain(domain, log_callback=log_callback)
                 raise EmailDomainRejected(domain or email)
             raise RuntimeError(
                 f"CreateEmailValidationCode 失败 http={send_res.get('http_status')} "
