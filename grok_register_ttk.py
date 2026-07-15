@@ -6167,6 +6167,10 @@ def register_via_api_after_otp(
         "password": password,
     }
     return sso, profile
+
+
+_thread_ctx = threading.local()
+_browser_launch_semaphore = threading.Semaphore(2)
 _xvfb_process = None
 _xvfb_lock = threading.Lock()
 
