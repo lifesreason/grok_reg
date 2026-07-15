@@ -144,10 +144,17 @@ DEFAULT_CONFIG = {
     "sub_domain_level": 1,
     "random_sub_domain_level": False,
     "enable_mail_domain_runtime_control": True,
-    "mail_domain_pinpoint_burst": False,  # 黄金矿工：打满当前主域再换
+    "mail_domain_pinpoint_burst": False,  # 黄金矿工/定点爆破
     "mail_domain_prefer_low_failure": True,
     "mail_domain_fail_threshold": 3,
     "mail_domain_fail_cooldown_sec": 600,
+    "enable_mail_domain_grouping": False,
+    "mail_domain_group_count": 2,
+    "mail_domain_group_mode": "auto",  # auto|manual
+    "mail_domain_group_strategy": "round_robin",  # round_robin|exhaust_then_next
+    "mail_domain_groups": [],  # 手动分组时每组逗号域名
+    "disabled_mail_domains": "",  # 手动禁用主域
+    "mail_domain_failure_types": ["discarded_email", "cloudflare_temp_email_network", "capacity_exceeded"],
     "show_tutorial_on_start": True,
     "cloudmail_url": "",
     "cloudmail_admin_email": "",
@@ -413,52 +420,34 @@ def _pick_list_payload(data):
 
 
 def _mail_pool_settings():
-    """读取域名池相关配置。"""
+    """读取域名池完整配置（对齐 openai-cpa）。"""
     import mail_domain_pool as mdp
 
-    domains = mdp.parse_domain_list(config.get("mail_domains") or config.get("defaultDomains") or "")
-    return {
-        "domains": domains,
-        "enable_sub": bool(config.get("enable_sub_domains")),
-        "sub_level": int(config.get("sub_domain_level") or 1),
-        "random_level": bool(config.get("random_sub_domain_level")),
-        "runtime": bool(config.get("enable_mail_domain_runtime_control", True)),
-        "pinpoint": bool(config.get("mail_domain_pinpoint_burst")),
-        "low_fail": bool(config.get("mail_domain_prefer_low_failure", True)),
-        "threshold": int(config.get("mail_domain_fail_threshold") or 3),
-        "cooldown": int(config.get("mail_domain_fail_cooldown_sec") or 600),
-    }
+    return mdp.settings_from_config(config)
 
 
 def pick_configured_mail_domain(log_callback=None):
-    """从 mail_domains/defaultDomains 选主域（含冷却/黄金矿工）。"""
+    """从 mail_domains/defaultDomains 选主域（分组/冷却/黄金矿工/低失败）。"""
     import mail_domain_pool as mdp
 
     settings = _mail_pool_settings()
-    domains = settings["domains"]
+    domains = settings.get("main_domains") or []
     if not domains:
         raise Exception("未配置 mail_domains / defaultDomains，无法生成邮箱域名")
     rejected = set(list_rejected_email_domains())
-    if settings["runtime"]:
-        main = mdp.pick_main_domain(
-            domains,
-            rejected=rejected,
-            pinpoint_burst=settings["pinpoint"],
-            prefer_low_failure=settings["low_fail"],
-        )
-    else:
-        # 简单轮询
-        global _cf_domain_index
-        usable = [d for d in domains if not is_email_domain_rejected(d)]
-        if not usable:
-            raise EmailProviderUnavailable("可用邮件域名均已被拒收")
-        main = usable[_cf_domain_index % len(usable)]
-        _cf_domain_index += 1
-    if log_callback and settings["enable_sub"]:
-        log_callback(
-            f"[*] 域名池选中主域 {main}（子域={'开' if settings['enable_sub'] else '关'}，"
-            f"黄金矿工={'开' if settings['pinpoint'] else '关'}）"
-        )
+    main = mdp.pick_main_domain(settings, rejected=rejected)
+    if log_callback:
+        mode_bits = []
+        if settings.get("enable_sub_domains"):
+            mode_bits.append("子域开")
+        if settings.get("pinpoint"):
+            mode_bits.append("黄金矿工")
+        if settings.get("low_failure"):
+            mode_bits.append("低失败优先")
+        if settings.get("enable_grouping"):
+            mode_bits.append(f"分组:{settings.get('group_strategy')}")
+        extra = ("，" + "/".join(mode_bits)) if mode_bits else ""
+        log_callback(f"[*] 域名池选中主域 {main}{extra}")
     return main
 
 
@@ -470,43 +459,40 @@ def compose_mail_address(main_domain=None, log_callback=None):
     main = main_domain or pick_configured_mail_domain(log_callback=log_callback)
     address = mdp.compose_email_address(
         main,
-        enable_sub_domains=settings["enable_sub"],
-        sub_domain_level=settings["sub_level"],
-        random_sub_domain_level=settings["random_level"],
+        enable_sub_domains=bool(settings.get("enable_sub_domains")),
+        sub_domain_level=int(settings.get("sub_domain_level") or 1),
+        random_sub_domain_level=bool(settings.get("random_sub_domain_level")),
     )
-    if log_callback and settings["enable_sub"]:
+    if log_callback and settings.get("enable_sub_domains"):
         log_callback(f"[*] 多级域名邮箱: {address}")
     return address, main
 
 
 def note_mail_domain_outcome(email_or_domain, success=True, reason="discarded_email", log_callback=None):
     """注册成功/域名拒收时回写域名池统计。"""
-    if not bool(config.get("enable_mail_domain_runtime_control", True)):
-        return
     try:
         import mail_domain_pool as mdp
 
         settings = _mail_pool_settings()
-        main = mdp.main_domain_of(email_or_domain, settings["domains"] or [email_or_domain])
+        if not settings.get("enable_runtime"):
+            return
+        main = mdp.main_domain_of(email_or_domain, settings.get("main_domains") or [email_or_domain])
         if not main:
             return
         if success:
-            mdp.mark_domain_success(main)
+            mdp.record_success(main, settings)
             return
-        info = mdp.mark_domain_failure(
-            main,
-            reason=reason,
-            threshold=settings["threshold"],
-            cooldown_sec=settings["cooldown"],
-        )
+        info = mdp.record_failure(main, reason, settings)
         if log_callback and info.get("cooled"):
+            left = max(0, int(float(info.get("cooldown_until") or 0) - time.time()))
             log_callback(
-                f"[!] 主域 {main} 失败过多，冷却 {settings['cooldown']}s "
-                f"(reason={reason})"
+                f"[!] 主域 {main} 失败过多，冷却约 {left}s "
+                f"(reason={info.get('reason') or reason})"
             )
+        elif log_callback and info.get("already_cooling"):
+            log_callback(f"[Debug] 主域 {main} 仍在冷却中")
     except Exception:
         pass
-
 
 def cloudflare_create_temp_address(api_base, log_callback=None):
     """适配 cloudflare_temp_email：优先指定 domain/name，支持多级子域。
@@ -4550,6 +4536,7 @@ def validate_registration_config(settings):
         "enable_mail_domain_runtime_control",
         "mail_domain_pinpoint_burst",
         "mail_domain_prefer_low_failure",
+        "enable_mail_domain_grouping",
     ):
         raw_bool = normalized.get(bool_key)
         if isinstance(raw_bool, str):
@@ -4579,6 +4566,49 @@ def validate_registration_config(settings):
         )
     except Exception:
         normalized["mail_domain_fail_cooldown_sec"] = 600
+    try:
+        normalized["mail_domain_group_count"] = max(
+            1, min(10, int(normalized.get("mail_domain_group_count") or 2))
+        )
+    except Exception:
+        normalized["mail_domain_group_count"] = 2
+    gmode = str(normalized.get("mail_domain_group_mode") or "auto").strip().lower()
+    normalized["mail_domain_group_mode"] = gmode if gmode in {"auto", "manual"} else "auto"
+    gstrat = str(normalized.get("mail_domain_group_strategy") or "round_robin").strip().lower()
+    normalized["mail_domain_group_strategy"] = (
+        gstrat if gstrat in {"round_robin", "exhaust_then_next"} else "round_robin"
+    )
+    # 互斥：分组 > 黄金矿工 > 低失败（与 cpa 一致）
+    if normalized.get("enable_mail_domain_grouping"):
+        normalized["mail_domain_pinpoint_burst"] = False
+    if normalized.get("mail_domain_pinpoint_burst") and normalized.get("mail_domain_prefer_low_failure"):
+        normalized["mail_domain_prefer_low_failure"] = False
+    # groups
+    raw_groups = normalized.get("mail_domain_groups") or []
+    if isinstance(raw_groups, str):
+        raw_groups = [raw_groups]
+    if not isinstance(raw_groups, list):
+        raw_groups = []
+    groups = [str(x or "").strip() for x in raw_groups]
+    while len(groups) < normalized["mail_domain_group_count"]:
+        groups.append("")
+    normalized["mail_domain_groups"] = groups[: normalized["mail_domain_group_count"]]
+    # failure types
+    raw_ft = normalized.get("mail_domain_failure_types") or "discarded_email"
+    if isinstance(raw_ft, str):
+        ftypes = [x.strip() for x in raw_ft.replace("，", ",").split(",") if x.strip()]
+    else:
+        ftypes = [str(x).strip() for x in (raw_ft or []) if str(x).strip()]
+    allowed_ft = {"discarded_email", "cloudflare_temp_email_network", "capacity_exceeded"}
+    ftypes = [x for x in ftypes if x in allowed_ft] or ["discarded_email"]
+    normalized["mail_domain_failure_types"] = ftypes
+    # disabled
+    if isinstance(normalized.get("disabled_mail_domains"), list):
+        normalized["disabled_mail_domains"] = ",".join(
+            str(x).strip() for x in normalized["disabled_mail_domains"] if str(x).strip()
+        )
+    else:
+        normalized["disabled_mail_domains"] = str(normalized.get("disabled_mail_domains") or "").strip()
     mail_domains = str(normalized.get("mail_domains") or "").strip()
     default_domains = str(normalized.get("defaultDomains") or "").strip()
     if not mail_domains and default_domains:

@@ -314,6 +314,10 @@
                   <input name="mail_domain_prefer_low_failure" type="checkbox" checked />
                   优先低失败主域
                 </label>
+                <label class="check">
+                  <input name="enable_mail_domain_grouping" type="checkbox" />
+                  域名分组（与黄金矿工互斥）
+                </label>
                 <label>
                   失败阈值
                   <input name="mail_domain_fail_threshold" type="number" min="0" max="50" value="3" />
@@ -322,11 +326,40 @@
                   冷却秒数
                   <input name="mail_domain_fail_cooldown_sec" type="number" min="0" max="86400" value="600" />
                 </label>
+                <label>
+                  分组数量
+                  <input name="mail_domain_group_count" type="number" min="1" max="10" value="2" />
+                </label>
+                <label>
+                  分组模式
+                  <select name="mail_domain_group_mode">
+                    <option value="auto">auto（按 mail_domains 顺序均分）</option>
+                    <option value="manual">manual（下方手动分组）</option>
+                  </select>
+                </label>
+                <label>
+                  分组策略
+                  <select name="mail_domain_group_strategy">
+                    <option value="round_robin">round_robin（每轮切组）</option>
+                    <option value="exhaust_then_next">exhaust_then_next（耗尽当前组再切）</option>
+                  </select>
+                </label>
+                <label class="wide">
+                  手动分组（每行一组，逗号分隔主域）
+                  <textarea name="mail_domain_groups_text" rows="3" placeholder="a.com,b.com&#10;c.com,d.com"></textarea>
+                </label>
+                <label class="wide">
+                  禁用主域（逗号分隔，仅主域池内）
+                  <input name="disabled_mail_domains" placeholder="bad.com,temp.bad.com" />
+                </label>
+                <label class="wide">
+                  计入冷却的失败类型
+                  <input name="mail_domain_failure_types" placeholder="discarded_email,cloudflare_temp_email_network,capacity_exceeded" />
+                </label>
               </div>
               <p class="hint">
-                多级子域把创建分散到大量子域名上，减轻 Cloudflare Email Routing / Worker 按主域聚合的日配额压力。
-                黄金矿工适合「某主域暂时最稳」时短时冲量；失败冷却可自动跳过坏域。
-                需在 Cloudflare 为对应主域开 <strong>catch-all</strong> 到 temp-email Worker。
+                多级子域：<code>user@rand.main.com</code>（需 CF catch-all）。黄金矿工=定点爆破同一主域；
+                分组可把域名拆成多组轮转/耗尽切换。失败冷却按主域统计，减轻坏域与日配额踩踏。
               </p>
             </section>
 

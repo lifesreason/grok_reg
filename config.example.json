@@ -59,6 +59,13 @@
   "mail_domain_prefer_low_failure": true,
   "mail_domain_fail_threshold": 3,
   "mail_domain_fail_cooldown_sec": 600,
+  "enable_mail_domain_grouping": false,
+  "mail_domain_group_count": 2,
+  "mail_domain_group_mode": "auto",
+  "mail_domain_group_strategy": "round_robin",
+  "mail_domain_groups": [],
+  "disabled_mail_domains": "",
+  "mail_domain_failure_types": ["discarded_email", "cloudflare_temp_email_network", "capacity_exceeded"],
   "email_provider": "cloudflare",
   "yyds_api_key": "",
   "yyds_jwt": ""

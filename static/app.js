@@ -127,6 +127,17 @@ function formPayload() {
   if (form.elements.mail_domain_prefer_low_failure) {
     data.mail_domain_prefer_low_failure = form.elements.mail_domain_prefer_low_failure.checked;
   }
+  if (form.elements.enable_mail_domain_grouping) {
+    data.enable_mail_domain_grouping = form.elements.enable_mail_domain_grouping.checked;
+  }
+  // 手动分组：textarea 每行一组
+  if (form.elements.mail_domain_groups_text) {
+    const lines = String(form.elements.mail_domain_groups_text.value || "")
+      .split(/\r?\n/)
+      .map((x) => x.trim())
+      .filter(Boolean);
+    data.mail_domain_groups = lines;
+  }
   data.register_count = Number(data.register_count || 1);
   data.register_threads = Number(data.register_threads || 1);
   data.thread_start_interval = Number(data.thread_start_interval || 2);
@@ -141,6 +152,7 @@ function formPayload() {
   data.sub_domain_level = Number(data.sub_domain_level || 1);
   data.mail_domain_fail_threshold = Number(data.mail_domain_fail_threshold || 3);
   data.mail_domain_fail_cooldown_sec = Number(data.mail_domain_fail_cooldown_sec || 600);
+  data.mail_domain_group_count = Number(data.mail_domain_group_count || 2);
   return data;
 }
 
@@ -153,6 +165,10 @@ function applyConfig(config) {
     } else {
       field.value = value ?? "";
     }
+  }
+  if (form.elements.mail_domain_groups_text) {
+    const groups = Array.isArray(config.mail_domain_groups) ? config.mail_domain_groups : [];
+    form.elements.mail_domain_groups_text.value = groups.filter(Boolean).join("\n");
   }
   const paths = [
     config.cloudflare_path_domains,

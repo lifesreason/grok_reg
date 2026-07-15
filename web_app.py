@@ -80,6 +80,42 @@ def update_config(payload: dict):
     return mask_config(validated)
 
 
+@app.get("/api/mail-domain-pool")
+def mail_domain_pool_status():
+    """域名内存池运行时状态（对齐 openai-cpa 统计）。"""
+    try:
+        import mail_domain_pool as mdp
+
+        settings = mdp.settings_from_config(reg.load_config())
+        return {"ok": True, "summary": mdp.runtime_summary(settings)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/mail-domain-pool/reset")
+def mail_domain_pool_reset():
+    try:
+        import mail_domain_pool as mdp
+
+        mdp.reset_runtime()
+        return {"ok": True}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/mail-domain-pool/clear-domain")
+def mail_domain_pool_clear_domain(payload: dict):
+    domain = str((payload or {}).get("domain") or "").strip()
+    if not domain:
+        raise HTTPException(status_code=400, detail="domain required")
+    try:
+        import mail_domain_pool as mdp
+
+        return {"ok": True, "result": mdp.clear_domain_counters(domain)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 def public_account(account):
     item = dict(account)
     item.pop("sso", None)
