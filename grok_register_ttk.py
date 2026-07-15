@@ -6976,8 +6976,12 @@ def create_xai_account_via_http(
     log_callback=None,
     cancel_callback=None,
     allow_create_session_fallback=True,
+    signin_turnstile_token=None,
 ):
-    """对齐 grokcli-2api：POST accounts.x.ai/sign-up Next.js server action 建号。"""
+    """对齐 grokcli-2api：POST accounts.x.ai/sign-up Next.js server action 建号。
+
+    signin_turnstile_token: 若已并行解好 sign-in token，CreateSession 直接用，不再串行等 Solver。
+    """
     if requests is None:
         raise RuntimeError("curl_cffi 未安装，无法 API 建号")
     raise_if_cancelled(cancel_callback)
@@ -7076,24 +7080,26 @@ def create_xai_account_via_http(
             raise RuntimeError(
                 f"create_account HTTP {resp.status_code}: {rsc_body[:300]}"
             )
-        # 精简成功路径：不再扫 set-cookie hop（当前部署基本无效）
-        # create_account → sign-in Turnstile → CreateSession(1 次) → 失败再刷 token 重试 1 次
+        # create_account → CreateSession（优先用预解的 sign-in token，避免再等一轮 Solver）
         if (not sso) and allow_create_session_fallback:
-            if log_callback:
-                log_callback("[*] CreateSession 取会话（sign-in Turnstile）...")
-            sleep_with_cancel(0.8, cancel_callback)
             sitekey = str(config.get("turnstile_sitekey") or "0x4AAAAAAAhr9JGVDZbrZOo0")
-            try:
-                signin_token = solve_turnstile_via_local_solver(
-                    website_url="https://accounts.x.ai/sign-in?redirect=grok-com",
-                    website_key=sitekey,
-                    log_callback=log_callback,
-                    cancel_callback=cancel_callback,
-                )
-            except Exception as ts_exc:
+            signin_token = str(signin_turnstile_token or "").strip()
+            if len(signin_token) < 80:
                 if log_callback:
-                    log_callback(f"[!] sign-in Turnstile 失败: {ts_exc}")
-                signin_token = turnstile_token
+                    log_callback("[*] 解 sign-in Turnstile 供 CreateSession...")
+                try:
+                    signin_token = solve_turnstile_via_local_solver(
+                        website_url="https://accounts.x.ai/sign-in?redirect=grok-com",
+                        website_key=sitekey,
+                        log_callback=log_callback,
+                        cancel_callback=cancel_callback,
+                    )
+                except Exception as ts_exc:
+                    if log_callback:
+                        log_callback(f"[!] sign-in Turnstile 失败: {ts_exc}")
+                    signin_token = turnstile_token
+            elif log_callback:
+                log_callback("[*] CreateSession 使用预解 sign-in token")
             sso = obtain_sso_via_create_session(
                 email,
                 password,
@@ -7114,7 +7120,6 @@ def create_xai_account_via_http(
                         log_callback=log_callback,
                         cancel_callback=cancel_callback,
                     )
-                    sleep_with_cancel(0.5, cancel_callback)
                     sso = obtain_sso_via_create_session(
                         email,
                         password,
@@ -7136,10 +7141,36 @@ def create_xai_account_via_http(
         if log_callback:
             payload = _parse_jwt_payload(sso) or {}
             log_callback(
-                f"[*] 已获取会话 JWT len={len(sso)} "
+                f"[*] 会话就绪 JWT len={len(sso)} "
                 f"sid={str(payload.get('session_id') or payload.get('sid') or payload.get('sub') or '')[:32]}"
             )
         return sso
+
+
+def _solve_turnstile_quiet(website_url, website_key, label, log_callback=None, cancel_callback=None):
+    """Solver 调用：只打开始/结束，去掉处理中刷屏。"""
+    def _log(msg):
+        if not log_callback:
+            return
+        # 过滤轮询噪音
+        if "处理中" in msg or "任务已创建" in msg:
+            return
+        if msg.startswith("[*] 请求 Turnstile"):
+            log_callback(f"[*] {label} Turnstile...")
+            return
+        if "成功" in msg and "token长度" in msg:
+            log_callback(msg.replace("Turnstile Solver 成功", f"{label} Turnstile 成功"))
+            return
+        if msg.startswith("[Debug]"):
+            return
+        log_callback(msg)
+
+    return solve_turnstile_via_local_solver(
+        website_url=website_url,
+        website_key=website_key,
+        log_callback=_log,
+        cancel_callback=cancel_callback,
+    )
 
 
 def register_via_api_after_otp(
@@ -7148,40 +7179,29 @@ def register_via_api_after_otp(
     log_callback=None,
     cancel_callback=None,
 ):
-    """OTP 已在浏览器验证后：Solver 出 token + HTTP create_account 拿 sso。"""
+    """OTP 已在浏览器验证后：并行 Solver + HTTP create_account / CreateSession。"""
     page = _get_page()
     if page is None:
         raise RuntimeError("页面未就绪，无法 API 建号")
 
     given_name, family_name, password = build_profile()
     if log_callback:
-        log_callback(
-            f"[*] API 建号模式：资料 {given_name} {family_name}，"
-            f"Solver + create_account（跳过 SPA Complete sign up）"
-        )
+        log_callback(f"[*] API 建号：{given_name} {family_name}")
 
-    # 1) 页面 HTML + cookies
     try:
         html = page.html or ""
     except Exception:
         html = ""
     if len(html) < 500:
-        # 回拉 sign-up 页
-        if log_callback:
-            log_callback("[Debug] 当前页 HTML 过短，重新打开 sign-up 提取 next-action")
         try:
             page.get(SIGNUP_URL)
-            sleep_with_cancel(2, cancel_callback)
+            sleep_with_cancel(1.2, cancel_callback)
             html = page.html or ""
         except Exception as exc:
             if log_callback:
-                log_callback(f"[Debug] 重开 sign-up 失败: {exc}")
+                log_callback(f"[!] 页面 HTML 不足: {exc}")
     browser_cookies = export_browser_cookies(page)
-    if log_callback:
-        names = [c.get("name") for c in browser_cookies]
-        log_callback(f"[Debug] 浏览器 cookies: {names[:20]}")
 
-    # 2) next-action / router tree（带浏览器 cookie，避免 CF 空响应）
     headers_meta = scrape_signup_next_headers(
         html,
         log_callback=log_callback,
@@ -7190,49 +7210,83 @@ def register_via_api_after_otp(
         page=page,
     )
 
-    # 3) Turnstile token（与业务代理同出口）
     ctx = scrape_turnstile_context_from_page(page)
     website_url = ctx.get("url") or SIGNUP_URL
-    website_key = ctx.get("sitekey") or str(config.get("turnstile_sitekey") or "")
-    if log_callback:
-        log_callback(
-            f"[*] API 建号请求 Solver: key={(website_key or '')[:14]}... "
-            f"proxy={_redact_proxy_for_log(_proxy_for_turnstile_solver()) or '直连'}"
-        )
+    website_key = ctx.get("sitekey") or str(
+        config.get("turnstile_sitekey") or "0x4AAAAAAAhr9JGVDZbrZOo0"
+    )
+    signin_url = "https://accounts.x.ai/sign-in?redirect=grok-com"
     if not probe_local_turnstile_solver():
         raise RuntimeError(
-            f"Turnstile Solver 不可达: {normalize_turnstile_solver_url()}，API 建号需要 Solver"
+            f"Turnstile Solver 不可达: {normalize_turnstile_solver_url()}"
         )
-    turnstile_token = solve_turnstile_via_local_solver(
-        website_url=website_url,
-        website_key=website_key,
-        action=ctx.get("action") or "",
-        cdata=ctx.get("cdata") or "",
-        log_callback=log_callback,
-        cancel_callback=cancel_callback,
-    )
 
-    # 4) HTTP create_account
+    # 并行解 signup + sign-in 两个 token（省掉串行第二轮 ~12s）
+    if log_callback:
+        log_callback("[*] 并行求解 signup/sign-in Turnstile...")
+    signup_token = {"value": "", "error": None}
+    signin_token = {"value": "", "error": None}
+
+    def _job_signup():
+        try:
+            signup_token["value"] = _solve_turnstile_quiet(
+                website_url,
+                website_key,
+                "signup",
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+            )
+        except Exception as exc:
+            signup_token["error"] = exc
+
+    def _job_signin():
+        try:
+            signin_token["value"] = _solve_turnstile_quiet(
+                signin_url,
+                website_key,
+                "sign-in",
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+            )
+        except Exception as exc:
+            signin_token["error"] = exc
+
+    t1 = threading.Thread(target=_job_signup, name="ts-signup", daemon=True)
+    t2 = threading.Thread(target=_job_signin, name="ts-signin", daemon=True)
+    t1.start()
+    t2.start()
+    while t1.is_alive() or t2.is_alive():
+        raise_if_cancelled(cancel_callback)
+        t1.join(timeout=0.4)
+        t2.join(timeout=0.4)
+    if signup_token["error"] or len(str(signup_token["value"] or "")) < 80:
+        raise RuntimeError(f"signup Turnstile 失败: {signup_token['error'] or 'empty'}")
+    if signin_token["error"] or len(str(signin_token["value"] or "")) < 80:
+        # sign-in 失败仍可继续，create_account 后再补
+        if log_callback:
+            log_callback(f"[!] sign-in Turnstile 并行失败，将串行补解: {signin_token['error']}")
+        signin_token["value"] = ""
+
     sso = create_xai_account_via_http(
         email=email,
         given_name=given_name,
         family_name=family_name,
         password=password,
         email_code=email_code,
-        turnstile_token=turnstile_token,
+        turnstile_token=signup_token["value"],
         next_action=headers_meta["next_action"],
         router_state_tree=headers_meta["router_state_tree"],
         browser_cookies=browser_cookies,
         signup_url=SIGNUP_URL,
         log_callback=log_callback,
         cancel_callback=cancel_callback,
+        signin_turnstile_token=signin_token["value"],
     )
-    profile = {
+    return sso, {
         "given_name": given_name,
         "family_name": family_name,
         "password": password,
     }
-    return sso, profile
 
 
 _thread_ctx = threading.local()
@@ -7295,7 +7349,7 @@ def override_user_agent_for_docker(page, log_callback=None):
                           "mobile": False,
                           "wow64": False,
                       })
-        if log_callback:
+        if log_callback and resolve_signup_mode() != "api":
             log_callback(f"[Debug] UA+userAgentData 已覆盖为 Windows: {windows_ua}")
     except Exception as exc:
         if log_callback:
@@ -7325,22 +7379,26 @@ def start_browser(log_callback=None):
                 install_light_stealth_script(page, log_callback=log_callback)
             except Exception:
                 pass
-            if log_callback and getattr(browser, "user_data_path", None):
+            api_mode = resolve_signup_mode() == "api"
+            if log_callback and not api_mode and getattr(browser, "user_data_path", None):
                 log_callback(f"[Debug] 当前浏览器资料目录: {browser.user_data_path}")
             if log_callback:
                 proxy = normalize_proxy_for_runtime(config.get("proxy", ""))
-                mode = "headless" if should_run_headless() else "visible"
-                extension_loaded = os.path.isdir(EXTENSION_PATH)
-                solver_on = bool(config.get("turnstile_solver_enabled", True))
-                log_callback(
-                    f"[Debug] 浏览器模式: {mode}，代理: {proxy or '直连'}，"
-                    f"Turnstile扩展路径: {'存在' if extension_loaded else '未找到'}，"
-                    f"API补丁: {'开' if config.get('turnstile_patch_api') else '关'}，"
-                    f"强制execute: {'开' if config.get('turnstile_force_execute') else '关'}，"
-                    f"Solver: {'开 ' + normalize_turnstile_solver_url() if solver_on else '关'}"
-                )
+                if api_mode:
+                    log_callback(f"[*] 浏览器已启动（API建号） 代理={proxy or '直连'}")
+                else:
+                    mode = "headless" if should_run_headless() else "visible"
+                    extension_loaded = os.path.isdir(EXTENSION_PATH)
+                    solver_on = bool(config.get("turnstile_solver_enabled", True))
+                    log_callback(
+                        f"[Debug] 浏览器模式: {mode}，代理: {proxy or '直连'}，"
+                        f"Turnstile扩展路径: {'存在' if extension_loaded else '未找到'}，"
+                        f"API补丁: {'开' if config.get('turnstile_patch_api') else '关'}，"
+                        f"强制execute: {'开' if config.get('turnstile_force_execute') else '关'}，"
+                        f"Solver: {'开 ' + normalize_turnstile_solver_url() if solver_on else '关'}"
+                    )
             # API 建号路径不依赖浏览器指纹对抗，跳过采样噪音
-            if resolve_signup_mode() != "api":
+            if not api_mode:
                 probe_browser_stealth(page, log_callback=log_callback)
             if log_callback and attempt > 1:
                 log_callback(f"[*] 浏览器第 {attempt} 次启动成功")
@@ -8224,7 +8282,8 @@ try {
 # 本地 Turnstile Solver 探测缓存 / 串行锁（Camoufox 池并发有限）
 _turnstile_solver_probe_cache = {"ok": None, "at": 0.0, "url": ""}
 _turnstile_solver_fail_until = 0.0
-_turnstile_solver_lock = threading.Lock()
+# 允许最多 2 路并行打 Solver（与 TURNSTILE_THREAD 对齐，signup+sign-in 可同时解）
+_turnstile_solver_sem = threading.Semaphore(2)
 _TURNSTILE_SITEKEY_RE = re.compile(r"0x4[0-9A-Za-z_-]{10,}")
 
 
@@ -8527,7 +8586,7 @@ def solve_turnstile_via_local_solver(
         )
 
     # 本地 Camoufox 池有限，串行化避免打爆
-    with _turnstile_solver_lock:
+    with _turnstile_solver_sem:
         raise_if_cancelled(cancel_callback)
         create_body = {"clientKey": client_key, "task": task}
         data, _status = _solver_http_json("POST", "/createTask", create_body, timeout=45)
