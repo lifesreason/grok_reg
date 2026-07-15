@@ -20,4 +20,5 @@ config.local.json
 accounts_*.txt
 mail_credentials.txt
 rejected_email_domains.json
+next_action_cache.json
 oauth_debug_*
