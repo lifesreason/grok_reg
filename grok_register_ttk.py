@@ -186,6 +186,11 @@ class ProfileSessionLost(Exception):
     pass
 
 
+class StaleNextActionError(Exception):
+    """next-action / server action 已过期（HTTP 404 Server action not found）。"""
+    pass
+
+
 def load_config():
     global config
     config = DEFAULT_CONFIG.copy()
@@ -6162,7 +6167,8 @@ _NEXT_ACTION_CACHE = {
     "at": 0.0,
     "html_sig": "",
 }
-_NEXT_ACTION_CACHE_TTL = 24 * 3600  # 24h（部署很少变）
+# xAI 部署会换 next-action；缓存过长会 404 Server action not found
+_NEXT_ACTION_CACHE_TTL = 2 * 3600  # 2h
 _NEXT_ACTION_CACHE_LOCK = threading.Lock()
 
 
@@ -6200,6 +6206,24 @@ def _save_next_action_disk_cache():
             json.dump(payload, handle, ensure_ascii=False)
     except Exception:
         pass
+
+
+def invalidate_next_action_cache(log_callback=None):
+    """next-action 过期（Server action not found）时清缓存。"""
+    with _NEXT_ACTION_CACHE_LOCK:
+        _NEXT_ACTION_CACHE["action"] = ""
+        _NEXT_ACTION_CACHE["router"] = ""
+        _NEXT_ACTION_CACHE["chunk_path"] = ""
+        _NEXT_ACTION_CACHE["at"] = 0.0
+        _NEXT_ACTION_CACHE["html_sig"] = ""
+    path = _next_action_cache_path()
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except Exception:
+        pass
+    if log_callback:
+        log_callback("[*] 已清除 next-action 缓存（将强制重扫）")
 
 
 def _html_action_signature(html):
@@ -7187,6 +7211,13 @@ def create_xai_account_via_http(
         if hard_err:
             raise RuntimeError(f"create_account 被拒绝: {hard_err}")
         if resp.status_code != 200:
+            body_l = (rsc_body or "").lower()
+            if resp.status_code == 404 and "server action not found" in body_l:
+                invalidate_next_action_cache(log_callback=log_callback)
+                raise StaleNextActionError(
+                    f"create_account HTTP 404: Server action not found "
+                    f"(next-action 已失效，请重扫): {(next_action or '')[:20]}"
+                )
             raise RuntimeError(
                 f"create_account HTTP {resp.status_code}: {rsc_body[:300]}"
             )
@@ -7377,21 +7408,52 @@ def register_via_api_after_otp(
             log_callback(f"[!] sign-in Turnstile 并行失败，将串行补解: {signin_token['error']}")
         signin_token["value"] = ""
 
-    sso = create_xai_account_via_http(
-        email=email,
-        given_name=given_name,
-        family_name=family_name,
-        password=password,
-        email_code=email_code,
-        turnstile_token=signup_token["value"],
-        next_action=headers_meta["next_action"],
-        router_state_tree=headers_meta["router_state_tree"],
-        browser_cookies=browser_cookies,
-        signup_url=SIGNUP_URL,
-        log_callback=log_callback,
-        cancel_callback=cancel_callback,
-        signin_turnstile_token=signin_token["value"],
-    )
+    try:
+        sso = create_xai_account_via_http(
+            email=email,
+            given_name=given_name,
+            family_name=family_name,
+            password=password,
+            email_code=email_code,
+            turnstile_token=signup_token["value"],
+            next_action=headers_meta["next_action"],
+            router_state_tree=headers_meta["router_state_tree"],
+            browser_cookies=browser_cookies,
+            signup_url=SIGNUP_URL,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            signin_turnstile_token=signin_token["value"],
+        )
+    except StaleNextActionError as stale_exc:
+        if log_callback:
+            log_callback(f"[!] {stale_exc}；强制重扫 next-action 后重试一次")
+        try:
+            html2 = page.html or html
+        except Exception:
+            html2 = html
+        headers_meta = scrape_signup_next_headers(
+            html2,
+            log_callback=log_callback,
+            proxies=get_proxies(),
+            browser_cookies=browser_cookies,
+            page=page,
+            force_refresh=True,
+        )
+        sso = create_xai_account_via_http(
+            email=email,
+            given_name=given_name,
+            family_name=family_name,
+            password=password,
+            email_code=email_code,
+            turnstile_token=signup_token["value"],
+            next_action=headers_meta["next_action"],
+            router_state_tree=headers_meta["router_state_tree"],
+            browser_cookies=browser_cookies,
+            signup_url=SIGNUP_URL,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            signin_turnstile_token=signin_token["value"],
+        )
     return sso, {
         "given_name": given_name,
         "family_name": family_name,
@@ -7636,21 +7698,54 @@ def register_via_pure_http(log_callback=None, cancel_callback=None):
         except Exception:
             pass
 
-        sso = create_xai_account_via_http(
-            email=email,
-            given_name=given_name,
-            family_name=family_name,
-            password=password,
-            email_code=clean_code,
-            turnstile_token=signup_token["value"],
-            next_action=headers_meta["next_action"],
-            router_state_tree=headers_meta["router_state_tree"],
-            browser_cookies=browser_cookies,
-            signup_url=signup_url,
-            log_callback=log_callback,
-            cancel_callback=cancel_callback,
-            signin_turnstile_token=signin_token["value"],
-        )
+        try:
+            sso = create_xai_account_via_http(
+                email=email,
+                given_name=given_name,
+                family_name=family_name,
+                password=password,
+                email_code=clean_code,
+                turnstile_token=signup_token["value"],
+                next_action=headers_meta["next_action"],
+                router_state_tree=headers_meta["router_state_tree"],
+                browser_cookies=browser_cookies,
+                signup_url=signup_url,
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+                signin_turnstile_token=signin_token["value"],
+            )
+        except StaleNextActionError as stale_exc:
+            if log_callback:
+                log_callback(f"[!] {stale_exc}；强制重扫 next-action 后重试一次")
+            # 重新 GET 页面再扫（部署可能已换 action）
+            try:
+                resp2 = session.get(signup_url, headers=page_headers, timeout=30)
+                html2 = resp2.text or html
+            except Exception:
+                html2 = html
+            headers_meta = scrape_signup_next_headers(
+                html2,
+                log_callback=log_callback,
+                proxies=get_proxies(),
+                browser_cookies=browser_cookies,
+                page=None,
+                force_refresh=True,
+            )
+            sso = create_xai_account_via_http(
+                email=email,
+                given_name=given_name,
+                family_name=family_name,
+                password=password,
+                email_code=clean_code,
+                turnstile_token=signup_token["value"],
+                next_action=headers_meta["next_action"],
+                router_state_tree=headers_meta["router_state_tree"],
+                browser_cookies=browser_cookies,
+                signup_url=signup_url,
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+                signin_turnstile_token=signin_token["value"],
+            )
         return sso, {
             "given_name": given_name,
             "family_name": family_name,
