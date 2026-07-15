@@ -6213,12 +6213,12 @@ def scrape_signup_next_headers(html, log_callback=None, proxies=None, force_refr
         if log_callback:
             log_callback("[Debug] next-router-state-tree 使用 grok-com 兜底结构")
 
-    # ---- next-action from JS chunks（并行，命中即停）----
+    # ---- next-action from JS chunks（串行优先扫，curl_cffi 非线程安全不能并行）----
     js_paths = list(set(re.findall(r'src="(/_next/static/chunks/[^"]+\.js)"', html)))
     if log_callback:
-        log_callback(f"[Debug] 并行扫描 JS chunk 查找 next-action（共 {len(js_paths)}）...")
+        log_callback(f"[Debug] 扫描 JS chunk 查找 next-action（共 {len(js_paths)}）...")
 
-    session_kwargs = {"timeout": 12, "impersonate": "chrome131"}
+    session_kwargs = {"timeout": 15, "impersonate": "chrome131"}
     if proxies:
         session_kwargs["proxies"] = proxies
 
@@ -6226,18 +6226,18 @@ def scrape_signup_next_headers(html, log_callback=None, proxies=None, force_refr
         url = f"https://accounts.x.ai{path}"
         try:
             if requests is None:
-                return path, None, False
+                return None, False
             resp = requests.get(url, **session_kwargs)
             text = resp.text or ""
-            hashes = set(re.findall(r'"([a-f0-9]{42})"', text))
+            hashes = re.findall(r'"([a-f0-9]{42})"', text)
             if not hashes:
-                return path, None, False
+                return None, False
             is_signup = any(h in text for h in _NEXT_ACTION_CHUNK_HINTS)
-            # signup chunk 里优先选 createUser 附近的 hash：先取全部，调用方处理
-            return path, list(hashes), is_signup
+            return hashes[0], is_signup
         except Exception:
-            return path, None, False
+            return None, False
 
+    # 关键字优先；再扫剩余，最多 24 个（通常前几个就命中）
     ordered = sorted(
         js_paths,
         key=lambda p: (
@@ -6245,44 +6245,51 @@ def scrape_signup_next_headers(html, log_callback=None, proxies=None, force_refr
             p,
         ),
     )
-    # 先并行扫前 16 个优先 chunk，通常 1–3 个请求就能命中
-    scan_list = ordered[:16]
     signup_hash = None
     fallback_hash = None
-    try:
-        with ThreadPoolExecutor(max_workers=min(8, max(1, len(scan_list)))) as pool:
-            futures = [pool.submit(_fetch_chunk, p) for p in scan_list]
-            for fut in as_completed(futures):
-                _path, hashes, is_signup = fut.result()
-                if not hashes:
-                    continue
-                if is_signup and not signup_hash:
-                    signup_hash = hashes[0]
-                    # 尽量取消未完成任务
-                    for other in futures:
-                        other.cancel()
-                    break
-                if fallback_hash is None:
-                    fallback_hash = hashes[0]
-    except Exception:
-        # 回退串行少量
-        for path in scan_list[:8]:
-            _path, hashes, is_signup = _fetch_chunk(path)
-            if not hashes:
-                continue
-            if is_signup:
-                signup_hash = hashes[0]
-                break
-            if fallback_hash is None:
-                fallback_hash = hashes[0]
+    scanned = 0
+    for path in ordered[:24]:
+        scanned += 1
+        h, is_signup = _fetch_chunk(path)
+        if not h:
+            continue
+        if is_signup:
+            signup_hash = h
+            break
+        if fallback_hash is None:
+            fallback_hash = h
 
     action_id = signup_hash or fallback_hash
+
+    # 扫描失败：放宽用任意未过期缓存（忽略 html_sig），再不行用已知可用 action
     if not action_id:
-        raise RuntimeError("未能从 JS chunk 提取 next-action，页面结构可能已变化")
+        _load_next_action_disk_cache()
+        with _NEXT_ACTION_CACHE_LOCK:
+            stale_action = str(_NEXT_ACTION_CACHE.get("action") or "")
+            stale_router = str(_NEXT_ACTION_CACHE.get("router") or "")
+            stale_at = float(_NEXT_ACTION_CACHE.get("at") or 0)
+        if stale_action and time.time() - stale_at < 7 * 86400:
+            if log_callback:
+                log_callback(
+                    f"[!] next-action 扫描失败（扫了 {scanned} 个），回退缓存 "
+                    f"{stale_action[:16]}... age={int(time.time() - stale_at)}s"
+                )
+            return {
+                "next_action": stale_action,
+                "router_state_tree": stale_router or router_header,
+            }
+        # 线上已验证可用的 action（部署变更前可顶一阵）
+        known = "7f50061dd2f5b389"
+        # 完整 42 位未知时不硬编；若缓存也没有就报错
+        raise RuntimeError(
+            f"未能从 JS chunk 提取 next-action（扫了 {scanned} 个）。"
+            "可检查代理/网络，或删除 data/next_action_cache.json 后重试"
+        )
+
     if log_callback:
         log_callback(
             f"[Debug] next-action={action_id[:16]}... ({len(action_id)} chars, "
-            f"{'signup-chunk' if signup_hash else 'fallback'}, cached)"
+            f"{'signup-chunk' if signup_hash else 'fallback'}, scanned={scanned})"
         )
 
     with _NEXT_ACTION_CACHE_LOCK:
