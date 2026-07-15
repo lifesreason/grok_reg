@@ -2675,29 +2675,82 @@ def save_xai_oauth_debug_snapshot(page, log_callback=None):
     return saved
 
 
-def set_xai_sso_cookies_for_oauth(page, sso):
+def set_xai_sso_cookies_for_oauth(page, sso, log_callback=None):
+    """把 API 拿到的 sso 注入浏览器，供后续 OAuth 使用。
+
+    CDP Network.setCookie 对 domain/.x.ai 不稳定时，用 url= 多站写入。
+    """
     token = _normalize_sso_token(sso)
     if not page or not token:
         return False
-    cookies = [
-        {"name": "sso", "value": token, "domain": ".x.ai", "path": "/", "secure": True, "httpOnly": True},
-        {"name": "sso-rw", "value": token, "domain": ".x.ai", "path": "/", "secure": True, "httpOnly": True},
-    ]
     ok = False
-    for cookie in cookies:
+    specs = []
+    for url in (
+        "https://auth.x.ai/",
+        "https://accounts.x.ai/",
+        "https://grok.com/",
+    ):
+        for name in ("sso", "sso-rw"):
+            specs.append(
+                {
+                    "name": name,
+                    "value": token,
+                    "url": url,
+                    "path": "/",
+                    "secure": True,
+                    "httpOnly": True,
+                    "sameSite": "None",
+                }
+            )
+    for domain in (".x.ai", ".grok.com", "auth.x.ai", "accounts.x.ai"):
+        for name in ("sso", "sso-rw"):
+            specs.append(
+                {
+                    "name": name,
+                    "value": token,
+                    "domain": domain,
+                    "path": "/",
+                    "secure": True,
+                    "httpOnly": True,
+                }
+            )
+    for cookie in specs:
         try:
             page.run_cdp("Network.setCookie", **cookie)
             ok = True
         except Exception:
-            pass
+            continue
     try:
         setter = getattr(getattr(page, "set", None), "cookies", None)
         if setter:
-            setter(cookies)
+            setter(
+                [
+                    {"name": "sso", "value": token, "domain": ".x.ai", "path": "/"},
+                    {"name": "sso-rw", "value": token, "domain": ".x.ai", "path": "/"},
+                ]
+            )
             ok = True
     except Exception:
         pass
-    return ok
+    # 校验 cookie 是否在 jar
+    present = False
+    try:
+        raw = page.cookies(all_domains=True, all_info=True) or []
+        for item in raw:
+            name = item.get("name") if isinstance(item, dict) else getattr(item, "name", "")
+            value = item.get("value") if isinstance(item, dict) else getattr(item, "value", "")
+            if str(name) == "sso" and str(value or "").strip():
+                present = True
+                break
+    except Exception:
+        pass
+    if log_callback:
+        payload = _parse_jwt_payload(token) or {}
+        log_callback(
+            f"[Debug] 注入 sso 到浏览器: ok={ok} present={present} "
+            f"len={len(token)} session_id={str(payload.get('session_id') or '')[:24]}"
+        )
+    return ok and present
 
 
 def exchange_xai_oauth_code_for_token(code, code_verifier, redirect_uri=None):
@@ -3044,8 +3097,29 @@ def fetch_xai_oauth_refresh_token(sso, timeout=90, log_callback=None, cancel_cal
     auth_url = build_xai_oauth_authorize_url(state, code_challenge, nonce)
     if log_callback:
         log_callback("[*] 获取 xAI OAuth Refresh Token...")
-    set_xai_sso_cookies_for_oauth(page, token)
+    # 先落到 auth 域再种 cookie，避免仍停在 sign-up 时空种
+    try:
+        page.get("https://auth.x.ai/")
+        sleep_with_cancel(0.8, cancel_callback)
+    except Exception:
+        pass
+    injected = set_xai_sso_cookies_for_oauth(page, token, log_callback=log_callback)
+    if not injected and log_callback:
+        log_callback("[!] sso cookie 注入未确认成功，OAuth 可能落到登录页")
+    # 种 cookie 后再打开 authorize
     page.get(auth_url)
+    sleep_with_cancel(1.0, cancel_callback)
+    # 若落到 sign-in，再种一次并重开
+    try:
+        cur = str(getattr(page, "url", "") or "")
+        if "sign-in" in cur or "login" in cur.lower():
+            if log_callback:
+                log_callback("[*] OAuth 落到登录页，重新注入 sso 并重开 authorize")
+            set_xai_sso_cookies_for_oauth(page, token, log_callback=log_callback)
+            page.get(auth_url)
+            sleep_with_cancel(1.2, cancel_callback)
+    except Exception:
+        pass
 
     deadline = time.time() + timeout
     last_url = ""
@@ -3074,6 +3148,9 @@ def fetch_xai_oauth_refresh_token(sso, timeout=90, log_callback=None, cancel_cal
             and current_url == consent_submitted_url
         )
         if not waiting_after_submit:
+            # 登录页时再尝试注入
+            if "sign-in" in current_url:
+                set_xai_sso_cookies_for_oauth(page, token, log_callback=None)
             click_result = _click_xai_oauth_consent_if_present(page)
             if isinstance(click_result, dict) and (click_result.get("clicked") or click_result.get("submitted")):
                 consent_submitted_at = time.time()
@@ -5886,46 +5963,219 @@ def scrape_signup_next_headers(html, log_callback=None, proxies=None):
     return {"next_action": action_id, "router_state_tree": router_header}
 
 
+def _normalize_rsc_text(rsc_body):
+    text = str(rsc_body or "")
+    for _ in range(3):
+        nxt = (
+            text.replace("\\u0026", "&")
+            .replace("\\u003d", "=")
+            .replace("\\u003f", "?")
+            .replace("\\u002F", "/")
+            .replace("\\u002f", "/")
+            .replace("\\/", "/")
+            .replace("&amp;", "&")
+        )
+        if nxt == text:
+            break
+        text = nxt
+    return text
+
+
+def _parse_jwt_payload(token):
+    try:
+        parts = str(token or "").split(".")
+        if len(parts) < 2:
+            return None
+        raw = parts[1]
+        raw += "=" * ((4 - len(raw) % 4) % 4)
+        return json.loads(base64.urlsafe_b64decode(raw.encode("ascii")))
+    except Exception:
+        return None
+
+
+def _looks_like_sso_session_jwt(token):
+    """sso cookie JWT 通常带 session_id；过滤 RSC 里的其它 JWT 误匹配。"""
+    token = str(token or "").strip()
+    if not token.startswith("eyJ") or token.count(".") < 2:
+        return False
+    payload = _parse_jwt_payload(token) or {}
+    if not isinstance(payload, dict):
+        return False
+    # 真实 sso 常见字段
+    if payload.get("session_id") or payload.get("sid") or payload.get("sub"):
+        return True
+    # 过短 payload 多半不是会话 cookie
+    return len(token) >= 80 and bool(payload)
+
+
 def extract_sso_from_http_result(set_cookies=None, body="", cookie_jar=None):
-    """从 Set-Cookie / RSC body / session jar 提取 sso。"""
+    """从 Set-Cookie / RSC body / session jar 提取 sso（仅接受会话 JWT）。"""
     patterns = [
-        re.compile(r"(?:^|,\s*)sso=([^;,\s]+)", re.I),
-        re.compile(r"sso=(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)"),
+        re.compile(
+            r"(?:^|,\s*)sso=(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)",
+            re.I,
+        ),
     ]
     for raw in set_cookies or []:
         text = str(raw or "")
         for pat in patterns:
             m = pat.search(text)
-            if m:
+            if m and _looks_like_sso_session_jwt(m.group(1)):
                 return m.group(1).strip()
-    body_text = str(body or "")
-    m = re.search(r"sso=(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)", body_text)
-    if m:
-        return m.group(1).strip()
+    body_text = _normalize_rsc_text(body)
     m = re.search(
-        r"set-cookie\?q=(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)",
+        r'(?:^|[;,\s\'"\\])sso=(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)',
         body_text,
-        flags=re.I,
+        flags=re.I | re.M,
     )
-    if m:
+    if m and _looks_like_sso_session_jwt(m.group(1)):
         return m.group(1).strip()
     if cookie_jar is not None:
         try:
             if hasattr(cookie_jar, "get"):
-                for domain in (".x.ai", "accounts.x.ai", ".grok.com", None):
+                for domain in (".x.ai", "accounts.x.ai", ".grok.com", "auth.x.ai", None):
                     try:
                         val = (
                             cookie_jar.get("sso", domain=domain)
                             if domain is not None
                             else cookie_jar.get("sso")
                         )
-                        if val:
+                        if val and _looks_like_sso_session_jwt(val):
                             return str(val).strip()
                     except Exception:
                         pass
         except Exception:
             pass
     return ""
+
+
+def extract_sso_via_set_cookie_chain(rsc_body, session=None, proxies=None, log_callback=None):
+    """对齐 grokcli-2api：跟随 RSC 中的 set-cookie?q=JWT 链路拿真实 sso。
+
+    create_account 的 200 RSC 往往不直接 Set-Cookie sso，而需要 hop
+    auth.grokusercontent.com/set-cookie 等。
+    """
+    text = _normalize_rsc_text(rsc_body)
+    # 先尝试直接 sso=
+    direct = extract_sso_from_http_result([], text, None)
+    if direct:
+        if log_callback:
+            payload = _parse_jwt_payload(direct) or {}
+            log_callback(
+                f"[Debug] RSC 直接含 sso JWT len={len(direct)} "
+                f"session_id={str(payload.get('session_id') or payload.get('sid') or '')[:24]}"
+            )
+        return direct
+
+    hop_urls = []
+    for m in re.finditer(
+        r'https?://[^\s"\'<>\\]+set-cookie/?\?q='
+        r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
+        text,
+        flags=re.I,
+    ):
+        url = m.group(0)
+        if url not in hop_urls:
+            hop_urls.append(url)
+    for m in re.finditer(
+        r'/[^\s"\'<>\\]*set-cookie/?\?q='
+        r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
+        text,
+        flags=re.I,
+    ):
+        url = "https://accounts.x.ai" + m.group(0)
+        if url not in hop_urls:
+            hop_urls.append(url)
+    # JWT near set-cookie → reconstruct
+    if not hop_urls:
+        m = re.search(
+            r"set-cookie[^e]{0,80}(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)",
+            text,
+            flags=re.I,
+        )
+        if m:
+            hop_urls.append(f"https://auth.grokusercontent.com/set-cookie?q={m.group(1)}")
+
+    # expand success_url from JWT payload
+    expanded = list(hop_urls)
+    for hop in list(hop_urls):
+        m = re.search(r"q=(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)", hop)
+        if not m:
+            continue
+        payload = _parse_jwt_payload(m.group(1)) or {}
+        success = str(payload.get("success_url") or payload.get("successUrl") or "").strip()
+        if success.startswith("http") and success not in expanded:
+            expanded.append(success)
+    hop_urls = expanded
+
+    if log_callback:
+        log_callback(f"[Debug] SSO set-cookie 链路候选: {len(hop_urls)}")
+
+    if not hop_urls:
+        return ""
+
+    own_session = session is None
+    if own_session:
+        if requests is None:
+            return ""
+        sk = {"impersonate": "chrome131", "timeout": 30}
+        if proxies:
+            sk["proxies"] = proxies
+        session = requests.Session(**sk)
+
+    headers = {
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "user-agent": get_user_agent(),
+        "sec-fetch-site": "cross-site",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-dest": "document",
+        "referer": "https://accounts.x.ai/",
+    }
+    token = ""
+    try:
+        for hop in hop_urls[:8]:
+            try:
+                resp = session.get(hop, headers=headers, allow_redirects=True)
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[Debug] SSO hop 失败: {str(exc)[:120]}")
+                continue
+            set_cookies = []
+            try:
+                if hasattr(resp.headers, "get_list"):
+                    set_cookies = resp.headers.get_list("set-cookie") or []
+                else:
+                    raw_sc = resp.headers.get("set-cookie")
+                    if raw_sc:
+                        set_cookies = [raw_sc] if isinstance(raw_sc, str) else list(raw_sc)
+            except Exception:
+                set_cookies = []
+            token = extract_sso_from_http_result(set_cookies, resp.text or "", session.cookies)
+            if log_callback:
+                log_callback(
+                    f"[Debug] SSO hop HTTP {resp.status_code} "
+                    f"set_cookies={len(set_cookies)} sso={'yes' if token else 'no'} "
+                    f"url={hop[:80]}"
+                )
+            if token:
+                break
+            # follow Location if any leftover
+            loc = ""
+            try:
+                loc = str(resp.headers.get("location") or resp.headers.get("Location") or "")
+            except Exception:
+                loc = ""
+            if loc.startswith("/"):
+                loc = "https://accounts.x.ai" + loc
+            if loc.startswith("http") and loc not in hop_urls:
+                hop_urls.append(loc)
+    finally:
+        if own_session:
+            try:
+                session.close()
+            except Exception:
+                pass
+    return token
 
 
 def extract_signup_hard_error(rsc_body):
@@ -6060,7 +6310,7 @@ def create_xai_account_via_http(
         if log_callback:
             log_callback(
                 f"[*] create_account HTTP {resp.status_code} hard_error={hard_err!r} "
-                f"sso={'yes' if sso else 'no'} body_len={len(rsc_body)} "
+                f"direct_sso={'yes' if sso else 'no'} body_len={len(rsc_body)} "
                 f"preview={rsc_body[:180]!r}"
             )
         if hard_err:
@@ -6069,13 +6319,26 @@ def create_xai_account_via_http(
             raise RuntimeError(
                 f"create_account HTTP {resp.status_code}: {rsc_body[:300]}"
             )
-        if not sso:
-            # 部分成功响应延迟写 cookie，再读 jar
-            sso = extract_sso_from_http_result([], rsc_body, session.cookies)
-        if not sso:
+        if not sso or not _looks_like_sso_session_jwt(sso):
+            # 关键：跟随 RSC 里的 set-cookie JWT 链路（与 grokcli-2api 一致）
+            if log_callback:
+                log_callback("[*] create_account 未直接返回 sso，跟随 set-cookie 链路...")
+            sso = extract_sso_via_set_cookie_chain(
+                rsc_body,
+                session=session,
+                proxies=proxies,
+                log_callback=log_callback,
+            )
+        if not sso or not _looks_like_sso_session_jwt(sso):
             raise RuntimeError(
-                "create_account 成功但未拿到 sso；"
+                "create_account 成功但未拿到有效 sso（需 set-cookie 链路）；"
                 f"set_cookies={len(set_cookies)} preview={rsc_body[:240]!r}"
+            )
+        if log_callback:
+            payload = _parse_jwt_payload(sso) or {}
+            log_callback(
+                f"[*] 已获取有效 sso JWT len={len(sso)} "
+                f"session_id={str(payload.get('session_id') or payload.get('sid') or '')[:32]}"
             )
         return sso
 
