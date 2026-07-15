@@ -150,6 +150,56 @@
               <p class="hint">建议：并发先 1，代理用干净住宅 IP，账号间隔 10–20 秒；连续封禁时自动熔断，避免同出口继续送死。</p>
             </section>
 
+            <section class="config-section" data-config-section="Turnstile">
+              <div class="section-copy">
+                <p class="section-kicker">Cloudflare</p>
+                <h2>Turnstile Solver（推荐）</h2>
+              </div>
+              <div class="config-grid">
+                <label class="check">
+                  <input name="turnstile_solver_enabled" type="checkbox" checked />
+                  启用本地/远端 Solver（YesCaptcha 协议，参考 grokcli-2api/turnstile-solver）
+                </label>
+                <label class="check">
+                  <input name="turnstile_solver_fallback_click" type="checkbox" checked />
+                  Solver 失败时回退 shadow/CDP 点选
+                </label>
+                <label class="wide">
+                  Solver 地址
+                  <input name="turnstile_solver_url" placeholder="http://127.0.0.1:5072（Docker 内自动映射 host.docker.internal）" />
+                </label>
+                <label>
+                  Client Key
+                  <input name="turnstile_solver_client_key" placeholder="local" />
+                </label>
+                <label>
+                  Solver 超时(秒)
+                  <input name="turnstile_solver_timeout" type="number" min="30" max="300" step="1" value="120" />
+                </label>
+                <label class="wide">
+                  Sitekey 回退
+                  <input name="turnstile_sitekey" placeholder="0x4AAAAAAAhr9JGVDZbrZOo0" />
+                </label>
+                <label>
+                  资料页等 token(秒)
+                  <input name="turnstile_wait_seconds" type="number" min="45" max="300" step="1" value="120" />
+                </label>
+                <label class="check">
+                  <input name="turnstile_patch_api" type="checkbox" />
+                  补丁 window.turnstile API（默认关，手动能过时勿开）
+                </label>
+                <label class="check">
+                  <input name="turnstile_force_execute" type="checkbox" />
+                  强制 turnstile.execute（默认关）
+                </label>
+              </div>
+              <p class="hint">
+                优先用 Camoufox 本地 solver 出 token 再回填页面，比在注册浏览器里硬点 checkbox 稳。
+                启动示例：在 <code>grokcli-2api/turnstile-solver</code> 执行 <code>./start.sh</code>，
+                确认 <code>http://127.0.0.1:5072/health</code> 可用。
+              </p>
+            </section>
+
             <section class="config-section" data-config-section="邮箱服务">
               <div class="section-copy">
                 <p class="section-kicker">邮箱服务</p>

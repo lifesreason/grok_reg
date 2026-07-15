@@ -11,6 +11,8 @@ services:
       GROK_REG_HEADLESS: "0"
       CHROME_BIN: /usr/bin/browser
       TZ: Asia/Shanghai
+      # 独立 turnstile-solver；同 compose 网络可用 http://turnstile-solver:5072
+      GROK_REG_TURNSTILE_SOLVER_URL: "${GROK_REG_TURNSTILE_SOLVER_URL:-http://host.docker.internal:5072}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

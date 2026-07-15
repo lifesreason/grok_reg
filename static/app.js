@@ -97,6 +97,18 @@ function formPayload() {
   data.grok2api_auto_add_remote = form.elements.grok2api_auto_add_remote.checked;
   data.sub2api_auto_import_remote = form.elements.sub2api_auto_import_remote.checked;
   data.cpa_auto_push_remote = form.elements.cpa_auto_push_remote.checked;
+  if (form.elements.turnstile_solver_enabled) {
+    data.turnstile_solver_enabled = form.elements.turnstile_solver_enabled.checked;
+  }
+  if (form.elements.turnstile_solver_fallback_click) {
+    data.turnstile_solver_fallback_click = form.elements.turnstile_solver_fallback_click.checked;
+  }
+  if (form.elements.turnstile_patch_api) {
+    data.turnstile_patch_api = form.elements.turnstile_patch_api.checked;
+  }
+  if (form.elements.turnstile_force_execute) {
+    data.turnstile_force_execute = form.elements.turnstile_force_execute.checked;
+  }
   data.register_count = Number(data.register_count || 1);
   data.register_threads = Number(data.register_threads || 1);
   data.thread_start_interval = Number(data.thread_start_interval || 2);
@@ -106,6 +118,8 @@ function formPayload() {
   data.sub2api_concurrency = Number(data.sub2api_concurrency || 3);
   data.sub2api_priority = Number(data.sub2api_priority || 50);
   data.cpa_push_workers = Number(data.cpa_push_workers || 3);
+  data.turnstile_solver_timeout = Number(data.turnstile_solver_timeout || 120);
+  data.turnstile_wait_seconds = Number(data.turnstile_wait_seconds || 120);
   return data;
 }
 

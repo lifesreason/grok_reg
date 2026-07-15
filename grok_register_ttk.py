@@ -121,6 +121,15 @@ DEFAULT_CONFIG = {
     "turnstile_force_execute": False,
     # 资料页等 token 的最长时间（秒）
     "turnstile_wait_seconds": 120,
+    # 方案 A：优先走本地/远端 Turnstile Solver（YesCaptcha 协议，参考 grokcli-2api/turnstile-solver）。
+    # 默认开启；solver 不可达时自动回退 shadow/CDP 点选。
+    "turnstile_solver_enabled": True,
+    "turnstile_solver_url": "http://127.0.0.1:5072",
+    "turnstile_solver_client_key": "local",
+    "turnstile_solver_timeout": 120,
+    "turnstile_solver_fallback_click": True,
+    # accounts.x.ai 公开 sitekey（页面刮不到时回退；非密钥）
+    "turnstile_sitekey": "0x4AAAAAAAhr9JGVDZbrZOo0",
     "show_tutorial_on_start": True,
     "cloudmail_url": "",
     "cloudmail_admin_email": "",
@@ -261,6 +270,17 @@ def normalize_proxy_for_runtime(proxy):
     if not in_docker:
         return raw
     return re.sub(r"(?<=://)(127\.0\.0\.1|localhost)(?=[:/]|$)", "host.docker.internal", raw)
+
+
+def normalize_turnstile_solver_url(url=None):
+    """Docker 内把 loopback solver 地址映射到宿主机。"""
+    raw = str(url if url is not None else config.get("turnstile_solver_url") or "").strip()
+    if not raw:
+        raw = "http://127.0.0.1:5072"
+    env_url = str(os.environ.get("GROK_REG_TURNSTILE_SOLVER_URL") or "").strip()
+    if env_url:
+        raw = env_url
+    return normalize_proxy_for_runtime(raw).rstrip("/")
 
 
 def _env_truthy(name, default="0"):
@@ -4052,7 +4072,12 @@ def validate_registration_config(settings):
     normalized["stop_on_consecutive_blocks"] = _parse_positive_int(
         normalized.get("stop_on_consecutive_blocks"), 3, minimum=0, maximum=50
     )
-    for bool_key in ("turnstile_patch_api", "turnstile_force_execute"):
+    for bool_key in (
+        "turnstile_patch_api",
+        "turnstile_force_execute",
+        "turnstile_solver_enabled",
+        "turnstile_solver_fallback_click",
+    ):
         raw_bool = normalized.get(bool_key)
         if isinstance(raw_bool, str):
             normalized[bool_key] = raw_bool.strip().lower() in {"1", "true", "yes", "on"}
@@ -4063,6 +4088,20 @@ def validate_registration_config(settings):
     except Exception:
         wait_seconds = 120.0
     normalized["turnstile_wait_seconds"] = max(45.0, min(wait_seconds, 300.0))
+    solver_url = str(normalized.get("turnstile_solver_url") or "").strip() or "http://127.0.0.1:5072"
+    normalized["turnstile_solver_url"] = solver_url.rstrip("/")
+    normalized["turnstile_solver_client_key"] = str(
+        normalized.get("turnstile_solver_client_key") or "local"
+    ).strip() or "local"
+    try:
+        solver_timeout = float(normalized.get("turnstile_solver_timeout", 120) or 120)
+    except Exception:
+        solver_timeout = 120.0
+    normalized["turnstile_solver_timeout"] = max(30.0, min(solver_timeout, 300.0))
+    sitekey = str(normalized.get("turnstile_sitekey") or "").strip()
+    if not sitekey:
+        sitekey = DEFAULT_CONFIG.get("turnstile_sitekey") or "0x4AAAAAAAhr9JGVDZbrZOo0"
+    normalized["turnstile_sitekey"] = sitekey
     normalized["sub2api_concurrency"] = _parse_positive_int(
         normalized.get("sub2api_concurrency"), 3, minimum=0, maximum=1000
     )
@@ -5709,11 +5748,13 @@ def start_browser(log_callback=None):
                 proxy = normalize_proxy_for_runtime(config.get("proxy", ""))
                 mode = "headless" if should_run_headless() else "visible"
                 extension_loaded = os.path.isdir(EXTENSION_PATH)
+                solver_on = bool(config.get("turnstile_solver_enabled", True))
                 log_callback(
                     f"[Debug] 浏览器模式: {mode}，代理: {proxy or '直连'}，"
                     f"Turnstile扩展路径: {'存在' if extension_loaded else '未找到'}，"
                     f"API补丁: {'开' if config.get('turnstile_patch_api') else '关'}，"
-                    f"强制execute: {'开' if config.get('turnstile_force_execute') else '关'}"
+                    f"强制execute: {'开' if config.get('turnstile_force_execute') else '关'}，"
+                    f"Solver: {'开 ' + normalize_turnstile_solver_url() if solver_on else '关'}"
                 )
             probe_browser_stealth(page, log_callback=log_callback)
             if log_callback and attempt > 1:
@@ -6595,11 +6636,408 @@ try {
         return {"ok": False, "actions": actions + [f"fatal:{exc}"]}
 
 
+# 本地 Turnstile Solver 探测缓存 / 串行锁（Camoufox 池并发有限）
+_turnstile_solver_probe_cache = {"ok": None, "at": 0.0, "url": ""}
+_turnstile_solver_fail_until = 0.0
+_turnstile_solver_lock = threading.Lock()
+_TURNSTILE_SITEKEY_RE = re.compile(r"0x4[0-9A-Za-z_-]{10,}")
+
+
+def scrape_turnstile_sitekey_text(text):
+    """从 HTML/JS 文本中提取 Turnstile sitekey。"""
+    raw = str(text or "")
+    patterns = (
+        r'sitekey["\']\s*[:=]\s*["\'](0x4[0-9A-Za-z_-]{10,})["\']',
+        r'data-sitekey=["\'](0x4[0-9A-Za-z_-]{10,})["\']',
+        r'Turnstile[^"\']{0,80}["\'](0x4[0-9A-Za-z_-]{10,})["\']',
+        r'(0x4AAAAA[0-9A-Za-z_-]{8,})',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, raw, flags=re.I)
+        if match:
+            key = str(match.group(1) or "").strip()
+            if _TURNSTILE_SITEKEY_RE.fullmatch(key):
+                return key
+    match = _TURNSTILE_SITEKEY_RE.search(raw)
+    return match.group(0) if match else ""
+
+
+def scrape_turnstile_context_from_page(page):
+    """从当前资料页读取 websiteURL / sitekey / action / cdata。"""
+    fallback_key = str(config.get("turnstile_sitekey") or DEFAULT_CONFIG.get("turnstile_sitekey") or "").strip()
+    detail = {
+        "url": "",
+        "sitekey": "",
+        "action": "",
+        "cdata": "",
+        "source": "",
+    }
+    if not page:
+        detail["sitekey"] = fallback_key
+        detail["source"] = "fallback-config"
+        return detail
+    try:
+        raw = page.run_js(
+            r"""
+const out = {
+  url: String(location.href || ''),
+  sitekey: '',
+  action: '',
+  cdata: '',
+  source: '',
+};
+try {
+  const hook = window.__grokTurnstile || {};
+  const widgets = Array.isArray(hook.widgets) ? hook.widgets : [];
+  for (let i = widgets.length - 1; i >= 0; i--) {
+    const w = widgets[i] || {};
+    const key = String(w.sitekey || '').trim();
+    if (key) {
+      out.sitekey = key;
+      out.action = String(w.action || '');
+      out.cdata = String(w.cData || w.cdata || '');
+      out.source = 'hook-widget';
+      break;
+    }
+  }
+} catch (e) {}
+if (!out.sitekey) {
+  const nodes = Array.from(document.querySelectorAll('[data-sitekey], div.cf-turnstile, .cf-turnstile'));
+  for (const node of nodes) {
+    const key = String(node.getAttribute('data-sitekey') || '').trim();
+    if (key) {
+      out.sitekey = key;
+      out.action = String(node.getAttribute('data-action') || '');
+      out.cdata = String(node.getAttribute('data-cdata') || '');
+      out.source = 'dom-sitekey';
+      break;
+    }
+  }
+}
+if (!out.sitekey) {
+  try {
+    const html = String(document.documentElement && document.documentElement.outerHTML || '').slice(0, 250000);
+    const patterns = [
+      /sitekey["']\s*[:=]\s*["'](0x4[0-9A-Za-z_-]{10,})["']/i,
+      /data-sitekey=["'](0x4[0-9A-Za-z_-]{10,})["']/i,
+      /(0x4AAAAA[0-9A-Za-z_-]{8,})/,
+    ];
+    for (const re of patterns) {
+      const m = html.match(re);
+      if (m && m[1]) { out.sitekey = m[1]; out.source = 'html-scan'; break; }
+    }
+  } catch (e) {}
+}
+return out;
+            """
+        )
+        if isinstance(raw, dict):
+            detail.update({k: raw.get(k) or detail.get(k) for k in detail})
+            detail["url"] = str(raw.get("url") or detail["url"] or "")
+            detail["sitekey"] = str(raw.get("sitekey") or "").strip()
+            detail["action"] = str(raw.get("action") or "").strip()
+            detail["cdata"] = str(raw.get("cdata") or "").strip()
+            detail["source"] = str(raw.get("source") or "").strip()
+    except Exception as exc:
+        detail["source"] = f"js-error:{str(exc)[:80]}"
+    if not detail["sitekey"]:
+        try:
+            html = page.html or ""
+        except Exception:
+            html = ""
+        scraped = scrape_turnstile_sitekey_text(html)
+        if scraped:
+            detail["sitekey"] = scraped
+            detail["source"] = detail["source"] or "page-html"
+    if not detail["sitekey"] and fallback_key:
+        detail["sitekey"] = fallback_key
+        detail["source"] = detail["source"] or "fallback-config"
+    if not detail["url"]:
+        try:
+            detail["url"] = str(getattr(page, "url", "") or "")
+        except Exception:
+            detail["url"] = ""
+    if not detail["url"]:
+        detail["url"] = "https://accounts.x.ai/sign-up"
+    return detail
+
+
+def inject_turnstile_token_to_page(page, token):
+    """把外部 solver 拿到的 token 写回页面 hidden input，并尽量暴露给 getResponse。"""
+    token = str(token or "").strip()
+    if not page or len(token) < 80:
+        return 0
+    try:
+        value = page.run_js(
+            r"""
+const token = String(arguments[0] || '').trim();
+if (!token) return 0;
+let wrote = 0;
+const inputs = Array.from(document.querySelectorAll(
+  'input[name="cf-turnstile-response"], input[name*="turnstile"], textarea[name="cf-turnstile-response"]'
+));
+if (!inputs.length) {
+  const input = document.createElement('input');
+  input.type = 'hidden';
+  input.name = 'cf-turnstile-response';
+  document.body.appendChild(input);
+  inputs.push(input);
+}
+const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+for (const input of inputs) {
+  try {
+    if (nativeSetter) nativeSetter.call(input, token);
+    else input.value = token;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    wrote = Math.max(wrote, String(input.value || '').trim().length);
+  } catch (e) {}
+}
+try {
+  window.__grokTurnstile = window.__grokTurnstile || {};
+  window.__grokTurnstile.lastToken = token;
+  window.__grokTurnstile.callbackCount = (window.__grokTurnstile.callbackCount || 0) + 1;
+  window.__grokTurnstile.externalInjected = true;
+} catch (e) {}
+try {
+  if (window.turnstile) {
+    try {
+      window.turnstile.getResponse = function () { return token; };
+    } catch (e) {}
+  }
+} catch (e) {}
+return wrote;
+            """,
+            token,
+        )
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+def _solver_http_json(method, path, payload=None, timeout=20.0):
+    """直连 solver（不走业务代理），返回 JSON dict。"""
+    if requests is None:
+        raise RuntimeError("curl_cffi 未安装，无法请求 Turnstile Solver")
+    base = normalize_turnstile_solver_url()
+    url = f"{base}{path if str(path).startswith('/') else '/' + str(path)}"
+    kwargs = {
+        "timeout": timeout,
+        "proxies": {},
+        "headers": {"Content-Type": "application/json", "Accept": "application/json"},
+    }
+    if method.upper() == "GET":
+        resp = requests.get(url, **kwargs)
+    else:
+        resp = requests.post(url, json=payload or {}, **kwargs)
+    try:
+        data = resp.json()
+    except Exception:
+        raise RuntimeError(f"Turnstile Solver 非 JSON 响应 HTTP {resp.status_code}: {resp.text[:200]}")
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Turnstile Solver 返回非对象: {data!r}")
+    return data, resp.status_code
+
+
+def probe_local_turnstile_solver(force=False, timeout=2.0):
+    """探测本地/远端 YesCaptcha 协议 solver 是否可用。"""
+    if not bool(config.get("turnstile_solver_enabled", True)):
+        return False
+    url = normalize_turnstile_solver_url()
+    now = time.time()
+    cache = _turnstile_solver_probe_cache
+    if (
+        not force
+        and cache.get("url") == url
+        and cache.get("ok") is not None
+        and now - float(cache.get("at") or 0) < 30
+    ):
+        return bool(cache["ok"])
+    ok = False
+    try:
+        data, status = _solver_http_json("GET", "/health", timeout=timeout)
+        ok = status == 200 and (data.get("ok") is True or data.get("status") in {"ok", "ready", True})
+    except Exception:
+        ok = False
+    if not ok:
+        # 兼容未暴露 /health 的 solver：用 createTask 空校验不合适，只记失败
+        ok = False
+    cache["ok"] = ok
+    cache["at"] = now
+    cache["url"] = url
+    return ok
+
+
+def solve_turnstile_via_local_solver(
+    website_url,
+    website_key,
+    action="",
+    cdata="",
+    log_callback=None,
+    cancel_callback=None,
+    timeout=None,
+):
+    """YesCaptcha 协议：POST /createTask + 轮询 /getTaskResult，返回 token。
+
+    兼容 grokcli-2api/turnstile-solver（Camoufox）以及远端 YesCaptcha。
+    """
+    website_url = str(website_url or "").strip()
+    website_key = str(website_key or "").strip()
+    if not website_url or not website_key:
+        raise ValueError("website_url 与 website_key 不能为空")
+    try:
+        timeout = float(timeout if timeout is not None else config.get("turnstile_solver_timeout", 120) or 120)
+    except Exception:
+        timeout = 120.0
+    timeout = max(30.0, min(timeout, 300.0))
+    client_key = str(config.get("turnstile_solver_client_key") or "local").strip() or "local"
+    base = normalize_turnstile_solver_url()
+    task = {
+        "type": "TurnstileTaskProxyless",
+        "websiteURL": website_url,
+        "websiteKey": website_key,
+    }
+    if action:
+        task["action"] = str(action)
+    if cdata:
+        task["cdata"] = str(cdata)
+
+    if log_callback:
+        log_callback(
+            f"[*] 请求 Turnstile Solver: {base} key={website_key[:14]}... url={website_url[:80]}"
+        )
+
+    # 本地 Camoufox 池有限，串行化避免打爆
+    with _turnstile_solver_lock:
+        raise_if_cancelled(cancel_callback)
+        create_body = {"clientKey": client_key, "task": task}
+        data, _status = _solver_http_json("POST", "/createTask", create_body, timeout=45)
+        if int(data.get("errorId") or 0) != 0:
+            raise RuntimeError(
+                f"createTask 失败: {data.get('errorCode')}: {data.get('errorDescription')}"
+            )
+        task_id = str(data.get("taskId") or "").strip()
+        if not task_id:
+            raise RuntimeError(f"createTask 未返回 taskId: {data}")
+        if log_callback:
+            log_callback(f"[*] Turnstile Solver 任务已创建: {task_id[:18]}...")
+
+        started = time.time()
+        deadline = started + timeout
+        poll_interval = 2.0
+        while time.time() < deadline:
+            raise_if_cancelled(cancel_callback)
+            result, _ = _solver_http_json(
+                "POST",
+                "/getTaskResult",
+                {"clientKey": client_key, "taskId": task_id},
+                timeout=45,
+            )
+            if int(result.get("errorId") or 0) != 0:
+                raise RuntimeError(
+                    f"getTaskResult 失败: {result.get('errorCode')}: {result.get('errorDescription')}"
+                )
+            status = str(result.get("status") or "").lower()
+            if status == "ready":
+                solution = result.get("solution") or {}
+                token = (
+                    solution.get("token")
+                    or solution.get("gRecaptchaResponse")
+                    or solution.get("cf_clearance")
+                    or ""
+                )
+                token = str(token or "").strip()
+                if len(token) < 80:
+                    raise RuntimeError(f"Solver 返回 token 过短: len={len(token)}")
+                if log_callback:
+                    log_callback(
+                        f"[*] Turnstile Solver 成功，耗时 {int(time.time() - started)}s，token长度={len(token)}"
+                    )
+                return token
+            if status in {"", "processing", "idle", "captcha_not_ready"}:
+                elapsed = int(time.time() - started)
+                if log_callback and elapsed > 0 and elapsed % 8 < poll_interval:
+                    log_callback(f"[*] Turnstile Solver 处理中... {elapsed}s/{int(timeout)}s")
+                sleep_with_cancel(poll_interval, cancel_callback)
+                continue
+            # 兼容本地 solver 直接把 value 塞在顶层的情况
+            direct = result.get("value") or result.get("token")
+            if direct and len(str(direct)) >= 80 and str(direct) not in {"CAPTCHA_FAIL", "CAPTCHA_NOT_READY"}:
+                if log_callback:
+                    log_callback(f"[*] Turnstile Solver 成功(直接value)，token长度={len(str(direct))}")
+                return str(direct).strip()
+            raise RuntimeError(f"Solver 未知状态: status={status} body={str(result)[:240]}")
+
+        raise TimeoutError(f"Turnstile Solver 超时 {int(timeout)}s (task={task_id[:18]}..., endpoint={base})")
+
+
 def getTurnstileToken(log_callback=None, cancel_callback=None, attempts=15):
-    """参考 grok-auto-register 的 Turnstile 复用：shadow_root 点选 + 读 token。"""
+    """优先本地/远端 Turnstile Solver 出 token，失败再 shadow_root/CDP 点选。"""
     page = _get_page()
     if page is None:
         raise Exception("页面未就绪，无法执行 Turnstile")
+
+    token = _read_turnstile_token_from_page(page)
+    if len(token) >= 80:
+        if log_callback:
+            log_callback(f"[*] Turnstile 已通过，token长度={len(token)}")
+        return token
+
+    global _turnstile_solver_fail_until
+    solver_enabled = bool(config.get("turnstile_solver_enabled", True))
+    fallback_click = bool(config.get("turnstile_solver_fallback_click", True))
+    solver_cooled = time.time() < float(_turnstile_solver_fail_until or 0)
+    if solver_enabled and not solver_cooled:
+        try:
+            if probe_local_turnstile_solver():
+                ctx = scrape_turnstile_context_from_page(page)
+                if log_callback:
+                    log_callback(
+                        f"[*] 使用 Turnstile Solver 过盾 "
+                        f"(sitekey来源={ctx.get('source') or '?'}, key={(ctx.get('sitekey') or '')[:14]}...)"
+                    )
+                solver_token = solve_turnstile_via_local_solver(
+                    website_url=ctx.get("url") or "https://accounts.x.ai/sign-up",
+                    website_key=ctx.get("sitekey") or "",
+                    action=ctx.get("action") or "",
+                    cdata=ctx.get("cdata") or "",
+                    log_callback=log_callback,
+                    cancel_callback=cancel_callback,
+                )
+                synced = inject_turnstile_token_to_page(page, solver_token)
+                # 再读一次确认
+                back = _read_turnstile_token_from_page(page)
+                if len(back) >= 80:
+                    _turnstile_solver_fail_until = 0.0
+                    if log_callback:
+                        log_callback(f"[*] Turnstile Solver token 已回填，长度={len(back)} (inject={synced})")
+                    return back
+                if len(solver_token) >= 80:
+                    _turnstile_solver_fail_until = 0.0
+                    if log_callback:
+                        log_callback(
+                            f"[*] 页面回填长度异常 inject={synced}，直接使用 solver token 长度={len(solver_token)}"
+                        )
+                    return solver_token
+            elif log_callback:
+                log_callback(
+                    f"[Debug] Turnstile Solver 不可达: {normalize_turnstile_solver_url()}，"
+                    f"{'回退 shadow/CDP 点选' if fallback_click else '且已关闭点选回退'}"
+                )
+        except Exception as solver_exc:
+            # 失败后冷却，避免资料页每 2s 重入再堵满 timeout
+            _turnstile_solver_fail_until = time.time() + 60.0
+            if log_callback:
+                log_callback(f"[Debug] Turnstile Solver 失败（60s 内不再重试）: {solver_exc}")
+            if not fallback_click:
+                raise Exception(f"Turnstile Solver 失败且已关闭点选回退: {solver_exc}") from solver_exc
+    elif solver_enabled and solver_cooled and log_callback:
+        remain = max(0, int(_turnstile_solver_fail_until - time.time()))
+        if remain and remain % 15 == 0:
+            log_callback(f"[Debug] Turnstile Solver 冷却中，{remain}s 后可再试")
+
+    if not fallback_click and solver_enabled:
+        raise Exception("Turnstile Solver 未出 token，且 turnstile_solver_fallback_click=false")
 
     for i in range(max(1, int(attempts))):
         raise_if_cancelled(cancel_callback)
@@ -6914,7 +7352,8 @@ return 'profile-filled';
                 if now - wait_cf_since >= wait_limit and str(token_len) in {"0", ""}:
                     raise Exception(
                         f"Cloudflare Turnstile {wait_limit:.0f}s 内未签发 token（token长度=0）。"
-                        "已尝试 shadow_root 点选（参考 grok-auto-register）；若仍失败请人工确认页面复选框是否可点"
+                        "已尝试本地 Solver（若开启）与 shadow_root 点选；"
+                        "请确认 turnstile-solver 已启动（默认 http://127.0.0.1:5072）或检查代理/出口 IP"
                     )
                 # 参考 grok-auto-register：token 为空时短暂停顿 + shadow DOM 点选复用
                 if str(token_len) in {"0", ""}:
@@ -6992,7 +7431,7 @@ return String(cfInput.value || '').trim().length;
             if now - wait_cf_since >= wait_limit and str(token_len) in {"0", ""}:
                 raise Exception(
                     f"Cloudflare Turnstile {wait_limit:.0f}s 内未签发 token（token长度=0）。"
-                    "已尝试 shadow_root 点选（参考 grok-auto-register）"
+                    "已尝试本地 Solver（若开启）与 shadow_root 点选"
                 )
             if now - last_humanize_at >= 5:
                 humanize_page_activity(page, log_callback=None, cancel_callback=cancel_callback)
@@ -7252,8 +7691,20 @@ return {
                         log_callback(f"[Debug] 最终页状态: final-page-wait-cf, token长度={token_len_now}")
                     if now - last_cf_retry_at >= 10:
                         if log_callback:
-                            log_callback("[*] 最终页 Cloudflare 卡住，主动触发 Turnstile（暂不空 token 提交）...")
+                            log_callback("[*] 最终页 Cloudflare 卡住，尝试 Solver/触发 Turnstile（暂不空 token 提交）...")
                         try:
+                            # 优先走本地 solver 回填 token（与资料页同一路径）
+                            try:
+                                final_token = getTurnstileToken(
+                                    log_callback=log_callback,
+                                    cancel_callback=cancel_callback,
+                                    attempts=3,
+                                )
+                                if final_token:
+                                    inject_turnstile_token_to_page(page, final_token)
+                            except Exception as solver_final_exc:
+                                if log_callback:
+                                    log_callback(f"[Debug] 最终页 Solver/点选: {solver_final_exc}")
                             trig = page.run_js(
                                 r"""
 let executed = false;
