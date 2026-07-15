@@ -5568,14 +5568,35 @@ def get_email_provider():
     return config.get("email_provider", "duckmail")
 
 
-def get_email_and_token(api_key=None):
+def _is_transient_http_error(exc):
+    """502/503/504/超时等可重试错误。"""
+    text = str(exc or "")
+    low = text.lower()
+    if any(code in text for code in ("502", "503", "504", "429")):
+        return True
+    if any(k in low for k in ("timeout", "timed out", "temporarily", "bad gateway", "gateway")):
+        return True
+    code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    try:
+        if int(code) in {429, 502, 503, 504}:
+            return True
+    except Exception:
+        pass
+    resp = getattr(exc, "response", None)
+    try:
+        if resp is not None and int(getattr(resp, "status_code", 0) or 0) in {429, 502, 503, 504}:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _get_email_and_token_once(api_key=None):
     provider = get_email_provider()
     if provider == "yyds":
         return yyds_get_email_and_token(api_key=api_key, jwt=get_yyds_jwt())
     if provider == "cloudmail":
         # CloudMail catch-all 模式：直接生成随机邮箱，无需注册
-        # Cloudflare Email Routing 会自动将所有该域名的邮件路由到 Worker
-        # 支持英文逗号、中文逗号、空格分隔
         raw = str(config.get("defaultDomains", "") or "")
         domains = [x.strip() for x in re.split(r"[,，\s]+", raw) if x.strip()]
         if not domains:
@@ -5590,25 +5611,21 @@ def get_email_and_token(api_key=None):
         _cf_domain_index += 1
         username = generate_username(10)
         address = f"{username}@{domain}"
-        # 返回占位 token（实际不用于邮件查询，邮件查询走公开 API）
         return address, "cloudmail_catch_all"
     if provider == "cloudflare":
         api_base = get_cloudflare_api_base()
         if not api_base:
             raise Exception("Cloudflare API Base 未配置")
         try:
-            # cloudflare_temp_email 专用模式
             address, token = cloudflare_create_temp_address(api_base)
-            # 若历史黑名单命中，直接换兜底域名创建，避免重复撞同一拒收后缀
             if address and is_email_domain_rejected(address):
                 raise Exception(f"临时邮箱域名已在拒收黑名单: {address}")
             return address, token
         except Exception as primary_exc:
-            # 兜底回退到 Mail.tm 风格
             key = api_key or get_cloudflare_api_key()
             domains = cloudflare_get_domains(api_base, api_key=key)
             if not domains:
-                raise Exception(f"Cloudflare 创建邮箱失败: {primary_exc}")
+                raise Exception(f"Cloudflare 创建邮箱失败: {primary_exc}") from primary_exc
             verified = [
                 d for d in domains
                 if d.get("isVerified") and not is_email_domain_rejected(d.get("domain"))
@@ -5642,8 +5659,52 @@ def get_email_and_token(api_key=None):
     create_account(address, password, api_key=key, expires_in=0)
     token = get_token(address, password)
     if not token:
-        raise Exception("鑾峰彇 DuckMail token 澶辫触")
+        raise Exception("获取 DuckMail token 失败")
     return address, token
+
+
+def get_email_and_token(api_key=None, retries=3, log_callback=None):
+    """创建临时邮箱；对 502/503/504 自动重试。"""
+    provider = get_email_provider()
+    last_exc = None
+    attempts = max(1, int(retries or 1))
+    for attempt in range(1, attempts + 1):
+        try:
+            return _get_email_and_token_once(api_key=api_key)
+        except EmailProviderUnavailable:
+            raise
+        except EmailDomainRejected:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            transient = _is_transient_http_error(exc)
+            if log_callback:
+                log_callback(
+                    f"[!] 邮箱服务({provider}) 创建失败 "
+                    f"({attempt}/{attempts}): {exc}"
+                    + ("，将重试" if transient and attempt < attempts else "")
+                )
+            if not transient or attempt >= attempts:
+                break
+            # 502 时短暂退避；第二次起尝试直连邮箱 API（不走业务代理）
+            time.sleep(0.8 * attempt)
+            if attempt >= 2 and config.get("proxy"):
+                try:
+                    # 临时清空代理再试一轮邮箱（很多 502 是代理对邮箱站的网关错误）
+                    old_proxy = config.get("proxy")
+                    config["proxy"] = ""
+                    try:
+                        return _get_email_and_token_once(api_key=api_key)
+                    finally:
+                        config["proxy"] = old_proxy
+                except Exception as exc2:
+                    last_exc = exc2
+                    if not _is_transient_http_error(exc2):
+                        break
+    raise Exception(
+        f"邮箱服务({provider}) 创建失败: {last_exc}。"
+        "若为 HTTP 502/503，一般是邮箱站或代理网关临时故障，稍后重试即可"
+    ) from last_exc
 
 
 def get_oai_code(
@@ -7563,7 +7624,7 @@ return !!(givenInput && familyInput && passwordInput);
 def fill_email_and_submit(timeout=30, log_callback=None, cancel_callback=None):
     page = _get_page()
     raise_if_cancelled(cancel_callback)
-    email, dev_token = get_email_and_token()
+    email, dev_token = get_email_and_token(log_callback=log_callback)
     if not email or not dev_token:
         raise Exception("获取邮箱失败")
     if log_callback:
