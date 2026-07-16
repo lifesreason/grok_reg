@@ -1311,24 +1311,110 @@ def _extract_sub2api_account_id(created):
     return ""
 
 
+def _sub2api_test_models(settings=None):
+    """探测用模型候选（不同 sub2api/Grok 版本模型名不一致）。"""
+    settings = settings or {}
+    preferred = str(settings.get("sub2api_test_model") or "").strip()
+    models = []
+    if preferred:
+        models.append(preferred)
+    for m in (
+        "grok-3",
+        "grok-3-mini",
+        "grok-2",
+        "grok-2-latest",
+        "grok-4",
+        "grok-4-0709",
+    ):
+        if m not in models:
+            models.append(m)
+    return models
+
+
+def _parse_sub2api_test_sse(text):
+    """解析 sub2api /test SSE，返回 (ok, message)。"""
+    text = str(text or "")
+    if not text.strip():
+        return None, "empty body"
+    # 非 SSE 的 JSON
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            if data.get("success") is True or data.get("ok") is True:
+                return True, "json success"
+            if data.get("success") is False:
+                return False, str(data.get("error") or data.get("message") or data)[:200]
+    except Exception:
+        pass
+
+    last_err = ""
+    saw_event = False
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        raw = line[5:].strip()
+        if not raw or raw == "[DONE]":
+            continue
+        saw_event = True
+        try:
+            event = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(event, dict):
+            continue
+        et = str(event.get("type") or event.get("event") or "").strip().lower()
+        if et in {"test_complete", "complete", "done"}:
+            if event.get("success") is True or event.get("ok") is True:
+                return True, "test_complete success"
+            err = str(event.get("error") or event.get("text") or event.get("message") or "test failed")
+            return False, err[:240]
+        if et in {"error", "test_error", "failed"}:
+            err = str(event.get("error") or event.get("text") or event.get("message") or "error")
+            last_err = err[:240]
+            # 继续读，可能后面有 complete
+            continue
+        # 有些实现直接塞 status
+        if event.get("success") is True:
+            return True, "event success"
+        if event.get("success") is False:
+            last_err = str(event.get("error") or event.get("message") or "failed")[:240]
+    if last_err:
+        return False, last_err
+    if saw_event:
+        # 有事件但没有明确失败——保守当部分成功（至少触发了探测）
+        return True, "sse events received"
+    # 纯 200 空/非结构化：不视为真正成功
+    return None, f"unrecognized body: {text[:160]}"
+
+
 def _sub2api_post_refresh_account(base, headers, account_id, log_callback=None):
-    """创建后强制 refresh，初始化用量窗口（避免 UI 显示 forbidden）。"""
+    """创建后强制 refresh，初始化会话（避免 UI 显示 forbidden）。"""
     account_id = str(account_id or "").strip()
     if not account_id:
         return False, "missing account_id"
     urls = [
         f"{base}/admin/accounts/{account_id}/refresh",
         f"{base}/admin/grok/accounts/{account_id}/refresh",
+        f"{base}/admin/accounts/{account_id}/probe",
+        f"{base}/admin/grok/accounts/{account_id}/probe",
     ]
     last_err = ""
     for url in urls:
         try:
-            resp = http_post(url, headers=headers, json={}, timeout=45, proxies={})
-            if int(getattr(resp, "status_code", 0) or 0) in {200, 201, 204}:
+            resp = http_post(url, headers=headers, json={}, timeout=60, proxies={})
+            code = int(getattr(resp, "status_code", 0) or 0)
+            body = getattr(resp, "text", "") or ""
+            if code in {200, 201, 204}:
+                # 若 body 里明确失败则继续试
+                low = body.lower()
+                if any(x in low for x in ("forbidden", "\"success\":false", "invalid_grant", "unauthorized")):
+                    last_err = f"{url} HTTP {code}: {body[:160]}"
+                    continue
                 if log_callback:
-                    log_callback(f"[*] sub2api 已 refresh 账号 id={account_id}")
-                return True, "refreshed"
-            last_err = f"HTTP {getattr(resp, 'status_code', '?')}: {(getattr(resp, 'text', '') or '')[:160]}"
+                    log_callback(f"[*] sub2api refresh 成功 id={account_id} via {url.rsplit('/', 1)[-1]}")
+                return True, body[:200] or "refreshed"
+            last_err = f"{url} HTTP {code}: {body[:160]}"
         except Exception as exc:
             last_err = str(exc)
             continue
@@ -1336,37 +1422,106 @@ def _sub2api_post_refresh_account(base, headers, account_id, log_callback=None):
 
 
 def _sub2api_post_test_account(base, headers, account_id, settings=None, log_callback=None):
-    """创建后探测一次，触发用量窗口从 forbidden 变为可用状态。"""
+    """创建后探测：解析 SSE 结果，失败会换模型重试。"""
     account_id = str(account_id or "").strip()
     if not account_id:
         return False, "missing account_id"
     settings = settings or {}
-    model_id = str(settings.get("sub2api_test_model") or "grok-3").strip() or "grok-3"
+    models = _sub2api_test_models(settings)
     urls = [
         f"{base}/admin/accounts/{account_id}/test",
         f"{base}/admin/grok/accounts/{account_id}/test",
+        f"{base}/admin/accounts/{account_id}/probe",
     ]
     last_err = ""
-    for url in urls:
-        try:
-            resp = http_post(
-                url,
-                headers=headers,
-                json={"model_id": model_id},
-                timeout=90,
-                proxies={},
-            )
-            code = int(getattr(resp, "status_code", 0) or 0)
-            # test 接口可能 SSE；只要 200 就认为探测已触发
-            if code in {200, 201, 204}:
-                if log_callback:
-                    log_callback(f"[*] sub2api 已探测账号 id={account_id}")
-                return True, "tested"
-            last_err = f"HTTP {code}: {(getattr(resp, 'text', '') or '')[:160]}"
-        except Exception as exc:
-            last_err = str(exc)
-            continue
+    for model_id in models:
+        for url in urls:
+            try:
+                resp = http_post(
+                    url,
+                    headers=headers,
+                    json={"model_id": model_id, "model": model_id},
+                    timeout=120,
+                    proxies={},
+                )
+                code = int(getattr(resp, "status_code", 0) or 0)
+                body = getattr(resp, "text", "") or ""
+                if code not in {200, 201, 204}:
+                    last_err = f"{url} model={model_id} HTTP {code}: {body[:160]}"
+                    continue
+                ok, msg = _parse_sub2api_test_sse(body)
+                if ok is True:
+                    if log_callback:
+                        log_callback(
+                            f"[*] sub2api 探测成功 id={account_id} model={model_id} ({msg})"
+                        )
+                    return True, msg
+                if ok is False:
+                    last_err = f"model={model_id} {msg}"
+                    if log_callback:
+                        log_callback(f"[Debug] sub2api 探测失败 id={account_id}: {last_err}")
+                    # 模型不对就换下一个
+                    continue
+                # 无法解析：记录但换路径/模型
+                last_err = f"model={model_id} {msg}"
+            except Exception as exc:
+                last_err = str(exc)
+                continue
     return False, last_err or "test failed"
+
+
+def _sub2api_initialize_account(base, headers, account_id, settings=None, log_callback=None):
+    """创建后完整初始化：refresh → 等待 → test，必要时重试。"""
+    account_id = str(account_id or "").strip()
+    if not account_id:
+        return {"account_id": "", "refresh": None, "test": None, "ok": False}
+    settings = settings or {}
+    result = {"account_id": account_id, "refresh": None, "test": None, "ok": False}
+
+    # 新号凭证刚写入，稍等再 refresh
+    time.sleep(1.5)
+    ok_r, msg_r = _sub2api_post_refresh_account(
+        base, headers, account_id, log_callback=log_callback
+    )
+    result["refresh"] = {"ok": ok_r, "msg": msg_r}
+    if not ok_r:
+        # 再试一次
+        time.sleep(2.0)
+        ok_r2, msg_r2 = _sub2api_post_refresh_account(
+            base, headers, account_id, log_callback=log_callback
+        )
+        result["refresh"] = {"ok": ok_r2, "msg": msg_r2, "retry": msg_r}
+        ok_r = ok_r2
+
+    time.sleep(2.0 if ok_r else 3.0)
+    ok_t, msg_t = _sub2api_post_test_account(
+        base, headers, account_id, settings=settings, log_callback=log_callback
+    )
+    result["test"] = {"ok": ok_t, "msg": msg_t}
+
+    # 探测失败：再 refresh 一次后重测
+    if not ok_t:
+        if log_callback:
+            log_callback(f"[*] sub2api 探测未通过，二次 refresh 后重试 id={account_id}")
+        time.sleep(1.5)
+        _sub2api_post_refresh_account(base, headers, account_id, log_callback=log_callback)
+        time.sleep(2.5)
+        ok_t2, msg_t2 = _sub2api_post_test_account(
+            base, headers, account_id, settings=settings, log_callback=log_callback
+        )
+        result["test"] = {"ok": ok_t2, "msg": msg_t2, "retry_from": msg_t}
+        ok_t = ok_t2
+
+    result["ok"] = bool(ok_r and ok_t)
+    if log_callback:
+        if result["ok"]:
+            log_callback(f"[+] sub2api 账号已初始化 id={account_id}（refresh+探测通过）")
+        else:
+            log_callback(
+                f"[!] sub2api 初始化未完全成功 id={account_id} "
+                f"refresh={ok_r} test={ok_t}；请在 UI 手动点探测/刷新令牌"
+            )
+    return result
 
 
 def _sub2api_find_account_id_by_name(base, headers, account_name, log_callback=None):
@@ -1432,33 +1587,22 @@ def _push_one_account_to_sub2api(account, settings, base, headers, index, log_ca
         )
     )
 
-    # 创建后主动 refresh + test，避免用量窗口一直 forbidden（对齐 openai-cpa）
+    # 创建后完整初始化：refresh → 等待 → test（解析 SSE），避免用量窗口 forbidden
     account_id = _extract_sub2api_account_id(created)
     if not account_id:
         account_id = _sub2api_find_account_id_by_name(
             base, headers, payload.get("name"), log_callback=log_callback
         )
-    post_actions = {"account_id": account_id, "refresh": None, "test": None}
     if account_id:
-        ok_r, msg_r = _sub2api_post_refresh_account(
-            base, headers, account_id, log_callback=log_callback
-        )
-        post_actions["refresh"] = {"ok": ok_r, "msg": msg_r}
-        # 短暂等待 session 就绪再探测
-        time.sleep(0.8)
-        ok_t, msg_t = _sub2api_post_test_account(
+        post_actions = _sub2api_initialize_account(
             base, headers, account_id, settings=settings, log_callback=log_callback
         )
-        post_actions["test"] = {"ok": ok_t, "msg": msg_t}
-        if log_callback and (not ok_r or not ok_t):
+    else:
+        post_actions = {"account_id": "", "refresh": None, "test": None, "ok": False}
+        if log_callback:
             log_callback(
-                f"[!] sub2api 后置初始化不完整 id={account_id} "
-                f"refresh={ok_r} test={ok_t}；可在 UI 手动点探测"
+                f"[!] sub2api 创建成功但未拿到 account_id，无法自动初始化: {account.get('email','')}"
             )
-    elif log_callback:
-        log_callback(
-            f"[!] sub2api 创建成功但未拿到 account_id，无法自动 refresh/test: {account.get('email','')}"
-        )
 
     return {
         "email": account.get("email", ""),
