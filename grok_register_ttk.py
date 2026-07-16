@@ -5316,12 +5316,15 @@ class RegistrationJob:
                     retriable = (
                         "未收到验证码" in msg
                         or "验证码" in msg
+                        or "CreateEmailValidationCode" in msg
+                        or "grpc=None" in msg
                         or any(c in msg for c in ("403", "429", "502", "503", "504"))
                         or "邮箱服务" in msg
+                        or "TLS connect" in msg
                     )
                     if retriable and mail_try < max_mail_retry:
-                        logf(f"[!] HTTP 注册失败，换邮箱重试: {msg}")
-                        sleep_with_cancel(1.2 * mail_try, self.should_stop)
+                        logf(f"[!] HTTP 注册失败，换邮箱重试: {msg[:160]}")
+                        sleep_with_cancel(0.8 * mail_try, self.should_stop)
                         continue
                     raise
             if not mail_ok:
