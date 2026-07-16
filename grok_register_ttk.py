@@ -1288,7 +1288,127 @@ def build_sub2api_grok_refresh_token_payload(account, token_info=None, settings=
     return payload
 
 
-def _push_one_account_to_sub2api(account, settings, base, headers, index):
+def _extract_sub2api_account_id(created):
+    """从创建账号响应里尽量抠出 account id。"""
+    if not isinstance(created, dict):
+        return ""
+    for key in ("id", "account_id", "accountId"):
+        val = created.get(key)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    data = created.get("data")
+    if isinstance(data, dict):
+        for key in ("id", "account_id", "accountId"):
+            val = data.get(key)
+            if val is not None and str(val).strip():
+                return str(val).strip()
+        account = data.get("account")
+        if isinstance(account, dict):
+            for key in ("id", "account_id", "accountId"):
+                val = account.get(key)
+                if val is not None and str(val).strip():
+                    return str(val).strip()
+    return ""
+
+
+def _sub2api_post_refresh_account(base, headers, account_id, log_callback=None):
+    """创建后强制 refresh，初始化用量窗口（避免 UI 显示 forbidden）。"""
+    account_id = str(account_id or "").strip()
+    if not account_id:
+        return False, "missing account_id"
+    urls = [
+        f"{base}/admin/accounts/{account_id}/refresh",
+        f"{base}/admin/grok/accounts/{account_id}/refresh",
+    ]
+    last_err = ""
+    for url in urls:
+        try:
+            resp = http_post(url, headers=headers, json={}, timeout=45, proxies={})
+            if int(getattr(resp, "status_code", 0) or 0) in {200, 201, 204}:
+                if log_callback:
+                    log_callback(f"[*] sub2api 已 refresh 账号 id={account_id}")
+                return True, "refreshed"
+            last_err = f"HTTP {getattr(resp, 'status_code', '?')}: {(getattr(resp, 'text', '') or '')[:160]}"
+        except Exception as exc:
+            last_err = str(exc)
+            continue
+    return False, last_err or "refresh failed"
+
+
+def _sub2api_post_test_account(base, headers, account_id, settings=None, log_callback=None):
+    """创建后探测一次，触发用量窗口从 forbidden 变为可用状态。"""
+    account_id = str(account_id or "").strip()
+    if not account_id:
+        return False, "missing account_id"
+    settings = settings or {}
+    model_id = str(settings.get("sub2api_test_model") or "grok-3").strip() or "grok-3"
+    urls = [
+        f"{base}/admin/accounts/{account_id}/test",
+        f"{base}/admin/grok/accounts/{account_id}/test",
+    ]
+    last_err = ""
+    for url in urls:
+        try:
+            resp = http_post(
+                url,
+                headers=headers,
+                json={"model_id": model_id},
+                timeout=90,
+                proxies={},
+            )
+            code = int(getattr(resp, "status_code", 0) or 0)
+            # test 接口可能 SSE；只要 200 就认为探测已触发
+            if code in {200, 201, 204}:
+                if log_callback:
+                    log_callback(f"[*] sub2api 已探测账号 id={account_id}")
+                return True, "tested"
+            last_err = f"HTTP {code}: {(getattr(resp, 'text', '') or '')[:160]}"
+        except Exception as exc:
+            last_err = str(exc)
+            continue
+    return False, last_err or "test failed"
+
+
+def _sub2api_find_account_id_by_name(base, headers, account_name, log_callback=None):
+    """创建响应无 id 时，按名称回查账号列表。"""
+    name = str(account_name or "").strip()
+    if not name:
+        return ""
+    try:
+        resp = http_get(
+            f"{base}/admin/accounts",
+            headers=headers,
+            params={"page": 1, "page_size": 50, "keyword": name},
+            timeout=30,
+            proxies={},
+        )
+        data = _sub2api_response_data(resp)
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] sub2api 回查账号失败: {exc}")
+        return ""
+    items = []
+    if isinstance(data, dict):
+        items = data.get("items") or data.get("list") or data.get("accounts") or []
+        if not items and isinstance(data.get("data"), dict):
+            items = data["data"].get("items") or []
+    if not isinstance(items, list):
+        return ""
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("name") or "").strip() == name:
+            return str(item.get("id") or "").strip()
+    # 宽松：名称包含
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if name in str(item.get("name") or ""):
+            return str(item.get("id") or "").strip()
+    return ""
+
+
+def _push_one_account_to_sub2api(account, settings, base, headers, index, log_callback=None):
     token_info = _sub2api_response_data(
         http_post(
             f"{base}/admin/grok/oauth/refresh-token",
@@ -1311,7 +1431,41 @@ def _push_one_account_to_sub2api(account, settings, base, headers, index):
             proxies={},
         )
     )
-    return {"email": account.get("email", ""), "status": "pushed", "response": created}
+
+    # 创建后主动 refresh + test，避免用量窗口一直 forbidden（对齐 openai-cpa）
+    account_id = _extract_sub2api_account_id(created)
+    if not account_id:
+        account_id = _sub2api_find_account_id_by_name(
+            base, headers, payload.get("name"), log_callback=log_callback
+        )
+    post_actions = {"account_id": account_id, "refresh": None, "test": None}
+    if account_id:
+        ok_r, msg_r = _sub2api_post_refresh_account(
+            base, headers, account_id, log_callback=log_callback
+        )
+        post_actions["refresh"] = {"ok": ok_r, "msg": msg_r}
+        # 短暂等待 session 就绪再探测
+        time.sleep(0.8)
+        ok_t, msg_t = _sub2api_post_test_account(
+            base, headers, account_id, settings=settings, log_callback=log_callback
+        )
+        post_actions["test"] = {"ok": ok_t, "msg": msg_t}
+        if log_callback and (not ok_r or not ok_t):
+            log_callback(
+                f"[!] sub2api 后置初始化不完整 id={account_id} "
+                f"refresh={ok_r} test={ok_t}；可在 UI 手动点探测"
+            )
+    elif log_callback:
+        log_callback(
+            f"[!] sub2api 创建成功但未拿到 account_id，无法自动 refresh/test: {account.get('email','')}"
+        )
+
+    return {
+        "email": account.get("email", ""),
+        "status": "pushed",
+        "response": created,
+        "post_actions": post_actions,
+    }
 
 
 def import_accounts_to_sub2api(accounts, settings=None, log_callback=None):
@@ -1335,7 +1489,11 @@ def import_accounts_to_sub2api(accounts, settings=None, log_callback=None):
     for index, account in enumerate(valid_accounts, start=1):
         step = "refresh-token"
         try:
-            items.append(_push_one_account_to_sub2api(account, settings, base, headers, index))
+            items.append(
+                _push_one_account_to_sub2api(
+                    account, settings, base, headers, index, log_callback=log_callback
+                )
+            )
         except Exception as exc:
             error_text = _sub2api_error_text(exc, step=step)
             if step == "refresh-token" and is_refresh_token_revoked_error(error_text) and account.get("sso"):
@@ -1347,7 +1505,11 @@ def import_accounts_to_sub2api(accounts, settings=None, log_callback=None):
                         log_callback=log_callback,
                     )
                     replace_registered_account_refresh_token(account, new_refresh_token)
-                    items.append(_push_one_account_to_sub2api(account, settings, base, headers, index))
+                    items.append(
+                        _push_one_account_to_sub2api(
+                            account, settings, base, headers, index, log_callback=log_callback
+                        )
+                    )
                     continue
                 except Exception as retry_exc:
                     error_text = f"{error_text}; retry_with_sso_failed: {_sub2api_error_text(retry_exc)}"
