@@ -102,6 +102,10 @@ DEFAULT_CONFIG = {
     "sub2api_group_ids": "",
     "sub2api_concurrency": 3,
     "sub2api_priority": 50,
+    # 推送后是否自动探测（遇 xAI 429 时可关掉，只 refresh）
+    "sub2api_auto_probe": True,
+    "sub2api_init_gap_seconds": 8,
+    "sub2api_test_model": "grok-3",
     "cpa_auth_dir": "cpa_auths",
     "cpa_auto_push_remote": False,
     "cpa_management_base": "",
@@ -1413,62 +1417,36 @@ def _sub2api_post_refresh_account(base, headers, account_id, log_callback=None):
 
 
 def _sub2api_post_test_account(base, headers, account_id, settings=None, log_callback=None):
-    """探测：单模型 + 解析 SSE；429/state changed 时退避后最多再试 1 次。"""
+    """探测：单次请求 + 解析 SSE。429 不再连环重试（会打坏 oauth 状态）。"""
     account_id = str(account_id or "").strip()
     if not account_id:
         return False, "missing account_id"
     settings = settings or {}
     model_id = _sub2api_test_models(settings)[0]
     url = f"{base}/admin/accounts/{account_id}/test"
-    last_err = ""
-
-    for attempt in range(1, 3):
-        try:
-            resp = http_post(
-                url,
-                headers=headers,
-                json={"model_id": model_id, "model": model_id},
-                timeout=120,
-                proxies={},
-            )
-            code = int(getattr(resp, "status_code", 0) or 0)
-            body = getattr(resp, "text", "") or ""
-            if code not in {200, 201, 204}:
-                last_err = f"HTTP {code}: {body[:200]}"
-                if _is_sub2api_rate_limited_msg(last_err) and attempt < 2:
-                    if log_callback:
-                        log_callback(f"[*] sub2api 探测限流，等待 10s 后重试 id={account_id}")
-                    time.sleep(10)
-                    continue
-                return False, last_err
-            ok, msg = _parse_sub2api_test_sse(body)
-            if ok is True:
-                if log_callback:
-                    log_callback(f"[*] sub2api 探测成功 id={account_id} model={model_id}")
-                return True, msg
-            last_err = msg or "test failed"
+    try:
+        resp = http_post(
+            url,
+            headers=headers,
+            json={"model_id": model_id, "model": model_id},
+            timeout=120,
+            proxies={},
+        )
+        code = int(getattr(resp, "status_code", 0) or 0)
+        body = getattr(resp, "text", "") or ""
+        if code not in {200, 201, 204}:
+            return False, f"HTTP {code}: {body[:220]}"
+        ok, msg = _parse_sub2api_test_sse(body)
+        if ok is True:
             if log_callback:
-                log_callback(f"[Debug] sub2api 探测未通过 id={account_id}: {last_err[:200]}")
-            if _is_sub2api_rate_limited_msg(last_err) and attempt < 2:
-                if log_callback:
-                    log_callback(f"[*] sub2api 429/限流，等待 12s 后重试 id={account_id}")
-                time.sleep(12)
-                continue
-            if _is_sub2api_oauth_state_msg(last_err) and attempt < 2:
-                if log_callback:
-                    log_callback(f"[*] oauth 状态冲突，等待 6s 后 refresh 再测 id={account_id}")
-                time.sleep(6)
-                _sub2api_post_refresh_account(base, headers, account_id, log_callback=None)
-                time.sleep(4)
-                continue
-            return False, last_err
-        except Exception as exc:
-            last_err = str(exc)
-            if attempt < 2:
-                time.sleep(4)
-                continue
-            return False, last_err
-    return False, last_err or "test failed"
+                log_callback(f"[*] sub2api 探测成功 id={account_id} model={model_id}")
+            return True, msg
+        # 明确失败
+        if log_callback:
+            log_callback(f"[Debug] sub2api 探测未通过 id={account_id}: {str(msg)[:200]}")
+        return False, msg or "test failed"
+    except Exception as exc:
+        return False, str(exc)
 
 
 _SUB2API_INIT_LOCK = threading.RLock()
@@ -1476,53 +1454,76 @@ _SUB2API_INIT_LAST_TS = 0.0
 
 
 def _sub2api_initialize_account(base, headers, account_id, settings=None, log_callback=None):
-    """创建后初始化：全局串行 + 温和 refresh/test，避免 429 与 state changed。"""
+    """创建后初始化：全局串行；默认 refresh + 可选一次探测。
+
+    说明：新免费号常遇 xAI 429 (RPM 0/0)。此时强行多轮 test/refresh
+    会触发 oauth refresh account state changed，反而更糟。
+    限流时只保留 refresh，探测交给用户稍后在 UI 操作。
+    """
     global _SUB2API_INIT_LAST_TS
     account_id = str(account_id or "").strip()
     if not account_id:
         return {"account_id": "", "refresh": None, "test": None, "ok": False}
     settings = settings or {}
+    auto_probe = bool(settings.get("sub2api_auto_probe", True))
     result = {"account_id": account_id, "refresh": None, "test": None, "ok": False}
 
     with _SUB2API_INIT_LOCK:
         try:
-            gap = max(1.0, float(settings.get("sub2api_init_gap_seconds") or 4.0))
+            gap = max(2.0, float(settings.get("sub2api_init_gap_seconds") or 8.0))
         except Exception:
-            gap = 4.0
+            gap = 8.0
         wait = (_SUB2API_INIT_LAST_TS + gap) - time.time()
         if wait > 0:
             if log_callback:
                 log_callback(f"[*] sub2api 初始化节流等待 {wait:.1f}s")
             time.sleep(wait)
 
-        time.sleep(2.5)
+        # 创建后稍等再 refresh
+        time.sleep(3.0)
         ok_r, msg_r = _sub2api_post_refresh_account(
             base, headers, account_id, log_callback=log_callback
         )
         result["refresh"] = {"ok": ok_r, "msg": msg_r}
 
-        # refresh 后给 token 落稳；不要立刻连打多模型
-        time.sleep(5.0 if ok_r else 7.0)
-        ok_t, msg_t = _sub2api_post_test_account(
-            base, headers, account_id, settings=settings, log_callback=log_callback
-        )
-        result["test"] = {"ok": ok_t, "msg": msg_t}
-        result["ok"] = bool(ok_r and ok_t)
+        ok_t = False
+        msg_t = "skipped"
+        if auto_probe:
+            time.sleep(6.0 if ok_r else 8.0)
+            ok_t, msg_t = _sub2api_post_test_account(
+                base, headers, account_id, settings=settings, log_callback=log_callback
+            )
+            result["test"] = {"ok": ok_t, "msg": msg_t}
+            # 429 / state changed：不要再 refresh 连环打
+            if not ok_t and (
+                _is_sub2api_rate_limited_msg(msg_t) or _is_sub2api_oauth_state_msg(msg_t)
+            ):
+                if log_callback:
+                    log_callback(
+                        f"[*] 探测遇限流/状态冲突，停止重试 id={account_id}；"
+                        "账号已入库，请数分钟后在 sub2api 点「探测」"
+                    )
+        else:
+            result["test"] = {"ok": None, "msg": "auto_probe disabled"}
+            if log_callback:
+                log_callback(f"[*] sub2api 已跳过自动探测 id={account_id}（仅 refresh）")
+
+        # refresh 成功即视为推送可用；探测失败不否掉推送结果
+        result["ok"] = bool(ok_r)
         _SUB2API_INIT_LAST_TS = time.time()
 
         if log_callback:
-            if result["ok"]:
+            if ok_r and ok_t:
                 log_callback(f"[+] sub2api 账号已初始化 id={account_id}（refresh+探测通过）")
-            else:
-                hint = ""
-                blob = f"{msg_r} {msg_t}"
-                if _is_sub2api_rate_limited_msg(blob):
-                    hint = "（xAI 限流/RPM=0，稍后再在 UI 点探测通常会好）"
-                elif _is_sub2api_oauth_state_msg(blob):
-                    hint = "（oauth 状态冲突，请稍后手动刷新令牌再探测）"
+            elif ok_r:
                 log_callback(
-                    f"[!] sub2api 初始化未完全成功 id={account_id} "
-                    f"refresh={ok_r} test={ok_t}{hint}"
+                    f"[+] sub2api 账号已入库 id={account_id}（refresh 成功"
+                    + ("，探测未通过/已跳过" if auto_probe else "，未探测")
+                    + "）"
+                )
+            else:
+                log_callback(
+                    f"[!] sub2api refresh 失败 id={account_id}；可在 UI 手动刷新令牌"
                 )
         return result
 
@@ -4964,6 +4965,23 @@ def validate_registration_config(settings):
         normalized["enable_nsfw"] = bool(normalized.get("enable_nsfw"))
     normalized["grok2api_auto_add_remote"] = bool(normalized.get("grok2api_auto_add_remote"))
     normalized["sub2api_auto_import_remote"] = bool(normalized.get("sub2api_auto_import_remote"))
+    if "sub2api_auto_probe" in normalized:
+        raw_probe = normalized.get("sub2api_auto_probe")
+        if isinstance(raw_probe, str):
+            normalized["sub2api_auto_probe"] = raw_probe.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            normalized["sub2api_auto_probe"] = bool(raw_probe)
+    else:
+        normalized["sub2api_auto_probe"] = True
+    try:
+        normalized["sub2api_init_gap_seconds"] = max(
+            1.0, min(120.0, float(normalized.get("sub2api_init_gap_seconds") or 8))
+        )
+    except Exception:
+        normalized["sub2api_init_gap_seconds"] = 8.0
+    normalized["sub2api_test_model"] = str(
+        normalized.get("sub2api_test_model") or "grok-3"
+    ).strip() or "grok-3"
     if isinstance(normalized.get("cpa_auto_push_remote"), str):
         normalized["cpa_auto_push_remote"] = normalized["cpa_auto_push_remote"].strip().lower() in {
             "1",

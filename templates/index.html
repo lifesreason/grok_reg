@@ -448,6 +448,10 @@
                   <input name="sub2api_auto_import_remote" type="checkbox" />
                   注册成功自动推送 sub2api
                 </label>
+                <label class="check">
+                  <input name="sub2api_auto_probe" type="checkbox" checked />
+                  推送后自动探测（遇 xAI 限流可关掉，只 refresh）
+                </label>
                 <label>
                   sub2api 账号名前缀
                   <input name="sub2api_account_name" placeholder="Grok Auto" />
@@ -463,6 +467,14 @@
                 <label>
                   sub2api 优先级
                   <input name="sub2api_priority" type="number" min="0" max="1000" value="50" />
+                </label>
+                <label>
+                  初始化间隔(秒)
+                  <input name="sub2api_init_gap_seconds" type="number" min="1" max="120" value="8" />
+                </label>
+                <label>
+                  探测模型
+                  <input name="sub2api_test_model" placeholder="grok-3" />
                 </label>
               </div>
             </section>

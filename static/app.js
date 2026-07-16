@@ -130,6 +130,12 @@ function formPayload() {
   if (form.elements.enable_mail_domain_grouping) {
     data.enable_mail_domain_grouping = form.elements.enable_mail_domain_grouping.checked;
   }
+  if (form.elements.sub2api_auto_import_remote) {
+    data.sub2api_auto_import_remote = form.elements.sub2api_auto_import_remote.checked;
+  }
+  if (form.elements.sub2api_auto_probe) {
+    data.sub2api_auto_probe = form.elements.sub2api_auto_probe.checked;
+  }
   if (form.elements.email_webhook_enabled) {
     data.email_webhook_enabled = form.elements.email_webhook_enabled.checked;
   }
@@ -149,6 +155,7 @@ function formPayload() {
   data.stop_on_consecutive_blocks = Number(data.stop_on_consecutive_blocks || 3);
   data.sub2api_concurrency = Number(data.sub2api_concurrency || 3);
   data.sub2api_priority = Number(data.sub2api_priority || 50);
+  data.sub2api_init_gap_seconds = Number(data.sub2api_init_gap_seconds || 8);
   data.cpa_push_workers = Number(data.cpa_push_workers || 3);
   data.turnstile_solver_timeout = Number(data.turnstile_solver_timeout || 120);
   data.turnstile_wait_seconds = Number(data.turnstile_wait_seconds || 120);
