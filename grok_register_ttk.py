@@ -173,7 +173,10 @@ XAI_GROK_OAUTH_AUTHORIZE_URL = "https://auth.x.ai/oauth2/authorize"
 XAI_GROK_OAUTH_TOKEN_URL = "https://auth.x.ai/oauth2/token"
 XAI_GROK_OAUTH_SCOPE = "openid profile email offline_access grok-cli:access api:access"
 XAI_GROK_OAUTH_REDIRECT_URI = "http://127.0.0.1:56121/callback"
+# 计费 API 通道（API Key）；OAuth/Device Flow 账号应走 cli-chat-proxy
 XAI_GROK_API_BASE_URL = "https://api.x.ai/v1"
+# grok-cli / Device Flow OAuth 实际聊天代理（对齐 grokcli-2api 导出）
+XAI_GROK_CLI_CHAT_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 CPA_DEFAULT_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 CPA_CLIENT_HEADERS = {
     "x-grok-client-version": "0.2.93",
@@ -1270,7 +1273,16 @@ def build_sub2api_grok_refresh_token_payload(account, token_info=None, settings=
     credentials = dict(token_info)
     credentials["refresh_token"] = str(credentials.get("refresh_token") or refresh_token).strip()
     credentials["client_id"] = str(credentials.get("client_id") or settings.get("sub2api_grok_client_id") or XAI_GROK_OAUTH_CLIENT_ID).strip()
-    credentials["base_url"] = str(credentials.get("base_url") or settings.get("sub2api_grok_base_url") or XAI_GROK_API_BASE_URL).strip()
+    # 关键：Device Flow OAuth 必须走 cli-chat-proxy，不能用 api.x.ai（会 403 chat denied）
+    default_base = XAI_GROK_CLI_CHAT_BASE_URL
+    raw_base = str(
+        credentials.get("base_url")
+        or settings.get("sub2api_grok_base_url")
+        or default_base
+    ).strip()
+    if "api.x.ai" in raw_base and not str(settings.get("sub2api_grok_base_url") or "").strip():
+        raw_base = default_base
+    credentials["base_url"] = raw_base
     email = str((account or {}).get("email") or "").strip()
     if email and not credentials.get("email"):
         credentials["email"] = email
