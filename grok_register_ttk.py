@@ -1283,6 +1283,28 @@ def build_sub2api_grok_refresh_token_payload(account, token_info=None, settings=
     if "api.x.ai" in raw_base and not str(settings.get("sub2api_grok_base_url") or "").strip():
         raw_base = default_base
     credentials["base_url"] = raw_base
+    # cli-chat-proxy 聊天必需的 grok-cli headers（对齐 grokcli-2api / CPA 导出）
+    # 缺这些时 billing 可能 200，但 chat/Responses 会 403 permission-denied
+    cli_headers = {
+        "X-XAI-Token-Auth": "xai-grok-cli",
+        "x-xai-token-auth": "xai-grok-cli",
+        "x-grok-client-version": str(
+            settings.get("sub2api_grok_client_version")
+            or CPA_CLIENT_HEADERS.get("x-grok-client-version")
+            or "0.2.93"
+        ),
+        "x-grok-client-identifier": str(
+            settings.get("sub2api_grok_client_identifier")
+            or CPA_CLIENT_HEADERS.get("x-grok-client-identifier")
+            or "grok-shell"
+        ),
+        "x-authenticateresponse": "authenticate-response",
+    }
+    existing_headers = credentials.get("headers")
+    if not isinstance(existing_headers, dict):
+        existing_headers = {}
+    merged_headers = {**cli_headers, **{k: v for k, v in existing_headers.items() if v}}
+    credentials["headers"] = merged_headers
     email = str((account or {}).get("email") or "").strip()
     if email and not credentials.get("email"):
         credentials["email"] = email
