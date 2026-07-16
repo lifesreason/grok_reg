@@ -1312,23 +1312,10 @@ def _extract_sub2api_account_id(created):
 
 
 def _sub2api_test_models(settings=None):
-    """探测用模型候选（不同 sub2api/Grok 版本模型名不一致）。"""
+    """探测只用 1 个模型，避免连打触发 oauth refresh account state changed。"""
     settings = settings or {}
     preferred = str(settings.get("sub2api_test_model") or "").strip()
-    models = []
-    if preferred:
-        models.append(preferred)
-    for m in (
-        "grok-3",
-        "grok-3-mini",
-        "grok-2",
-        "grok-2-latest",
-        "grok-4",
-        "grok-4-0709",
-    ):
-        if m not in models:
-            models.append(m)
-    return models
+    return [preferred] if preferred else ["grok-3"]
 
 
 def _parse_sub2api_test_sse(text):
@@ -1336,14 +1323,13 @@ def _parse_sub2api_test_sse(text):
     text = str(text or "")
     if not text.strip():
         return None, "empty body"
-    # 非 SSE 的 JSON
     try:
         data = json.loads(text)
         if isinstance(data, dict):
             if data.get("success") is True or data.get("ok") is True:
                 return True, "json success"
             if data.get("success") is False:
-                return False, str(data.get("error") or data.get("message") or data)[:200]
+                return False, str(data.get("error") or data.get("message") or data)[:300]
     except Exception:
         pass
 
@@ -1368,36 +1354,42 @@ def _parse_sub2api_test_sse(text):
             if event.get("success") is True or event.get("ok") is True:
                 return True, "test_complete success"
             err = str(event.get("error") or event.get("text") or event.get("message") or "test failed")
-            return False, err[:240]
+            return False, err[:300]
         if et in {"error", "test_error", "failed"}:
-            err = str(event.get("error") or event.get("text") or event.get("message") or "error")
-            last_err = err[:240]
-            # 继续读，可能后面有 complete
+            last_err = str(event.get("error") or event.get("text") or event.get("message") or "error")[:300]
             continue
-        # 有些实现直接塞 status
         if event.get("success") is True:
             return True, "event success"
         if event.get("success") is False:
-            last_err = str(event.get("error") or event.get("message") or "failed")[:240]
+            last_err = str(event.get("error") or event.get("message") or "failed")[:300]
     if last_err:
         return False, last_err
     if saw_event:
-        # 有事件但没有明确失败——保守当部分成功（至少触发了探测）
         return True, "sse events received"
-    # 纯 200 空/非结构化：不视为真正成功
     return None, f"unrecognized body: {text[:160]}"
 
 
+def _is_sub2api_rate_limited_msg(msg):
+    text = str(msg or "").lower()
+    return any(
+        k in text
+        for k in ("429", "resource-exhausted", "too many request", "rate limit", "rate_limit", "0/0")
+    )
+
+
+def _is_sub2api_oauth_state_msg(msg):
+    text = str(msg or "").lower()
+    return "account state changed" in text or "oauth refresh" in text
+
+
 def _sub2api_post_refresh_account(base, headers, account_id, log_callback=None):
-    """创建后强制 refresh，初始化会话（避免 UI 显示 forbidden）。"""
+    """创建后 refresh 一次（少路径，避免连打）。"""
     account_id = str(account_id or "").strip()
     if not account_id:
         return False, "missing account_id"
     urls = [
         f"{base}/admin/accounts/{account_id}/refresh",
         f"{base}/admin/grok/accounts/{account_id}/refresh",
-        f"{base}/admin/accounts/{account_id}/probe",
-        f"{base}/admin/grok/accounts/{account_id}/probe",
     ]
     last_err = ""
     for url in urls:
@@ -1406,15 +1398,14 @@ def _sub2api_post_refresh_account(base, headers, account_id, log_callback=None):
             code = int(getattr(resp, "status_code", 0) or 0)
             body = getattr(resp, "text", "") or ""
             if code in {200, 201, 204}:
-                # 若 body 里明确失败则继续试
                 low = body.lower()
-                if any(x in low for x in ("forbidden", "\"success\":false", "invalid_grant", "unauthorized")):
-                    last_err = f"{url} HTTP {code}: {body[:160]}"
+                if any(x in low for x in ("\"success\":false", "invalid_grant", "unauthorized")):
+                    last_err = f"HTTP {code}: {body[:200]}"
                     continue
                 if log_callback:
-                    log_callback(f"[*] sub2api refresh 成功 id={account_id} via {url.rsplit('/', 1)[-1]}")
+                    log_callback(f"[*] sub2api refresh 成功 id={account_id}")
                 return True, body[:200] or "refreshed"
-            last_err = f"{url} HTTP {code}: {body[:160]}"
+            last_err = f"HTTP {code}: {body[:200]}"
         except Exception as exc:
             last_err = str(exc)
             continue
@@ -1422,106 +1413,118 @@ def _sub2api_post_refresh_account(base, headers, account_id, log_callback=None):
 
 
 def _sub2api_post_test_account(base, headers, account_id, settings=None, log_callback=None):
-    """创建后探测：解析 SSE 结果，失败会换模型重试。"""
+    """探测：单模型 + 解析 SSE；429/state changed 时退避后最多再试 1 次。"""
     account_id = str(account_id or "").strip()
     if not account_id:
         return False, "missing account_id"
     settings = settings or {}
-    models = _sub2api_test_models(settings)
-    urls = [
-        f"{base}/admin/accounts/{account_id}/test",
-        f"{base}/admin/grok/accounts/{account_id}/test",
-        f"{base}/admin/accounts/{account_id}/probe",
-    ]
+    model_id = _sub2api_test_models(settings)[0]
+    url = f"{base}/admin/accounts/{account_id}/test"
     last_err = ""
-    for model_id in models:
-        for url in urls:
-            try:
-                resp = http_post(
-                    url,
-                    headers=headers,
-                    json={"model_id": model_id, "model": model_id},
-                    timeout=120,
-                    proxies={},
-                )
-                code = int(getattr(resp, "status_code", 0) or 0)
-                body = getattr(resp, "text", "") or ""
-                if code not in {200, 201, 204}:
-                    last_err = f"{url} model={model_id} HTTP {code}: {body[:160]}"
-                    continue
-                ok, msg = _parse_sub2api_test_sse(body)
-                if ok is True:
+
+    for attempt in range(1, 3):
+        try:
+            resp = http_post(
+                url,
+                headers=headers,
+                json={"model_id": model_id, "model": model_id},
+                timeout=120,
+                proxies={},
+            )
+            code = int(getattr(resp, "status_code", 0) or 0)
+            body = getattr(resp, "text", "") or ""
+            if code not in {200, 201, 204}:
+                last_err = f"HTTP {code}: {body[:200]}"
+                if _is_sub2api_rate_limited_msg(last_err) and attempt < 2:
                     if log_callback:
-                        log_callback(
-                            f"[*] sub2api 探测成功 id={account_id} model={model_id} ({msg})"
-                        )
-                    return True, msg
-                if ok is False:
-                    last_err = f"model={model_id} {msg}"
-                    if log_callback:
-                        log_callback(f"[Debug] sub2api 探测失败 id={account_id}: {last_err}")
-                    # 模型不对就换下一个
+                        log_callback(f"[*] sub2api 探测限流，等待 10s 后重试 id={account_id}")
+                    time.sleep(10)
                     continue
-                # 无法解析：记录但换路径/模型
-                last_err = f"model={model_id} {msg}"
-            except Exception as exc:
-                last_err = str(exc)
+                return False, last_err
+            ok, msg = _parse_sub2api_test_sse(body)
+            if ok is True:
+                if log_callback:
+                    log_callback(f"[*] sub2api 探测成功 id={account_id} model={model_id}")
+                return True, msg
+            last_err = msg or "test failed"
+            if log_callback:
+                log_callback(f"[Debug] sub2api 探测未通过 id={account_id}: {last_err[:200]}")
+            if _is_sub2api_rate_limited_msg(last_err) and attempt < 2:
+                if log_callback:
+                    log_callback(f"[*] sub2api 429/限流，等待 12s 后重试 id={account_id}")
+                time.sleep(12)
                 continue
+            if _is_sub2api_oauth_state_msg(last_err) and attempt < 2:
+                if log_callback:
+                    log_callback(f"[*] oauth 状态冲突，等待 6s 后 refresh 再测 id={account_id}")
+                time.sleep(6)
+                _sub2api_post_refresh_account(base, headers, account_id, log_callback=None)
+                time.sleep(4)
+                continue
+            return False, last_err
+        except Exception as exc:
+            last_err = str(exc)
+            if attempt < 2:
+                time.sleep(4)
+                continue
+            return False, last_err
     return False, last_err or "test failed"
 
 
+_SUB2API_INIT_LOCK = threading.RLock()
+_SUB2API_INIT_LAST_TS = 0.0
+
+
 def _sub2api_initialize_account(base, headers, account_id, settings=None, log_callback=None):
-    """创建后完整初始化：refresh → 等待 → test，必要时重试。"""
+    """创建后初始化：全局串行 + 温和 refresh/test，避免 429 与 state changed。"""
+    global _SUB2API_INIT_LAST_TS
     account_id = str(account_id or "").strip()
     if not account_id:
         return {"account_id": "", "refresh": None, "test": None, "ok": False}
     settings = settings or {}
     result = {"account_id": account_id, "refresh": None, "test": None, "ok": False}
 
-    # 新号凭证刚写入，稍等再 refresh
-    time.sleep(1.5)
-    ok_r, msg_r = _sub2api_post_refresh_account(
-        base, headers, account_id, log_callback=log_callback
-    )
-    result["refresh"] = {"ok": ok_r, "msg": msg_r}
-    if not ok_r:
-        # 再试一次
-        time.sleep(2.0)
-        ok_r2, msg_r2 = _sub2api_post_refresh_account(
+    with _SUB2API_INIT_LOCK:
+        try:
+            gap = max(1.0, float(settings.get("sub2api_init_gap_seconds") or 4.0))
+        except Exception:
+            gap = 4.0
+        wait = (_SUB2API_INIT_LAST_TS + gap) - time.time()
+        if wait > 0:
+            if log_callback:
+                log_callback(f"[*] sub2api 初始化节流等待 {wait:.1f}s")
+            time.sleep(wait)
+
+        time.sleep(2.5)
+        ok_r, msg_r = _sub2api_post_refresh_account(
             base, headers, account_id, log_callback=log_callback
         )
-        result["refresh"] = {"ok": ok_r2, "msg": msg_r2, "retry": msg_r}
-        ok_r = ok_r2
+        result["refresh"] = {"ok": ok_r, "msg": msg_r}
 
-    time.sleep(2.0 if ok_r else 3.0)
-    ok_t, msg_t = _sub2api_post_test_account(
-        base, headers, account_id, settings=settings, log_callback=log_callback
-    )
-    result["test"] = {"ok": ok_t, "msg": msg_t}
-
-    # 探测失败：再 refresh 一次后重测
-    if not ok_t:
-        if log_callback:
-            log_callback(f"[*] sub2api 探测未通过，二次 refresh 后重试 id={account_id}")
-        time.sleep(1.5)
-        _sub2api_post_refresh_account(base, headers, account_id, log_callback=log_callback)
-        time.sleep(2.5)
-        ok_t2, msg_t2 = _sub2api_post_test_account(
+        # refresh 后给 token 落稳；不要立刻连打多模型
+        time.sleep(5.0 if ok_r else 7.0)
+        ok_t, msg_t = _sub2api_post_test_account(
             base, headers, account_id, settings=settings, log_callback=log_callback
         )
-        result["test"] = {"ok": ok_t2, "msg": msg_t2, "retry_from": msg_t}
-        ok_t = ok_t2
+        result["test"] = {"ok": ok_t, "msg": msg_t}
+        result["ok"] = bool(ok_r and ok_t)
+        _SUB2API_INIT_LAST_TS = time.time()
 
-    result["ok"] = bool(ok_r and ok_t)
-    if log_callback:
-        if result["ok"]:
-            log_callback(f"[+] sub2api 账号已初始化 id={account_id}（refresh+探测通过）")
-        else:
-            log_callback(
-                f"[!] sub2api 初始化未完全成功 id={account_id} "
-                f"refresh={ok_r} test={ok_t}；请在 UI 手动点探测/刷新令牌"
-            )
-    return result
+        if log_callback:
+            if result["ok"]:
+                log_callback(f"[+] sub2api 账号已初始化 id={account_id}（refresh+探测通过）")
+            else:
+                hint = ""
+                blob = f"{msg_r} {msg_t}"
+                if _is_sub2api_rate_limited_msg(blob):
+                    hint = "（xAI 限流/RPM=0，稍后再在 UI 点探测通常会好）"
+                elif _is_sub2api_oauth_state_msg(blob):
+                    hint = "（oauth 状态冲突，请稍后手动刷新令牌再探测）"
+                log_callback(
+                    f"[!] sub2api 初始化未完全成功 id={account_id} "
+                    f"refresh={ok_r} test={ok_t}{hint}"
+                )
+        return result
 
 
 def _sub2api_find_account_id_by_name(base, headers, account_name, log_callback=None):
