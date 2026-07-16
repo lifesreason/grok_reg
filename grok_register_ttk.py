@@ -1416,8 +1416,22 @@ def _sub2api_post_refresh_account(base, headers, account_id, log_callback=None):
     return False, last_err or "refresh failed"
 
 
+def _is_sub2api_access_denied_msg(msg):
+    text = str(msg or "").lower()
+    return any(
+        k in text
+        for k in (
+            "access denied",
+            "403",
+            "forbidden",
+            "not allowed",
+            "permission",
+        )
+    )
+
+
 def _sub2api_post_test_account(base, headers, account_id, settings=None, log_callback=None):
-    """探测：单次请求 + 解析 SSE。429 不再连环重试（会打坏 oauth 状态）。"""
+    """探测：单次请求 + 解析 SSE。"""
     account_id = str(account_id or "").strip()
     if not account_id:
         return False, "missing account_id"
@@ -1441,9 +1455,8 @@ def _sub2api_post_test_account(base, headers, account_id, settings=None, log_cal
             if log_callback:
                 log_callback(f"[*] sub2api 探测成功 id={account_id} model={model_id}")
             return True, msg
-        # 明确失败
         if log_callback:
-            log_callback(f"[Debug] sub2api 探测未通过 id={account_id}: {str(msg)[:200]}")
+            log_callback(f"[Debug] sub2api 探测未通过 id={account_id}: {str(msg)[:220]}")
         return False, msg or "test failed"
     except Exception as exc:
         return False, str(exc)
@@ -1454,11 +1467,9 @@ _SUB2API_INIT_LAST_TS = 0.0
 
 
 def _sub2api_initialize_account(base, headers, account_id, settings=None, log_callback=None):
-    """创建后初始化：全局串行；默认 refresh + 可选一次探测。
+    """创建后初始化：全局串行；refresh + 探测（403/限流会有限次重试）。
 
-    说明：新免费号常遇 xAI 429 (RPM 0/0)。此时强行多轮 test/refresh
-    会触发 oauth refresh account state changed，反而更糟。
-    限流时只保留 refresh，探测交给用户稍后在 UI 操作。
+    探测失败仍算「已推送」，但会尽量再试，避免账号一直停在 forbidden。
     """
     global _SUB2API_INIT_LAST_TS
     account_id = str(account_id or "").strip()
@@ -1479,7 +1490,6 @@ def _sub2api_initialize_account(base, headers, account_id, settings=None, log_ca
                 log_callback(f"[*] sub2api 初始化节流等待 {wait:.1f}s")
             time.sleep(wait)
 
-        # 创建后稍等再 refresh
         time.sleep(3.0)
         ok_r, msg_r = _sub2api_post_refresh_account(
             base, headers, account_id, log_callback=log_callback
@@ -1493,34 +1503,62 @@ def _sub2api_initialize_account(base, headers, account_id, settings=None, log_ca
             ok_t, msg_t = _sub2api_post_test_account(
                 base, headers, account_id, settings=settings, log_callback=log_callback
             )
-            result["test"] = {"ok": ok_t, "msg": msg_t}
-            # 429 / state changed：不要再 refresh 连环打
-            if not ok_t and (
-                _is_sub2api_rate_limited_msg(msg_t) or _is_sub2api_oauth_state_msg(msg_t)
-            ):
+            # 403 Access denied：账号可能尚未完全可用，等久一点再 refresh+测 1 次
+            if not ok_t and _is_sub2api_access_denied_msg(msg_t):
                 if log_callback:
                     log_callback(
-                        f"[*] 探测遇限流/状态冲突，停止重试 id={account_id}；"
-                        "账号已入库，请数分钟后在 sub2api 点「探测」"
+                        f"[*] 探测 403 Access denied，等待 15s 后重试 id={account_id}"
                     )
+                time.sleep(15)
+                _sub2api_post_refresh_account(
+                    base, headers, account_id, log_callback=log_callback
+                )
+                time.sleep(5)
+                ok_t2, msg_t2 = _sub2api_post_test_account(
+                    base, headers, account_id, settings=settings, log_callback=log_callback
+                )
+                result["test"] = {
+                    "ok": ok_t2,
+                    "msg": msg_t2,
+                    "retry_from": msg_t,
+                }
+                ok_t, msg_t = ok_t2, msg_t2
+            # 429：只再等一次，不要连环 refresh
+            elif not ok_t and _is_sub2api_rate_limited_msg(msg_t):
+                if log_callback:
+                    log_callback(
+                        f"[*] 探测限流 429，等待 20s 后只再测 1 次 id={account_id}"
+                    )
+                time.sleep(20)
+                ok_t2, msg_t2 = _sub2api_post_test_account(
+                    base, headers, account_id, settings=settings, log_callback=log_callback
+                )
+                result["test"] = {
+                    "ok": ok_t2,
+                    "msg": msg_t2,
+                    "retry_from": msg_t,
+                }
+                ok_t, msg_t = ok_t2, msg_t2
+            else:
+                result["test"] = {"ok": ok_t, "msg": msg_t}
         else:
             result["test"] = {"ok": None, "msg": "auto_probe disabled"}
             if log_callback:
                 log_callback(f"[*] sub2api 已跳过自动探测 id={account_id}（仅 refresh）")
 
-        # refresh 成功即视为推送可用；探测失败不否掉推送结果
-        result["ok"] = bool(ok_r)
+        result["ok"] = bool(ok_r and (ok_t or not auto_probe))
         _SUB2API_INIT_LAST_TS = time.time()
 
         if log_callback:
             if ok_r and ok_t:
                 log_callback(f"[+] sub2api 账号已初始化 id={account_id}（refresh+探测通过）")
-            elif ok_r:
+            elif ok_r and auto_probe and not ok_t:
                 log_callback(
-                    f"[+] sub2api 账号已入库 id={account_id}（refresh 成功"
-                    + ("，探测未通过/已跳过" if auto_probe else "，未探测")
-                    + "）"
+                    f"[!] sub2api 账号已入库但探测失败 id={account_id}："
+                    f"{str(msg_t)[:120]}；请稍后在 UI 手动点「探测」"
                 )
+            elif ok_r:
+                log_callback(f"[+] sub2api 账号已入库 id={account_id}（仅 refresh）")
             else:
                 log_callback(
                     f"[!] sub2api refresh 失败 id={account_id}；可在 UI 手动刷新令牌"
