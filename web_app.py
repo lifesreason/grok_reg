@@ -51,7 +51,14 @@ def active_job_running():
     if not _active_job_id:
         return False
     job = _jobs.get(_active_job_id)
-    return bool(job and job.status()["status"] in {"pending", "running"})
+    if not job:
+        return False
+    try:
+        if job.status().get("status") not in {"pending", "running"}:
+            return False
+        return bool(job.thread and job.thread.is_alive())
+    except Exception:
+        return job.status().get("status") in {"pending", "running"}
 
 
 @app.get("/")
@@ -329,39 +336,75 @@ def _resolve_job(job_id: str):
 
 @app.get("/api/jobs/current")
 def get_current_job():
-    """页面刷新后恢复：优先返回运行中任务，否则最近一次任务。"""
+    """页面刷新后恢复：优先返回运行中任务；落盘 running 若进程已无则标为中断。"""
     with _job_lock:
         job_id = _active_job_id
         job = _jobs.get(job_id) if job_id else None
         if job is not None:
             st = job.status()
+            alive = False
+            try:
+                alive = bool(job.thread and job.thread.is_alive())
+            except Exception:
+                alive = st.get("status") in {"pending", "running"}
+            running = st.get("status") in {"pending", "running"} and alive
+            # 线程已死但状态还是 running：纠正
+            if st.get("status") in {"pending", "running"} and not alive:
+                try:
+                    job.status_value = "interrupted"
+                    job.finished_at = job.finished_at or __import__("datetime").datetime.now().isoformat(timespec="seconds")
+                    job._persist_status()
+                except Exception:
+                    pass
+                st = job.status()
+                running = False
             return {
                 "job_id": job.id,
                 "has_job": True,
-                "running": st.get("status") in {"pending", "running"},
+                "running": running,
                 **st,
             }
-        # 内存没有：读落盘 current
+
+        # 内存没有：读落盘 current（只读历史，不能当 running）
         meta = reg.load_current_job_meta()
         if not meta:
-            return {"has_job": False, "job_id": None, "status": "idle"}
+            return {"has_job": False, "job_id": None, "status": "idle", "running": False}
         job_id = str(meta.get("job_id") or "").strip()
         snapshot = reg.load_job_snapshot(job_id) if job_id else None
         if not snapshot:
-            return {"has_job": False, "job_id": job_id or None, "status": "idle"}
-        st = snapshot if isinstance(snapshot, dict) else {}
+            return {"has_job": False, "job_id": job_id or None, "status": "idle", "running": False}
+        st = dict(snapshot) if isinstance(snapshot, dict) else {}
+        disk_status = str(st.get("status") or meta.get("status") or "finished")
+        # 进程重启后磁盘上的 running 是僵尸状态
+        if disk_status in {"pending", "running"}:
+            disk_status = "interrupted"
+            try:
+                st["status"] = "interrupted"
+                reg.save_job_snapshot(job_id, st)
+                reg.save_current_job_meta(
+                    {
+                        "job_id": job_id,
+                        "status": "interrupted",
+                        "success_count": st.get("success_count"),
+                        "fail_count": st.get("fail_count"),
+                    }
+                )
+            except Exception:
+                pass
         return {
             "job_id": job_id,
             "has_job": True,
             "running": False,
             "from_disk": True,
-            **{k: st.get(k) for k in (
-                "status", "success_count", "fail_count", "register_count",
-                "register_threads", "output_file", "created_at", "started_at", "finished_at",
-            ) if k in st or True},
-            "status": st.get("status") or meta.get("status") or "finished",
+            "status": disk_status,
             "success_count": int(st.get("success_count") or meta.get("success_count") or 0),
             "fail_count": int(st.get("fail_count") or meta.get("fail_count") or 0),
+            "register_count": st.get("register_count"),
+            "register_threads": st.get("register_threads"),
+            "output_file": st.get("output_file"),
+            "created_at": st.get("created_at"),
+            "started_at": st.get("started_at"),
+            "finished_at": st.get("finished_at"),
         }
 
 
@@ -376,7 +419,6 @@ def start_job(payload: dict):
 
     with _job_lock:
         if active_job_running():
-            # 返回正在运行的任务，方便前端自动恢复而不是 409 打断
             job = _jobs.get(_active_job_id)
             if job is not None:
                 return {
@@ -394,14 +436,65 @@ def start_job(payload: dict):
         return {"job_id": job.id, **job.status()}
 
 
+def _do_stop_job(job_id: str = None):
+    """停止任务：优先指定 id，否则停当前 active；找不到则清理僵尸状态。"""
+    global _active_job_id
+    with _job_lock:
+        target_id = str(job_id or "").strip() or str(_active_job_id or "").strip()
+        job = _jobs.get(target_id) if target_id else None
+        if job is None and _active_job_id and _active_job_id != target_id:
+            job = _jobs.get(_active_job_id)
+            if job is not None:
+                target_id = _active_job_id
+        if job is not None:
+            job.stop()
+            st = job.status()
+            return {"ok": True, "job_id": target_id, **st}
+
+        meta = reg.load_current_job_meta() or {}
+        disk_id = str(meta.get("job_id") or target_id or "").strip()
+        snapshot = reg.load_job_snapshot(disk_id) if disk_id else None
+        if isinstance(snapshot, dict):
+            snapshot["status"] = "stopped"
+            snapshot["stop_requested"] = True
+            try:
+                reg.save_job_snapshot(disk_id, snapshot)
+            except Exception:
+                pass
+        if disk_id:
+            try:
+                reg.save_current_job_meta(
+                    {
+                        "job_id": disk_id,
+                        "status": "stopped",
+                        "success_count": (snapshot or {}).get("success_count")
+                        or meta.get("success_count"),
+                        "fail_count": (snapshot or {}).get("fail_count")
+                        or meta.get("fail_count"),
+                    }
+                )
+            except Exception:
+                pass
+        _active_job_id = None
+        return {
+            "ok": True,
+            "job_id": disk_id or target_id or None,
+            "status": "stopped",
+            "message": "无运行中任务，已清理状态",
+            "from_disk": True,
+            "success_count": int((snapshot or {}).get("success_count") or meta.get("success_count") or 0),
+            "fail_count": int((snapshot or {}).get("fail_count") or meta.get("fail_count") or 0),
+        }
+
+
+@app.post("/api/jobs/stop")
+def stop_current_job():
+    return _do_stop_job(None)
+
+
 @app.post("/api/jobs/{job_id}/stop")
 def stop_job(job_id: str):
-    job = _jobs.get(job_id)
-    if not job:
-        # 落盘快照无法 stop
-        raise HTTPException(status_code=404, detail="任务不存在或已结束")
-    job.stop()
-    return job.status()
+    return _do_stop_job(job_id)
 
 
 @app.get("/api/jobs/{job_id}")
@@ -413,8 +506,20 @@ def get_job(job_id: str):
         st = dict(job) if isinstance(job, dict) else {}
         st.setdefault("id", job_id)
         st["from_disk"] = True
+        # 磁盘上的 running 不可信
+        if str(st.get("status") or "") in {"pending", "running"}:
+            st["status"] = "interrupted"
+            st["running"] = False
         return st
-    return job.status()
+    st = job.status()
+    try:
+        alive = bool(job.thread and job.thread.is_alive())
+    except Exception:
+        alive = st.get("status") in {"pending", "running"}
+    if st.get("status") in {"pending", "running"} and not alive:
+        st = dict(st)
+        st["status"] = "interrupted"
+    return st
 
 
 @app.get("/api/jobs/{job_id}/logs")

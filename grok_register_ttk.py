@@ -5107,6 +5107,18 @@ def load_job_snapshot(job_id):
         return None
 
 
+def save_job_snapshot(job_id, snapshot):
+    job_id = str(job_id or "").strip()
+    if not job_id or not isinstance(snapshot, dict):
+        return
+    path = _job_status_path(job_id)
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(snapshot, handle, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
 def read_job_log_lines(job_id, offset=0):
     path = _job_log_path(job_id)
     try:

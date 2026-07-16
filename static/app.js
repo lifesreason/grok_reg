@@ -255,9 +255,43 @@ async function startJob() {
 }
 
 async function stopJob() {
-  if (!currentJobId) return;
-  await requestJson(`/api/jobs/${currentJobId}/stop`, { method: "POST" });
-  setMessage("已请求停止任务");
+  // 优先当前 id；失败则停服务端 active
+  const id = currentJobId;
+  try {
+    let result;
+    if (id) {
+      try {
+        result = await requestJson(`/api/jobs/${id}/stop`, { method: "POST" });
+      } catch (error) {
+        // 404：尝试无 id 的 stop（停当前 active / 清僵尸）
+        result = await requestJson(`/api/jobs/stop`, { method: "POST" });
+      }
+    } else {
+      result = await requestJson(`/api/jobs/stop`, { method: "POST" });
+    }
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+    statusText.textContent = result.status || "stopped";
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    if (result.job_id) rememberJobId(result.job_id);
+    setMessage(result.message || "已请求停止任务");
+    renderDashboard();
+  } catch (error) {
+    // 最终失败也清前端状态，避免卡在 running
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+    statusText.textContent = "stopped";
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    rememberJobId(null);
+    setMessage(`停止任务: ${error.message}`);
+    renderDashboard();
+  }
 }
 
 async function pollJob() {
@@ -266,27 +300,45 @@ async function pollJob() {
   try {
     status = await requestJson(`/api/jobs/${currentJobId}`);
   } catch (error) {
-    // 任务可能已结束且内存丢失：尝试 current 接口
     if (String(error.message || "").includes("404") || String(error.message || "").includes("不存在")) {
-      await restoreCurrentJob({ silent: true });
-      return;
+      const current = await requestJson("/api/jobs/current").catch(() => null);
+      if (current && current.has_job && current.job_id) {
+        rememberJobId(current.job_id);
+        status = current;
+      } else {
+        if (pollTimer) {
+          clearInterval(pollTimer);
+          pollTimer = null;
+        }
+        statusText.textContent = "idle";
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+        rememberJobId(null);
+        return;
+      }
+    } else {
+      throw error;
     }
-    throw error;
   }
   statusText.textContent = status.status;
   statsText.textContent = `成功 ${status.success_count || 0} / 失败 ${status.fail_count || 0}`;
-  const running = ["pending", "running"].includes(status.status);
-  startBtn.disabled = running;
-  stopBtn.disabled = !running;
+  const running = Boolean(status.running) || ["pending", "running"].includes(status.status);
+  // from_disk / interrupted 不算 running
+  const trulyRunning =
+    running && !status.from_disk && !["interrupted", "stopped", "completed", "failed", "idle"].includes(status.status);
+  startBtn.disabled = trulyRunning;
+  stopBtn.disabled = !trulyRunning;
 
-  const logs = await requestJson(`/api/jobs/${currentJobId}/logs?offset=${logOffset}`);
-  if (logs.lines && logs.lines.length) {
-    logBox.textContent += `${logs.lines.join("\n")}\n`;
-    logBox.scrollTop = logBox.scrollHeight;
-    logOffset = logs.next_offset;
+  if (currentJobId) {
+    const logs = await requestJson(`/api/jobs/${currentJobId}/logs?offset=${logOffset}`);
+    if (logs.lines && logs.lines.length) {
+      logBox.textContent += `${logs.lines.join("\n")}\n`;
+      logBox.scrollTop = logBox.scrollHeight;
+      logOffset = logs.next_offset;
+    }
   }
 
-  if (!running && pollTimer) {
+  if (!trulyRunning && pollTimer) {
     clearInterval(pollTimer);
     pollTimer = null;
     loadAccounts().catch((error) => setMessage(error.message));
