@@ -8382,24 +8382,49 @@ def register_via_pure_http(log_callback=None, cancel_callback=None):
         t1.start()
         t2.start()
 
-        # 4) 发验证码（与 Solver 并行）
+        # 4) 发验证码（与 Solver 并行）；空 body / grpc=None 时刷新会话重试
         raise_if_cancelled(cancel_callback)
-        send_res = _xai_grpc_call(
-            session, create_code_url, [(1, email)], referer=signup_url, log_callback=log_callback
-        )
-        if not send_res.get("ok"):
-            # 域名拒收等
+        send_res = None
+        for send_try in range(1, 4):
+            send_res = _xai_grpc_call(
+                session,
+                create_code_url,
+                [(1, email)],
+                referer=signup_url,
+                log_callback=log_callback,
+            )
+            if send_res.get("ok"):
+                break
             trailers = send_res.get("trailers") or {}
             msg = str(trailers.get("grpc-message") or "")
-            raw_preview = (send_res.get("raw") or b"")[:200]
+            raw = send_res.get("raw") or b""
+            # 域名拒收：不重试
             if "reject" in msg.lower() or "domain" in msg.lower():
                 domain = email.split("@")[-1] if "@" in email else ""
                 if domain:
                     remember_rejected_email_domain(domain, log_callback=log_callback)
                 raise EmailDomainRejected(domain or email)
+            empty = (
+                not raw
+                or send_res.get("grpc_status") is None
+                or int(send_res.get("http_status") or 0) in {0, 429, 502, 503}
+            )
+            if empty and send_try < 3:
+                if log_callback:
+                    log_callback(
+                        f"[*] CreateEmailValidationCode 空/异常响应，"
+                        f"刷新会话后重试 ({send_try}/3)"
+                    )
+                try:
+                    session.get(signup_url, headers=page_headers, timeout=30)
+                except Exception:
+                    pass
+                sleep_with_cancel(1.2 * send_try, cancel_callback)
+                continue
             raise RuntimeError(
                 f"CreateEmailValidationCode 失败 http={send_res.get('http_status')} "
-                f"grpc={send_res.get('grpc_status')} msg={msg!r} raw={raw_preview!r}"
+                f"grpc={send_res.get('grpc_status')} msg={msg!r} "
+                f"raw={(raw[:200])!r}"
             )
 
         # 5) 收验证码
