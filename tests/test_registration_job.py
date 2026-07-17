@@ -110,6 +110,19 @@ def test_load_config_resets_defaults_when_data_directory_has_no_config(monkeypat
     assert settings["cpa_management_key"] == ""
 
 
+def test_load_config_migrates_old_sub2api_probe_default(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    tmp_path.joinpath("config.json").write_text(
+        json.dumps({"sub2api_auto_probe": True}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    settings = reg.load_config()
+
+    assert settings["sub2api_auto_probe"] is False
+    assert settings["sub2api_validate_refresh_token"] is False
+
+
 def test_delete_registered_accounts_removes_selected_account_and_migrates_remaining_statuses(
     monkeypatch, tmp_path
 ):
@@ -1166,6 +1179,7 @@ def test_import_accounts_to_sub2api_posts_grok_refresh_token(monkeypatch):
             "sub2api_group_ids": "1, 2",
             "sub2api_concurrency": 5,
             "sub2api_priority": 40,
+            "sub2api_validate_refresh_token": True,
         },
     )
 
@@ -1183,11 +1197,51 @@ def test_import_accounts_to_sub2api_posts_grok_refresh_token(monkeypatch):
     assert calls[1][1]["json"]["credentials"]["token_type"] == "Bearer"
     assert calls[1][1]["json"]["credentials"]["expires_at"] == 1790000000
     assert calls[1][1]["json"]["credentials"]["client_id"]
-    assert calls[1][1]["json"]["credentials"]["base_url"] == "https://api.x.ai/v1"
+    assert calls[1][1]["json"]["credentials"]["base_url"] == "https://cli-chat-proxy.grok.com/v1"
     assert calls[1][1]["json"]["group_ids"] == [1, 2]
     assert calls[1][1]["json"]["concurrency"] == 5
     assert calls[1][1]["json"]["priority"] == 40
     assert "sso-token-1" not in str(calls[1][1]["json"])
+
+
+def test_import_accounts_to_sub2api_posts_account_directly_by_default(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+            self.status_code = 200
+            self.text = "{}"
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    def fake_post(url, **kwargs):
+        calls.append(url)
+        if url.endswith("/admin/accounts"):
+            return FakeResponse({"code": 0, "data": {"id": 101}})
+        raise AssertionError(f"unexpected URL: {url}")
+
+    monkeypatch.setattr(reg, "http_post", fake_post)
+    monkeypatch.setattr(reg.time, "sleep", lambda seconds: (_ for _ in ()).throw(AssertionError("probe sleep should not run")))
+
+    result = reg.import_accounts_to_sub2api(
+        [{"email": "user@example.com", "sso": "sso-token", "refresh_token": "refresh-token"}],
+        {
+            "sub2api_base": "https://sub2api.example/api/v1",
+            "sub2api_admin_token": "admin-key",
+        },
+    )
+
+    assert result["imported"] is True
+    assert result["items"][0]["post_actions"]["ok"] is True
+    assert result["items"][0]["post_actions"]["test"]["ok"] is None
+    assert calls == [
+        "https://sub2api.example/api/v1/admin/accounts",
+    ]
 
 
 def test_import_accounts_to_sub2api_returns_per_account_failure(monkeypatch):
@@ -1210,6 +1264,7 @@ def test_import_accounts_to_sub2api_returns_per_account_failure(monkeypatch):
         {
             "sub2api_base": "https://sub2api.example/api/v1",
             "sub2api_admin_token": "admin-key",
+            "sub2api_validate_refresh_token": True,
         },
     )
 
@@ -1299,6 +1354,7 @@ def test_import_accounts_to_sub2api_reauths_when_refresh_token_revoked(monkeypat
         {
             "sub2api_base": "https://sub2api.example/api/v1",
             "sub2api_admin_token": "admin-key",
+            "sub2api_validate_refresh_token": True,
         },
     )
 

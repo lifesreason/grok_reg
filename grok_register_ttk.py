@@ -102,8 +102,9 @@ DEFAULT_CONFIG = {
     "sub2api_group_ids": "",
     "sub2api_concurrency": 3,
     "sub2api_priority": 50,
-    # 推送后是否自动探测（遇 xAI 429 时可关掉，只 refresh）
-    "sub2api_auto_probe": True,
+    # 推送默认只创建账号；预校验/探测会触发 xAI 请求，容易慢或被限流，需要时再显式开启。
+    "sub2api_validate_refresh_token": False,
+    "sub2api_auto_probe": False,
     "sub2api_init_gap_seconds": 8,
     "sub2api_test_model": "grok-4.5",
     "cpa_auth_dir": "cpa_auths",
@@ -229,6 +230,10 @@ def load_config():
             with open(config_file, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
             config = {**DEFAULT_CONFIG, **loaded}
+            # 旧版本页面默认勾选自动探测，保存后会让“推送账号”被创建后探测拖慢。
+            # 新版本默认快路径：旧配置未见过新开关时，迁移回不自动探测。
+            if "sub2api_validate_refresh_token" not in loaded:
+                config["sub2api_auto_probe"] = False
         except Exception:
             config = DEFAULT_CONFIG.copy()
     return config
@@ -1510,8 +1515,15 @@ def _sub2api_initialize_account(base, headers, account_id, settings=None, log_ca
     if not account_id:
         return {"account_id": "", "refresh": None, "test": None, "ok": False}
     settings = settings or {}
-    auto_probe = bool(settings.get("sub2api_auto_probe", True))
+    auto_probe = bool(settings.get("sub2api_auto_probe", False))
     result = {"account_id": account_id, "refresh": None, "test": None, "ok": False}
+
+    if not auto_probe:
+        result["test"] = {"ok": None, "msg": "auto_probe disabled"}
+        result["ok"] = True
+        if log_callback:
+            log_callback(f"[*] sub2api 已跳过自动探测 id={account_id}")
+        return result
 
     with _SUB2API_INIT_LOCK:
         try:
@@ -1523,14 +1535,6 @@ def _sub2api_initialize_account(base, headers, account_id, settings=None, log_ca
             if log_callback:
                 log_callback(f"[*] sub2api 初始化节流等待 {wait:.1f}s")
             time.sleep(wait)
-
-        if not auto_probe:
-            result["test"] = {"ok": None, "msg": "auto_probe disabled"}
-            result["ok"] = True
-            _SUB2API_INIT_LAST_TS = time.time()
-            if log_callback:
-                log_callback(f"[*] sub2api 已跳过自动探测 id={account_id}")
-            return result
 
         # 创建后稍等再探测，给 sub2api 落库时间
         time.sleep(4.0)
@@ -1614,18 +1618,20 @@ def _sub2api_find_account_id_by_name(base, headers, account_name, log_callback=N
 
 
 def _push_one_account_to_sub2api(account, settings, base, headers, index, log_callback=None):
-    token_info = _sub2api_response_data(
-        http_post(
-            f"{base}/admin/grok/oauth/refresh-token",
-            headers=headers,
-            json=build_sub2api_grok_refresh_token_check_payload(account, settings),
-            timeout=60,
-            proxies={},
+    token_info = {}
+    if bool(settings.get("sub2api_validate_refresh_token")):
+        token_info = _sub2api_response_data(
+            http_post(
+                f"{base}/admin/grok/oauth/refresh-token",
+                headers=headers,
+                json=build_sub2api_grok_refresh_token_check_payload(account, settings),
+                timeout=60,
+                proxies={},
+            )
         )
-    )
-    token_refresh = str((token_info or {}).get("refresh_token") or "").strip()
-    if token_refresh and token_refresh != str(account.get("refresh_token") or "").strip():
-        replace_registered_account_refresh_token(account, token_refresh)
+        token_refresh = str((token_info or {}).get("refresh_token") or "").strip()
+        if token_refresh and token_refresh != str(account.get("refresh_token") or "").strip():
+            replace_registered_account_refresh_token(account, token_refresh)
     payload = build_sub2api_grok_refresh_token_payload(account, token_info, settings, index=index)
     created = _sub2api_response_data(
         http_post(
@@ -5011,6 +5017,11 @@ def validate_registration_config(settings):
         normalized["enable_nsfw"] = bool(normalized.get("enable_nsfw"))
     normalized["grok2api_auto_add_remote"] = bool(normalized.get("grok2api_auto_add_remote"))
     normalized["sub2api_auto_import_remote"] = bool(normalized.get("sub2api_auto_import_remote"))
+    raw_validate = normalized.get("sub2api_validate_refresh_token")
+    if isinstance(raw_validate, str):
+        normalized["sub2api_validate_refresh_token"] = raw_validate.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        normalized["sub2api_validate_refresh_token"] = bool(raw_validate)
     if "sub2api_auto_probe" in normalized:
         raw_probe = normalized.get("sub2api_auto_probe")
         if isinstance(raw_probe, str):
@@ -5018,7 +5029,7 @@ def validate_registration_config(settings):
         else:
             normalized["sub2api_auto_probe"] = bool(raw_probe)
     else:
-        normalized["sub2api_auto_probe"] = True
+        normalized["sub2api_auto_probe"] = False
     try:
         normalized["sub2api_init_gap_seconds"] = max(
             1.0, min(120.0, float(normalized.get("sub2api_init_gap_seconds") or 8))
