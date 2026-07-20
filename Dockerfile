@@ -16,9 +16,7 @@ WORKDIR /app
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
-        curl \
         wget \
-        gnupg \
         fonts-liberation \
         fonts-dejavu-core \
         libasound2 \
@@ -43,12 +41,20 @@ RUN apt-get update \
         apt-get install -y --no-install-recommends chromium \
         && ln -sf /usr/bin/chromium /usr/bin/browser; \
     fi \
-    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+    && apt-get purge -y --auto-remove wget \
+    && rm -rf \
+        /var/lib/apt/lists/* \
+        /var/cache/apt/archives/* \
+        /tmp/* \
+        /var/tmp/* \
+        /usr/share/doc/* \
+        /usr/share/man/* \
+        /usr/share/info/*
 
 ENV CHROME_BIN=/usr/bin/browser
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --no-compile -r requirements.txt
 
 COPY . .
 RUN mkdir -p /app/data \

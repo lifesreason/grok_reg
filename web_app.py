@@ -421,11 +421,7 @@ def start_job(payload: dict):
         if active_job_running():
             job = _jobs.get(_active_job_id)
             if job is not None:
-                return {
-                    "job_id": job.id,
-                    "already_running": True,
-                    **job.status(),
-                }
+                raise HTTPException(status_code=409, detail="已有任务正在运行")
             raise HTTPException(status_code=409, detail="已有任务正在运行")
         reg.config = validated
         reg.save_config()

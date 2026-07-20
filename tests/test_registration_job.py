@@ -30,13 +30,13 @@ def test_validate_registration_config_normalizes_counts_and_paths():
     settings = reg.validate_registration_config(
         {
             "email_provider": "duckmail",
-            "register_count": "3",
+            "register_count": "1200",
             "register_threads": "20",
             "cloudflare_paths": "api/domains,api/new_address,api/token,api/mails",
         }
     )
 
-    assert settings["register_count"] == 3
+    assert settings["register_count"] == 1000
     assert settings["register_threads"] == 10
     assert settings["cloudflare_path_domains"] == "/api/domains"
     assert settings["cloudflare_path_accounts"] == "/api/new_address"
@@ -44,6 +44,19 @@ def test_validate_registration_config_normalizes_counts_and_paths():
     assert settings["cloudflare_path_messages"] == "/api/mails"
     assert settings["grok2api_auto_add_remote"] is False
     assert settings["sub2api_auto_import_remote"] is False
+
+
+def test_validate_registration_config_normalizes_sub2api_proxy_and_models():
+    settings = reg.validate_registration_config(
+        {
+            "email_provider": "duckmail",
+            "sub2api_proxy": " 1.2.3.4:7890 ",
+            "sub2api_models": " grok-4.5, grok-4.3 ",
+        }
+    )
+
+    assert settings["sub2api_proxy"] == "1.2.3.4:7890"
+    assert settings["sub2api_models"] == "grok-4.5, grok-4.3"
 
 
 def test_validate_registration_config_keeps_auto_push_switches():
@@ -797,7 +810,7 @@ def test_registration_job_stops_queue_when_email_provider_is_unusable(monkeypatc
     assert any("邮箱服务商不可用" in line for line in job.logs())
 
 
-def test_yyds_pick_domain_skips_rejected_domains_and_rotates(monkeypatch):
+def test_yyds_pick_domain_ignores_permanent_rejected_domains_and_rotates(monkeypatch):
     reg._rejected_email_domains.clear()
     reg.remember_rejected_email_domain("first.example")
     monkeypatch.setattr(
@@ -811,45 +824,42 @@ def test_yyds_pick_domain_skips_rejected_domains_and_rotates(monkeypatch):
     )
     monkeypatch.setattr(reg, "_yyds_domain_index", 0, raising=False)
 
-    assert reg.yyds_pick_domain() == "second.example"
+    assert reg.yyds_pick_domain() == "first.example"
 
 
-def test_remember_rejected_email_domain_stores_exact_suffix_only(monkeypatch, tmp_path):
+def test_remember_rejected_email_domain_does_not_store_permanent_suffix(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     reg._rejected_email_domains.clear()
     reg.load_rejected_email_domains(force=True)
     reg.remember_rejected_email_domain("007.hzeg.eu.org")
 
-    # 只记精确后缀，不自动拉黑父域/兄弟子域
-    assert reg.is_email_domain_rejected("007.hzeg.eu.org")
+    # 对齐 openai-cpa：拒收只进入运行时冷却，不再写永久黑名单。
+    assert not reg.is_email_domain_rejected("007.hzeg.eu.org")
     assert not reg.is_email_domain_rejected("10011.hzeg.eu.org")
     assert not reg.is_email_domain_rejected("hzeg.eu.org")
     assert not reg.is_email_domain_rejected("eu.org")
     assert not reg.is_email_domain_rejected("10161993.xyz")
 
-    # 只有当父域本身被拒并入库时，才拦截其子域
+    # 再次记录父域也不会永久拦截其子域
     reg.remember_rejected_email_domain("hzeg.eu.org")
-    assert reg.is_email_domain_rejected("10011.hzeg.eu.org")
+    assert not reg.is_email_domain_rejected("10011.hzeg.eu.org")
 
 
-def test_rejected_email_domains_are_persisted_and_reloaded(monkeypatch, tmp_path):
+def test_rejected_email_domains_are_not_persisted_from_runtime_rejections(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
     reg._rejected_email_domains.clear()
     reg.load_rejected_email_domains(force=True)
     reg.remember_rejected_email_domain("100811.xyz")
 
     path = tmp_path / "rejected_email_domains.json"
-    assert path.exists()
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["domains"] == ["100811.xyz"]
+    assert not path.exists()
 
     # 模拟进程重启：清空内存后再加载
     reg._rejected_email_domains.clear()
     reg.load_rejected_email_domains(force=True)
-    assert reg.is_email_domain_rejected("a@100811.xyz")
-    # 父域被显式拉黑时，其子域也应拦截；但不会自动写入父域
-    assert reg.is_email_domain_rejected("sub.100811.xyz")
-    assert reg.list_rejected_email_domains() == ["100811.xyz"]
+    assert not reg.is_email_domain_rejected("a@100811.xyz")
+    assert not reg.is_email_domain_rejected("sub.100811.xyz")
+    assert reg.list_rejected_email_domains() == []
 
 
 def test_extract_rejected_email_domain_supports_chinese_copy():
@@ -1198,6 +1208,7 @@ def test_import_accounts_to_sub2api_posts_grok_refresh_token(monkeypatch):
     assert calls[1][1]["json"]["credentials"]["expires_at"] == 1790000000
     assert calls[1][1]["json"]["credentials"]["client_id"]
     assert calls[1][1]["json"]["credentials"]["base_url"] == "https://cli-chat-proxy.grok.com/v1"
+    assert calls[1][1]["json"]["credentials"]["model_mapping"] == {"grok-4.5": "grok-4.5"}
     assert calls[1][1]["json"]["group_ids"] == [1, 2]
     assert calls[1][1]["json"]["concurrency"] == 5
     assert calls[1][1]["json"]["priority"] == 40
@@ -1242,6 +1253,73 @@ def test_import_accounts_to_sub2api_posts_account_directly_by_default(monkeypatc
     assert calls == [
         "https://sub2api.example/api/v1/admin/accounts",
     ]
+
+
+def test_import_accounts_to_sub2api_resolves_proxy_and_sets_model_mapping(monkeypatch):
+    get_calls = []
+    post_calls = []
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+            self.status_code = 200
+            self.text = "{}"
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    def fake_get(url, **kwargs):
+        get_calls.append((url, kwargs))
+        if url.endswith("/admin/proxies/all"):
+            return FakeResponse(
+                {
+                    "code": 0,
+                    "data": [
+                        {
+                            "id": 77,
+                            "name": "cn-proxy",
+                            "url": "http://1.2.3.4:7890",
+                        }
+                    ],
+                }
+            )
+        raise AssertionError(f"unexpected GET URL: {url}")
+
+    def fake_post(url, **kwargs):
+        post_calls.append((url, kwargs))
+        if url.endswith("/admin/accounts"):
+            return FakeResponse({"code": 0, "data": {"id": 101}})
+        raise AssertionError(f"unexpected POST URL: {url}")
+
+    monkeypatch.setattr(reg, "http_get", fake_get)
+    monkeypatch.setattr(reg, "http_post", fake_post)
+
+    result = reg.import_accounts_to_sub2api(
+        [{"email": "user@example.com", "sso": "sso-token", "refresh_token": "refresh-token"}],
+        {
+            "sub2api_base": "https://sub2api.example/api/v1",
+            "sub2api_admin_token": "admin-key",
+            "sub2api_proxy": "1.2.3.4:7890",
+            "sub2api_models": "grok-4.5, grok-4.3",
+        },
+    )
+
+    assert result["imported"] is True
+    assert get_calls == [
+        (
+            "https://sub2api.example/api/v1/admin/proxies/all",
+            {"headers": {"Content-Type": "application/json", "x-api-key": "admin-key"}, "params": {"with_count": "true"}, "timeout": 30, "proxies": {}},
+        )
+    ]
+    payload = post_calls[0][1]["json"]
+    assert payload["proxy_id"] == 77
+    assert payload["credentials"]["model_mapping"] == {
+        "grok-4.5": "grok-4.5",
+        "grok-4.3": "grok-4.3",
+    }
 
 
 def test_import_accounts_to_sub2api_returns_per_account_failure(monkeypatch):
@@ -2032,11 +2110,29 @@ def test_docker_starts_web_server_directly_and_keeps_xvfb_for_registration():
     assert 'GROK_REG_HEADLESS: "0"' in compose
 
 
-def test_docker_workflow_publishes_amd64_and_arm64_images():
+def test_docker_image_uses_conservative_single_image_slimming():
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+    requirements = Path("requirements.txt").read_text(encoding="utf-8")
+    dockerignore = Path(".dockerignore").read_text(encoding="utf-8")
+
+    assert "pip install --no-cache-dir --no-compile -r requirements.txt" in dockerfile
+    assert "apt-get purge -y --auto-remove wget" in dockerfile
+    assert "/usr/share/doc" in dockerfile
+    assert "/usr/share/man" in dockerfile
+    assert "uvicorn[standard]" not in requirements
+    assert "uvicorn>=" in requirements
+    assert ".codegraph" in dockerignore
+    assert ".claude" in dockerignore
+    assert ".mcp.json" in dockerignore
+
+
+def test_docker_workflow_defaults_to_amd64_with_optional_arm64_dispatch():
     workflow = Path(".github/workflows/docker-image.yml").read_text(encoding="utf-8")
 
     assert "docker/setup-qemu-action@v3" in workflow
-    assert "platforms: linux/amd64,linux/arm64" in workflow
+    assert 'default: "linux/amd64"' in workflow
+    assert 'if [ -z "$P" ]; then P="linux/amd64"; fi' in workflow
+    assert "contains(github.event.inputs.platforms || 'linux/amd64', 'arm')" in workflow
 
 
 def test_loopback_proxy_is_rewritten_inside_docker(monkeypatch):
@@ -2525,8 +2621,8 @@ def test_docker_visible_browser_keeps_linux_startup_flags(monkeypatch):
 
     assert ("--no-sandbox", None) in options.arguments
     assert ("--disable-dev-shm-usage", None) in options.arguments
-    assert ("--disable-gpu", None) in options.arguments
-    assert ("--window-size", "1365,900") in options.arguments
+    assert ("--disable-gpu", None) not in options.arguments
+    assert ("--window-size", "1920,1080") in options.arguments
 
 
 def test_docker_forces_visible_mode_even_if_legacy_headless_env_is_set(monkeypatch):
@@ -2565,7 +2661,7 @@ def test_visible_docker_starts_xvfb_when_display_is_missing(monkeypatch):
     started = reg.ensure_virtual_display()
 
     assert started is True
-    assert calls == [["Xvfb", ":99", "-screen", "0", "1365x900x24", "-nolisten", "tcp"]]
+    assert calls == [["Xvfb", ":99", "-screen", "0", "1920x1080x24", "-nolisten", "tcp"]]
     assert reg.os.environ["DISPLAY"] == ":99"
 
 

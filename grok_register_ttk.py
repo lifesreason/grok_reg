@@ -100,6 +100,8 @@ DEFAULT_CONFIG = {
     "sub2api_admin_token": "",
     "sub2api_account_name": "Grok Auto",
     "sub2api_group_ids": "",
+    "sub2api_proxy": "",
+    "sub2api_models": "grok-4.5",
     "sub2api_concurrency": 3,
     "sub2api_priority": 50,
     # 推送默认只创建账号；预校验/探测会触发 xAI 请求，容易慢或被限流，需要时再显式开启。
@@ -1251,6 +1253,211 @@ def _sub2api_account_name(account, settings=None, index=1):
     return f"{base_name} - {email}" if email else f"{base_name} #{index}"
 
 
+def _normalize_sub2api_models_value(value):
+    raw = str(value or "").replace("，", ",").replace(";", ",").replace("\n", ",")
+    models = [item.strip() for item in raw.split(",") if item.strip()]
+    return ", ".join(models) or "grok-4.5"
+
+
+def _sub2api_model_mapping(settings=None):
+    settings = {**config, **dict(settings or {})}
+    raw = (
+        settings.get("sub2api_models")
+        or settings.get("sub2api_model")
+        or settings.get("sub2api_test_model")
+        or "grok-4.5"
+    )
+    mapping = {}
+    for item in _normalize_sub2api_models_value(raw).split(","):
+        text = item.strip()
+        if not text:
+            continue
+        if "=>" in text:
+            source, target = text.split("=>", 1)
+        elif "=" in text:
+            source, target = text.split("=", 1)
+        else:
+            source, target = text, text
+        source = source.strip()
+        target = target.strip()
+        if source and target:
+            mapping[source] = target
+    return mapping or {"grok-4.5": "grok-4.5"}
+
+
+def _normalize_sub2api_proxy_value(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if re.match(r"^[a-z][a-z0-9+.-]*://", raw, re.I):
+        return raw
+    # 面板允许直接填 IP:端口 / host:端口；sub2api 代理 URL 默认按 http 处理。
+    if ":" in raw or "@" in raw:
+        return f"http://{raw}"
+    return raw
+
+
+def _sub2api_proxy_compare_values(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return set()
+    normalized = _normalize_sub2api_proxy_value(raw)
+    values = {raw.lower(), normalized.lower()}
+    parsed = urllib.parse.urlsplit(normalized)
+    if parsed.hostname:
+        host_port = parsed.hostname
+        if parsed.port:
+            host_port = f"{host_port}:{parsed.port}"
+        values.add(host_port.lower())
+        values.add(f"{parsed.scheme}://{host_port}".lower())
+        if parsed.username or parsed.password:
+            auth = parsed.username or ""
+            if parsed.password:
+                auth = f"{auth}:{parsed.password}"
+            values.add(f"{parsed.scheme}://{auth}@{host_port}".lower())
+    return {item for item in values if item}
+
+
+def _sub2api_proxy_items(data):
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    for key in ("items", "list", "proxies", "results"):
+        items = data.get(key)
+        if isinstance(items, list):
+            return items
+    nested = data.get("data")
+    if nested is not data:
+        return _sub2api_proxy_items(nested)
+    return []
+
+
+def _sub2api_proxy_item_values(item):
+    if not isinstance(item, dict):
+        return set()
+    values = set()
+    for key in ("id", "proxy_id", "name", "url", "proxy_url", "proxy", "address", "server"):
+        value = item.get(key)
+        if value is not None:
+            values.update(_sub2api_proxy_compare_values(value))
+            values.add(str(value).strip().lower())
+    host = str(item.get("host") or item.get("hostname") or item.get("ip") or "").strip()
+    port = str(item.get("port") or "").strip()
+    protocol = str(item.get("protocol") or item.get("type") or "http").strip().lower() or "http"
+    if host:
+        host_port = f"{host}:{port}" if port else host
+        values.add(host_port.lower())
+        values.add(f"{protocol}://{host_port}".lower())
+    return {value for value in values if value}
+
+
+def _extract_sub2api_proxy_id(data):
+    if isinstance(data, dict):
+        for key in ("id", "proxy_id"):
+            value = str(data.get(key) or "").strip()
+            if value:
+                return value
+        nested = data.get("data")
+        if nested is not data:
+            return _extract_sub2api_proxy_id(nested)
+    return ""
+
+
+def _sub2api_proxy_create_payloads(raw_proxy, settings=None):
+    settings = {**config, **dict(settings or {})}
+    normalized = _normalize_sub2api_proxy_value(raw_proxy)
+    parsed = urllib.parse.urlsplit(normalized)
+    if not parsed.scheme or not parsed.hostname:
+        raise ValueError(f"sub2api 代理未找到且不是可创建的代理地址: {raw_proxy}")
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https", "socks4", "socks5"}:
+        raise ValueError(f"sub2api 代理协议不支持: {scheme}")
+    host_port = parsed.hostname
+    if parsed.port:
+        host_port = f"{host_port}:{parsed.port}"
+    name = str(settings.get("sub2api_proxy_name") or host_port or normalized).strip()
+    auth_payload = {}
+    if parsed.username:
+        auth_payload["username"] = urllib.parse.unquote(parsed.username)
+    if parsed.password:
+        auth_payload["password"] = urllib.parse.unquote(parsed.password)
+    split_payload = {
+        "name": name,
+        "protocol": scheme,
+        "type": scheme,
+        "host": parsed.hostname,
+        "port": parsed.port,
+        **auth_payload,
+    }
+    split_payload = {key: value for key, value in split_payload.items() if value not in (None, "")}
+    return [
+        {"name": name, "type": scheme, "url": normalized},
+        split_payload,
+        {"name": name, "proxy_url": normalized},
+    ]
+
+
+def resolve_sub2api_proxy_id(base, headers, settings=None, log_callback=None):
+    settings = {**config, **dict(settings or {})}
+    raw_proxy_id = str(settings.get("sub2api_proxy_id") or "").strip()
+    if raw_proxy_id:
+        return raw_proxy_id
+    raw_proxy = str(settings.get("sub2api_proxy") or settings.get("sub2api_proxy_url") or "").strip()
+    if not raw_proxy:
+        return ""
+    wanted = _sub2api_proxy_compare_values(raw_proxy)
+    if raw_proxy.isdigit():
+        wanted.add(raw_proxy)
+
+    try:
+        data = _sub2api_response_data(
+            http_get(
+                f"{base}/admin/proxies/all",
+                headers=headers,
+                params={"with_count": "true"},
+                timeout=30,
+                proxies={},
+            )
+        )
+        for item in _sub2api_proxy_items(data):
+            item_values = _sub2api_proxy_item_values(item)
+            if wanted & item_values:
+                proxy_id = _extract_sub2api_proxy_id(item)
+                if proxy_id:
+                    if log_callback:
+                        log_callback(f"[*] sub2api 已匹配代理 proxy_id={proxy_id}")
+                    return proxy_id
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] sub2api 查询代理失败，将尝试创建: {exc}")
+
+    if raw_proxy.isdigit():
+        return raw_proxy
+
+    last_err = ""
+    for payload in _sub2api_proxy_create_payloads(raw_proxy, settings):
+        try:
+            created = _sub2api_response_data(
+                http_post(
+                    f"{base}/admin/proxies",
+                    headers=headers,
+                    json=payload,
+                    timeout=30,
+                    proxies={},
+                )
+            )
+            proxy_id = _extract_sub2api_proxy_id(created)
+            if proxy_id:
+                if log_callback:
+                    log_callback(f"[*] sub2api 已创建代理 proxy_id={proxy_id}")
+                return proxy_id
+        except Exception as exc:
+            last_err = str(exc)
+            continue
+    raise Exception(f"sub2api 代理解析/创建失败: {last_err or raw_proxy}")
+
+
 def build_sub2api_grok_refresh_token_check_payload(account, settings=None):
     settings = {**config, **dict(settings or {})}
     refresh_token = str((account or {}).get("refresh_token") or "").strip()
@@ -1310,6 +1517,7 @@ def build_sub2api_grok_refresh_token_payload(account, token_info=None, settings=
         existing_headers = {}
     merged_headers = {**cli_headers, **{k: v for k, v in existing_headers.items() if v}}
     credentials["headers"] = merged_headers
+    credentials["model_mapping"] = _sub2api_model_mapping(settings)
     email = str((account or {}).get("email") or "").strip()
     if email and not credentials.get("email"):
         credentials["email"] = email
@@ -1328,6 +1536,9 @@ def build_sub2api_grok_refresh_token_payload(account, token_info=None, settings=
     priority = _optional_positive_int(settings.get("sub2api_priority"), None)
     if priority is not None:
         payload["priority"] = priority
+    proxy_id = _optional_positive_int(settings.get("sub2api_resolved_proxy_id") or settings.get("sub2api_proxy_id"), None)
+    if proxy_id is not None:
+        payload["proxy_id"] = proxy_id
     return payload
 
 
@@ -1684,6 +1895,10 @@ def import_accounts_to_sub2api(accounts, settings=None, log_callback=None):
     missing = [item for item in missing if item]
     if missing:
         raise ValueError(f"账号 {', '.join(missing)} 缺少 refresh_token，不能推送到 sub2api")
+
+    proxy_id = resolve_sub2api_proxy_id(base, headers, settings=settings, log_callback=log_callback)
+    if proxy_id:
+        settings["sub2api_resolved_proxy_id"] = proxy_id
 
     items = []
     for index, account in enumerate(valid_accounts, start=1):
@@ -4867,7 +5082,7 @@ def validate_registration_config(settings):
     provider = str(normalized.get("email_provider") or "duckmail").strip() or "duckmail"
     normalized["email_provider"] = provider
     normalized["register_count"] = _parse_positive_int(
-        normalized.get("register_count"), 1, minimum=1, maximum=100
+        normalized.get("register_count"), 1, minimum=1, maximum=1000
     )
     normalized["register_threads"] = _parse_positive_int(
         normalized.get("register_threads"), 1, minimum=1, maximum=10
@@ -5008,6 +5223,12 @@ def validate_registration_config(settings):
     )
     normalized["sub2api_priority"] = _parse_positive_int(
         normalized.get("sub2api_priority"), 50, minimum=0, maximum=1000
+    )
+    normalized["sub2api_proxy"] = str(
+        normalized.get("sub2api_proxy") or normalized.get("sub2api_proxy_url") or ""
+    ).strip()
+    normalized["sub2api_models"] = _normalize_sub2api_models_value(
+        normalized.get("sub2api_models") or normalized.get("sub2api_model") or "grok-4.5"
     )
     auth_mode = str(normalized.get("sub2api_auth_mode") or "x-api-key").strip().lower()
     normalized["sub2api_auth_mode"] = "bearer" if auth_mode == "bearer" else "x-api-key"
