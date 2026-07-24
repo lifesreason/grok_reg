@@ -208,7 +208,7 @@ def test_registration_job_runs_successfully(monkeypatch, tmp_path):
     monkeypatch.setattr(
         reg,
         "fetch_xai_oauth_refresh_token",
-        lambda sso, log_callback=None, cancel_callback=None: "refresh-token",
+        lambda *args, **kwargs: "refresh-token",
     )
     monkeypatch.setattr(
         reg,
@@ -268,6 +268,64 @@ def test_registration_job_pushes_cpa_after_refresh_token_when_enabled(monkeypatc
     assert pushed == [("user@example.com", "refresh-token", job.settings)]
 
 
+def test_http_registration_keeps_account_when_refresh_token_fallback_browser_fails(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GROK_REG_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(reg, "resolve_signup_mode", lambda: "http")
+    monkeypatch.setattr(
+        reg,
+        "register_via_pure_http",
+        lambda log_callback=None, cancel_callback=None: (
+            "sso-token",
+            {
+                "email": "user@example.com",
+                "given_name": "Ada",
+                "family_name": "Lovelace",
+                "password": "secret",
+            },
+        ),
+    )
+    fetch_calls = []
+
+    def fake_fetch_refresh(sso, log_callback=None, cancel_callback=None, **kwargs):
+        fetch_calls.append((sso, kwargs))
+        raise RuntimeError("浏览器启动失败，已重试4次")
+
+    monkeypatch.setattr(reg, "fetch_xai_oauth_refresh_token", fake_fetch_refresh)
+    monkeypatch.setattr(reg, "add_token_to_grok2api_pools", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        reg,
+        "auto_push_registered_account",
+        lambda *args, **kwargs: (
+            (_ for _ in ()).throw(AssertionError("sub2api should not run without refresh_token"))
+        ),
+    )
+
+    job = reg.RegistrationJob(
+        {
+            "email_provider": "duckmail",
+            "register_count": 1,
+            "register_threads": 1,
+            "sub2api_auto_import_remote": True,
+            "sub2api_base": "http://sub2api.example",
+            "sub2api_admin_token": "admin-key",
+        }
+    )
+    job.start()
+    status = wait_for_job(job)
+
+    assert status["status"] == "completed"
+    assert status["success_count"] == 1
+    assert status["fail_count"] == 0
+    saved = tmp_path.joinpath(status["output_file"]).read_text(encoding="utf-8")
+    assert "user@example.com----secret----sso-token\n" in saved
+    account = reg.list_registered_accounts()[0]
+    assert account["has_refresh_token"] is False
+    assert fetch_calls == [("sso-token", {"fallback_browser": False})]
+    assert any("Refresh Token 获取失败，账号已保留" in line for line in job.logs())
+
+
 def test_registration_job_retries_when_profile_session_returns_to_signup(monkeypatch, tmp_path):
     emails = iter(["first@example.com", "second@example.com"])
     profile_calls = [0]
@@ -297,7 +355,7 @@ def test_registration_job_retries_when_profile_session_returns_to_signup(monkeyp
 
     monkeypatch.setattr(reg, "fill_profile_and_submit", fake_fill_profile)
     monkeypatch.setattr(reg, "wait_for_sso_cookie", lambda log_callback=None, cancel_callback=None: "sso-token")
-    monkeypatch.setattr(reg, "fetch_xai_oauth_refresh_token", lambda sso, log_callback=None, cancel_callback=None: "refresh-token")
+    monkeypatch.setattr(reg, "fetch_xai_oauth_refresh_token", lambda *args, **kwargs: "refresh-token")
     monkeypatch.setattr(reg, "add_token_to_grok2api_pools", lambda raw_token, email="", log_callback=None: None)
 
     job = reg.RegistrationJob({"email_provider": "duckmail", "register_count": 1, "register_threads": 1})
@@ -324,7 +382,7 @@ def test_registration_job_enables_nsfw_when_enabled(monkeypatch, tmp_path):
     monkeypatch.setattr(reg, "fill_code_and_submit", lambda email, token, log_callback=None, cancel_callback=None: "123456")
     monkeypatch.setattr(reg, "fill_profile_and_submit", lambda log_callback=None, cancel_callback=None: {"given_name": "Ada", "family_name": "Lovelace", "password": "secret"})
     monkeypatch.setattr(reg, "wait_for_sso_cookie", lambda log_callback=None, cancel_callback=None: "sso-token")
-    monkeypatch.setattr(reg, "fetch_xai_oauth_refresh_token", lambda sso, log_callback=None, cancel_callback=None: "refresh-token")
+    monkeypatch.setattr(reg, "fetch_xai_oauth_refresh_token", lambda *args, **kwargs: "refresh-token")
     monkeypatch.setattr(reg, "add_token_to_grok2api_pools", lambda raw_token, email="", log_callback=None: None)
     calls = []
 
@@ -356,7 +414,7 @@ def test_registration_job_skips_nsfw_when_disabled(monkeypatch, tmp_path):
     monkeypatch.setattr(reg, "fill_code_and_submit", lambda email, token, log_callback=None, cancel_callback=None: "123456")
     monkeypatch.setattr(reg, "fill_profile_and_submit", lambda log_callback=None, cancel_callback=None: {"given_name": "Ada", "family_name": "Lovelace", "password": "secret"})
     monkeypatch.setattr(reg, "wait_for_sso_cookie", lambda log_callback=None, cancel_callback=None: "sso-token")
-    monkeypatch.setattr(reg, "fetch_xai_oauth_refresh_token", lambda sso, log_callback=None, cancel_callback=None: "refresh-token")
+    monkeypatch.setattr(reg, "fetch_xai_oauth_refresh_token", lambda *args, **kwargs: "refresh-token")
     monkeypatch.setattr(reg, "add_token_to_grok2api_pools", lambda raw_token, email="", log_callback=None: None)
     monkeypatch.setattr(reg, "enable_nsfw_for_token", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("NSFW should not run")))
 
@@ -396,7 +454,7 @@ def test_registration_job_auto_pushes_to_remote_services_when_enabled(monkeypatc
         },
     )
     monkeypatch.setattr(reg, "wait_for_sso_cookie", lambda log_callback=None, cancel_callback=None: "sso-token")
-    monkeypatch.setattr(reg, "fetch_xai_oauth_refresh_token", lambda sso, log_callback=None, cancel_callback=None: "refresh-token")
+    monkeypatch.setattr(reg, "fetch_xai_oauth_refresh_token", lambda *args, **kwargs: "refresh-token")
     monkeypatch.setattr(reg, "add_token_to_grok2api_pools", lambda raw_token, email="", log_callback=None: None)
     pushed = []
 
@@ -448,7 +506,7 @@ def test_registration_job_does_not_auto_push_when_switches_disabled(monkeypatch,
     monkeypatch.setattr(reg, "fill_code_and_submit", lambda email, token, log_callback=None, cancel_callback=None: "123456")
     monkeypatch.setattr(reg, "fill_profile_and_submit", lambda log_callback=None, cancel_callback=None: {"given_name": "Ada", "family_name": "Lovelace", "password": "secret"})
     monkeypatch.setattr(reg, "wait_for_sso_cookie", lambda log_callback=None, cancel_callback=None: "sso-token")
-    monkeypatch.setattr(reg, "fetch_xai_oauth_refresh_token", lambda sso, log_callback=None, cancel_callback=None: "refresh-token")
+    monkeypatch.setattr(reg, "fetch_xai_oauth_refresh_token", lambda *args, **kwargs: "refresh-token")
     monkeypatch.setattr(reg, "add_token_to_grok2api_pools", lambda raw_token, email="", log_callback=None: None)
     monkeypatch.setattr(reg, "import_accounts_to_grok2api", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("grok2api should not run")))
     monkeypatch.setattr(reg, "import_accounts_to_sub2api", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sub2api should not run")))
@@ -1425,7 +1483,7 @@ def test_import_accounts_to_sub2api_reauths_when_refresh_token_revoked(monkeypat
         raise AssertionError(f"unexpected URL: {url}")
 
     monkeypatch.setattr(reg, "http_post", fake_post)
-    monkeypatch.setattr(reg, "fetch_xai_oauth_refresh_token", lambda sso, log_callback=None, cancel_callback=None: "new-refresh-token")
+    monkeypatch.setattr(reg, "fetch_xai_oauth_refresh_token", lambda *args, **kwargs: "new-refresh-token")
 
     result = reg.import_accounts_to_sub2api(
         [account],

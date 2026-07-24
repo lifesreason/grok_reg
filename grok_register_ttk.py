@@ -4213,7 +4213,13 @@ def exchange_sso_to_refresh_token_via_device_flow(
                 pass
 
 
-def fetch_xai_oauth_refresh_token(sso, timeout=90, log_callback=None, cancel_callback=None):
+def fetch_xai_oauth_refresh_token(
+    sso,
+    timeout=90,
+    log_callback=None,
+    cancel_callback=None,
+    fallback_browser=True,
+):
     """优先纯 HTTP Authorization Code + PKCE；失败再回退浏览器 OAuth consent。"""
     token = _normalize_sso_token(sso)
     if not token:
@@ -4230,6 +4236,8 @@ def fetch_xai_oauth_refresh_token(sso, timeout=90, log_callback=None, cancel_cal
             cancel_callback=cancel_callback,
         )
     except Exception as oauth_exc:
+        if not fallback_browser:
+            raise RuntimeError(f"HTTP OAuth 获取 Refresh Token 失败: {oauth_exc}") from oauth_exc
         if log_callback:
             log_callback(f"[!] HTTP OAuth 失败，回退浏览器 OAuth: {oauth_exc}")
 
@@ -5757,6 +5765,57 @@ class RegistrationJob:
             delay += random.uniform(0.0, jitter)
         return max(0.0, delay)
 
+    def _ensure_output_file(self):
+        if not self.output_file:
+            now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.output_file = f"accounts_{now}_{self.id[:8]}.txt"
+        return self.output_file
+
+    def _save_registered_account(self, email, sso, refresh_token, profile, logf):
+        profile = dict(profile or {})
+        refresh_token = str(refresh_token or "").strip()
+        result = {
+            "email": email,
+            "sso": sso,
+            "refresh_token": refresh_token,
+            "profile": profile,
+        }
+        line = f"{email}----{profile.get('password','')}----{sso}"
+        if refresh_token:
+            line += f"----{refresh_token}"
+        line += "\n"
+        source_file = self._ensure_output_file()
+        source_line_no = 0
+        try:
+            with _registered_accounts_lock:
+                path = os.path.join(get_data_dir(), source_file)
+                try:
+                    with open(path, "r", encoding="utf-8") as existing:
+                        source_line_no = sum(1 for _ in existing) + 1
+                except FileNotFoundError:
+                    source_line_no = 1
+                with open(path, "a", encoding="utf-8") as handle:
+                    handle.write(line)
+        except Exception as file_exc:
+            logf(f"[Debug] 保存账号文件失败: {file_exc}")
+
+        with self.stats_lock:
+            self.results.append(result)
+            self.success_count += 1
+
+        account = parse_registered_account_line(
+            line,
+            source=source_file,
+            line_no=source_line_no,
+            include_sso=True,
+        ) or {
+            "email": email,
+            "sso": sso,
+            "refresh_token": refresh_token,
+            "has_refresh_token": bool(refresh_token),
+        }
+        return account, result
+
     def _run_single_registration(self, idx, total, logf):
         email = ""
         dev_token = ""
@@ -5901,11 +5960,40 @@ class RegistrationJob:
                 logf("[*] NSFW 已开启")
             else:
                 logf(f"[!] NSFW 开启失败，继续注册流程: {nsfw_message}")
+        refresh_token = ""
+        account, result_item = self._save_registered_account(email, sso, refresh_token, profile, logf)
+        try:
+            self._persist_status()
+        except Exception:
+            pass
+        try:
+            add_token_to_grok2api_pools(sso, email=email, log_callback=logf)
+        except Exception as pool_exc:
+            logf(f"[Debug] 写入 grok2api 本地池失败，继续注册流程: {pool_exc}")
+
         logf("[*] 7. 获取 Refresh Token")
-        refresh_token = fetch_xai_oauth_refresh_token(
-            sso, log_callback=logf, cancel_callback=self.should_stop
-        )
-        if self.settings.get("cpa_auto_push_remote"):
+        try:
+            refresh_token = fetch_xai_oauth_refresh_token(
+                sso,
+                log_callback=logf,
+                cancel_callback=self.should_stop,
+                fallback_browser=(signup_mode != "http"),
+            )
+            account["refresh_token"] = refresh_token
+            account["refresh_token_preview"] = _mask_token(refresh_token)
+            account["has_refresh_token"] = bool(refresh_token)
+            result_item["refresh_token"] = refresh_token
+            if refresh_token:
+                replace_registered_account_refresh_token(account, refresh_token)
+        except RegistrationCancelled:
+            raise
+        except Exception as refresh_exc:
+            logf(
+                f"[!] Refresh Token 获取失败，账号已保留，可稍后在账号列表补推: "
+                f"{str(refresh_exc)[:240]}"
+            )
+
+        if refresh_token and self.settings.get("cpa_auto_push_remote"):
             logf("[*] 8. 推送 CPA 凭证")
             try:
                 cpa_result = export_and_push_cpa_credential(
@@ -5914,46 +6002,18 @@ class RegistrationJob:
                 rotated_refresh_token = str(cpa_result.get("refresh_token") or "").strip()
                 if rotated_refresh_token:
                     refresh_token = rotated_refresh_token
+                    result_item["refresh_token"] = refresh_token
+                    replace_registered_account_refresh_token(account, refresh_token)
                 if cpa_result.get("upload_error"):
                     logf(f"[!] CPA 凭证推送失败，已保留本地文件: {cpa_result['upload_error']}")
                 elif cpa_result.get("uploaded"):
                     logf(f"[+] CPA 凭证已推送: {cpa_result.get('filename', '')}")
             except Exception as cpa_exc:
                 logf(f"[!] CPA 凭证生成或推送失败，继续注册流程: {cpa_exc}")
-        with self.stats_lock:
-            source_line_no = self.success_count + 1
-            self.results.append(
-                {"email": email, "sso": sso, "refresh_token": refresh_token, "profile": profile}
-            )
-            self.success_count += 1
-            line = f"{email}----{profile.get('password','')}----{sso}----{refresh_token}\n"
-            try:
-                with _registered_accounts_lock:
-                    with open(
-                        os.path.join(get_data_dir(), self.output_file),
-                        "a",
-                        encoding="utf-8",
-                    ) as f:
-                        f.write(line)
-            except Exception as file_exc:
-                logf(f"[Debug] 保存账号文件失败: {file_exc}")
-        try:
-            self._persist_status()
-        except Exception:
-            pass
-        account = parse_registered_account_line(
-            line,
-            source=self.output_file,
-            line_no=source_line_no,
-            include_sso=True,
-        ) or {
-            "email": email,
-            "sso": sso,
-            "refresh_token": refresh_token,
-            "has_refresh_token": bool(refresh_token),
-        }
-        add_token_to_grok2api_pools(sso, email=email, log_callback=logf)
-        auto_push_registered_account(account, self.settings, log_callback=logf)
+        if refresh_token:
+            auto_push_registered_account(account, self.settings, log_callback=logf)
+        elif self.settings.get("sub2api_auto_import_remote"):
+            logf("[!] 已跳过 sub2api 自动推送：账号缺少 Refresh Token")
         self._note_registration_outcome(True, logf=logf)
         try:
             note_mail_domain_outcome(email, success=True, log_callback=logf)
