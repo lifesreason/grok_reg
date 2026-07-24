@@ -2217,6 +2217,7 @@ def test_docker_image_uses_conservative_single_image_slimming():
     assert "/usr/share/man" in dockerfile
     assert 'command -v google-chrome-stable || command -v google-chrome' in dockerfile
     assert 'command -v chromium || command -v chromium-browser' in dockerfile
+    assert "chmod 755 /usr/bin/browser" in dockerfile
     assert "test -x /usr/bin/browser" in dockerfile
     assert "uvicorn[standard]" not in requirements
     assert "uvicorn>=" in requirements

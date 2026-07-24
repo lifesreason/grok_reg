@@ -35,13 +35,21 @@ RUN apt-get update \
     && if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
         wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
         && apt-get install -y --no-install-recommends /tmp/chrome.deb \
-        && browser_path="$(command -v google-chrome-stable || command -v google-chrome || true)"; \
+        && browser_path="$(command -v google-chrome-stable || command -v google-chrome || true)" \
+        && browser_package=google-chrome-stable; \
     else \
         apt-get install -y --no-install-recommends chromium \
-        && browser_path="$(command -v chromium || command -v chromium-browser || true)"; \
+        && browser_path="$(command -v chromium || command -v chromium-browser || true)" \
+        && browser_package=chromium; \
     fi \
     && test -n "${browser_path}" \
-    && ln -sf "${browser_path}" /usr/bin/browser \
+    && test -x "${browser_path}" \
+    && apt-mark manual "${browser_package}" \
+    && printf '%s\n' \
+        '#!/bin/sh' \
+        "exec \"${browser_path}\" \"\$@\"" \
+        > /usr/bin/browser \
+    && chmod 755 /usr/bin/browser \
     && test -x /usr/bin/browser \
     && rm -f /tmp/chrome.deb \
     && apt-get purge -y --auto-remove wget \
