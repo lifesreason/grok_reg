@@ -1599,22 +1599,169 @@ def test_exchange_sso_to_refresh_token_uses_authorization_code_flow(monkeypatch)
     assert "code=authorization-code" in token[2]["data"]
 
 
-def test_fetch_refresh_token_does_not_start_device_flow_first(monkeypatch):
+def test_fetch_refresh_token_prefers_device_flow_and_reuses_promoted_cookies(monkeypatch):
     calls = []
+    promoted_cookies = [{"name": "sso", "value": "promoted", "domain": "auth.x.ai", "path": "/"}]
+
+    def fake_promote(*args, **kwargs):
+        raise AssertionError("fetch should reuse cached CookieSetter cookies")
+
+    fake_promote._last_promo = {"ok": True, "cookies": promoted_cookies}
 
     monkeypatch.setattr(
         reg,
         "exchange_sso_to_refresh_token_via_authorization_code",
-        lambda sso, **kwargs: calls.append("authorization_code") or "refresh-token",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("authorization code flow should not run first")
+        ),
     )
+    monkeypatch.setattr(reg, "_get_browser", lambda: None)
+    monkeypatch.setattr(reg, "start_browser", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("browser fallback should not run")))
+    monkeypatch.setattr(reg, "promote_sso_session_cookies", fake_promote, raising=False)
     monkeypatch.setattr(
         reg,
         "exchange_sso_to_refresh_token_via_device_flow",
-        lambda *args, **kwargs: calls.append("device_flow") or "bad-refresh-token",
+        lambda sso, **kwargs: calls.append((sso, kwargs.get("browser_cookies"))) or "refresh-token",
     )
 
     assert reg.fetch_xai_oauth_refresh_token("sso-token") == "refresh-token"
-    assert calls == ["authorization_code"]
+    assert calls == [("sso-token", promoted_cookies)]
+
+
+def test_device_flow_reuses_cookie_setter_jar_and_uses_empty_principal(monkeypatch):
+    calls = []
+    cookie_sets = []
+
+    class CookieJar:
+        def set(self, *args, **kwargs):
+            cookie_sets.append((args, kwargs))
+
+    class FakeResponse:
+        def __init__(self, url="", status_code=200, payload=None, text=""):
+            self.url = url
+            self.status_code = status_code
+            self._payload = payload or {}
+            self.text = text
+            self.content = text.encode()
+
+        def json(self):
+            return self._payload
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            self.cookies = CookieJar()
+
+        def get(self, url, **kwargs):
+            calls.append(("get", url, kwargs))
+            if url == "https://accounts.x.ai/":
+                return FakeResponse("https://accounts.x.ai/account")
+            return FakeResponse(url)
+
+        def post(self, url, **kwargs):
+            calls.append(("post", url, kwargs))
+            if url.endswith("/oauth2/device/code"):
+                return FakeResponse(
+                    url,
+                    payload={
+                        "device_code": "device-code",
+                        "user_code": "user-code",
+                        "verification_uri_complete": "https://auth.x.ai/device",
+                        "interval": 1,
+                    },
+                )
+            if url.endswith("/oauth2/device/verify"):
+                return FakeResponse("https://auth.x.ai/oauth2/consent")
+            if url.endswith("/oauth2/device/approve"):
+                return FakeResponse("https://auth.x.ai/device/done")
+            if url.endswith("/oauth2/token"):
+                return FakeResponse(url, payload={"refresh_token": "refresh-token"})
+            raise AssertionError(f"unexpected URL: {url}")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(reg.requests, "Session", FakeSession)
+    monkeypatch.setattr(reg, "get_proxies", lambda: {})
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda *args, **kwargs: None)
+    monkeypatch.setattr(reg, "_DEVICE_FLOW_LAST_TS", 0)
+
+    refresh = reg.exchange_sso_to_refresh_token_via_device_flow(
+        "sso-token",
+        browser_cookies=[
+            {"name": "sso", "value": "promoted", "domain": "auth.x.ai", "path": "/"}
+        ],
+    )
+
+    assert refresh == "refresh-token"
+    approve = next(call for call in calls if call[1].endswith("/oauth2/device/approve"))
+    assert approve[2]["data"]["principal_id"] == ""
+    assert any(
+        args[:2] == ("sso", "promoted") and kwargs.get("domain") == "auth.x.ai"
+        for args, kwargs in cookie_sets
+    )
+    auth_calls = [call for call in calls if call[1].startswith("https://auth.x.ai/")]
+    assert all(call[2].get("impersonate") == "chrome" for call in auth_calls)
+
+
+def test_create_session_promotes_cookie_and_caches_same_session_refresh(monkeypatch):
+    calls = []
+    promoted_cookies = [{"name": "sso", "value": "promoted", "domain": "auth.x.ai", "path": "/"}]
+
+    class CookieJar:
+        def set(self, *args, **kwargs):
+            pass
+
+    class FakeResponse:
+        status_code = 200
+        content = b"grpc"
+        headers = {}
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            self.cookies = CookieJar()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, **kwargs):
+            calls.append(("post", url, kwargs))
+            return FakeResponse()
+
+    def fake_promote(sso, **kwargs):
+        calls.append(("promote", sso, kwargs))
+        return {
+            "ok": True,
+            "cookies": promoted_cookies,
+        }
+
+    def fake_device(sso, **kwargs):
+        calls.append(("device", sso, kwargs))
+        return "refresh-token"
+
+    monkeypatch.setattr(reg.requests, "Session", FakeSession)
+    monkeypatch.setattr(reg, "get_proxies", lambda: {})
+    monkeypatch.setattr(
+        reg,
+        "_grpc_parse_response",
+        lambda raw: {
+            "grpc_status": 0,
+            "messages": [[{"type": "string", "value": "eyJ.session.jwt"}]],
+        },
+    )
+    monkeypatch.setattr(reg, "promote_sso_session_cookies", fake_promote, raising=False)
+    monkeypatch.setattr(reg, "exchange_sso_to_refresh_token_via_device_flow", fake_device)
+
+    sso = reg.obtain_sso_via_create_session("user@example.com", "secret", "t" * 80)
+
+    assert sso == "eyJ.session.jwt"
+    device = next(call for call in calls if call[0] == "device")
+    promote = next(call for call in calls if call[0] == "promote")
+    assert device[2]["session"] is promote[2]["session"]
+    assert device[2]["browser_cookies"] == promoted_cookies
+    assert reg.promote_sso_session_cookies._last_refresh_token == "refresh-token"
 
 
 def test_resolve_browser_executable_falls_back_from_stale_configured_path(monkeypatch):

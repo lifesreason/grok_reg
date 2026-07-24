@@ -4003,6 +4003,8 @@ def exchange_sso_to_refresh_token_via_device_flow(
     log_callback=None,
     cancel_callback=None,
     retries=3,
+    browser_cookies=None,
+    session=None,
 ):
     """对齐 grokcli-2api/sso_to_auth_json：纯 HTTP Device Flow，sso → refresh_token。
 
@@ -4028,6 +4030,7 @@ def exchange_sso_to_refresh_token_via_device_flow(
     issuer = "https://auth.x.ai"
     client_id = XAI_GROK_OAUTH_CLIENT_ID
     scopes = XAI_GROK_OAUTH_SCOPE
+    impersonate = "chrome"
 
     def log(msg):
         if log_callback:
@@ -4042,20 +4045,31 @@ def exchange_sso_to_refresh_token_via_device_flow(
             sleep_with_cancel(wait, cancel_callback)
         _DEVICE_FLOW_LAST_TS = time.time()
 
-        session = requests.Session(impersonate="chrome131")
+        own_session = session is None
+        if own_session:
+            session = requests.Session()
         try:
-            try:
-                session.cookies.set("sso", token, domain=".x.ai")
-                session.cookies.set("sso-rw", token, domain=".x.ai")
-            except Exception:
-                session.cookies.set("sso", token)
-                session.cookies.set("sso-rw", token)
+            _set_sso_cookie_on_session(session, token)
+            for c in browser_cookies or []:
+                try:
+                    session.cookies.set(
+                        c.get("name"),
+                        c.get("value"),
+                        domain=c.get("domain") or ".x.ai",
+                        path=c.get("path") or "/",
+                    )
+                except Exception:
+                    try:
+                        session.cookies.set(c.get("name"), c.get("value"))
+                    except Exception:
+                        pass
 
             # 1) 校验 sso
             raise_if_cancelled(cancel_callback)
             try:
                 r = session.get(
                     "https://accounts.x.ai/",
+                    impersonate=impersonate,
                     timeout=timeout,
                     **proxy_kw,
                 )
@@ -4065,6 +4079,54 @@ def exchange_sso_to_refresh_token_via_device_flow(
             if "sign-in" in final_url or "sign-up" in final_url:
                 raise RuntimeError(f"sso 无效（校验落到登录页）: {final_url}")
             log(f"[*] Device Flow: sso 有效（校验 URL={final_url[:80]}）")
+
+            # 若调用方已传入 CookieSetter 后的 cookies，则不再二次 CreateCookieSetterLink。
+            if browser_cookies:
+                log(f"[*] Device Flow 复用建号 CookieSetter jar（{len(browser_cookies)} cookies）")
+            else:
+                try:
+                    raise_if_cancelled(cancel_callback)
+                    promo = promote_sso_session_cookies(
+                        token,
+                        session=session,
+                        proxies=proxies,
+                        success_url="https://accounts.x.ai/account",
+                        log_callback=log_callback,
+                        cancel_callback=cancel_callback,
+                    )
+                    ok = bool(isinstance(promo, dict) and promo.get("ok"))
+                    log(f"[*] Device Flow CookieSetter 推广: {'ok' if ok else 'skip/fail'}")
+                    if ok and promo.get("cookies"):
+                        for c in promo.get("cookies") or []:
+                            try:
+                                session.cookies.set(
+                                    c.get("name"),
+                                    c.get("value"),
+                                    domain=c.get("domain") or ".x.ai",
+                                    path=c.get("path") or "/",
+                                )
+                            except Exception:
+                                pass
+                except Exception as exc:
+                    log(f"[Debug] Device Flow CookieSetter 推广异常: {exc}")
+
+            try:
+                settle = float(config.get("device_flow_settle_seconds", 1.5) or 1.5)
+            except Exception:
+                settle = 1.5
+            settle = max(0.0, min(settle, 15.0))
+            if settle > 0:
+                log(f"[*] Device Flow 会话预热 {settle:.1f}s（auth.x.ai）")
+                sleep_with_cancel(settle, cancel_callback)
+                try:
+                    session.get(
+                        f"{issuer}/",
+                        impersonate=impersonate,
+                        timeout=timeout,
+                        **proxy_kw,
+                    )
+                except Exception:
+                    pass
 
             last_err = ""
             for attempt in range(1, max(1, int(retries)) + 1):
@@ -4077,11 +4139,12 @@ def exchange_sso_to_refresh_token_via_device_flow(
                         f"{issuer}/oauth2/device/code",
                         data={"client_id": client_id, "scope": scopes},
                         headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        impersonate=impersonate,
                         timeout=timeout,
                         **proxy_kw,
                     )
                     if int(getattr(r, "status_code", 0) or 0) >= 400:
-                        last_err = f"device/code HTTP {r.status_code}: {(r.text or '')[:160]}"
+                        last_err = f"device/code HTTP {r.status_code}: {(r.text or '')[:200]}"
                         log(f"[Debug] {last_err}")
                         sleep_with_cancel(2.0 * attempt, cancel_callback)
                         continue
@@ -4104,11 +4167,17 @@ def exchange_sso_to_refresh_token_via_device_flow(
                 # 3) verify
                 try:
                     if verify_url:
-                        session.get(verify_url, timeout=timeout, **proxy_kw)
+                        session.get(
+                            verify_url,
+                            impersonate=impersonate,
+                            timeout=timeout,
+                            **proxy_kw,
+                        )
                     r = session.post(
                         f"{issuer}/oauth2/device/verify",
                         data={"user_code": user_code},
                         headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        impersonate=impersonate,
                         timeout=timeout,
                         allow_redirects=True,
                         **proxy_kw,
@@ -4138,18 +4207,30 @@ def exchange_sso_to_refresh_token_via_device_flow(
                             "principal_id": "",
                         },
                         headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        impersonate=impersonate,
                         timeout=timeout,
                         allow_redirects=True,
                         **proxy_kw,
                     )
                     aurl = str(getattr(r, "url", "") or "")
-                    if "done" not in aurl:
-                        last_err = f"approve 未到 done: {aurl[:160]}"
+                    astatus = int(getattr(r, "status_code", 0) or 0)
+                    aurl_l = aurl.lower()
+                    approved = (
+                        "/done" in aurl_l
+                        or aurl_l.rstrip("/").endswith("done")
+                        or "device/done" in aurl_l
+                        or "status=done" in aurl_l
+                    )
+                    if not approved:
+                        last_err = (
+                            f"approve 未到 done: HTTP {astatus} url={aurl[:180]} "
+                            f"body={(getattr(r, 'text', None) or '')[:120]}"
+                        )
                         log(f"[Debug] {last_err}")
-                        backoff = 4.0 * attempt if "rate_limited" in aurl else 2.0 * attempt
+                        backoff = 4.0 * attempt if "rate_limited" in aurl_l else 2.0 * attempt
                         sleep_with_cancel(backoff, cancel_callback)
                         continue
-                    log("[*] Device Flow 已 approve")
+                    log(f"[*] Device Flow 已 approve (HTTP {astatus})")
                 except Exception as exc:
                     last_err = f"approve 异常: {exc}"
                     log(f"[Debug] {last_err}")
@@ -4175,6 +4256,7 @@ def exchange_sso_to_refresh_token_via_device_flow(
                             f"{issuer}/oauth2/token",
                             data=form,
                             headers={"Content-Type": "application/x-www-form-urlencoded"},
+                            impersonate=impersonate,
                             timeout=timeout,
                             **proxy_kw,
                         )
@@ -4185,7 +4267,7 @@ def exchange_sso_to_refresh_token_via_device_flow(
                             if refresh:
                                 log(f"[*] Device Flow 成功，refresh_token 长度={len(refresh)}")
                                 return refresh
-                            last_err = f"token 响应无 refresh_token: {str(data)[:160]}"
+                            last_err = f"token 响应无 refresh_token: {str(data)[:200]}"
                             break
                         try:
                             err = r.json() if getattr(r, "content", None) else {}
@@ -4197,7 +4279,19 @@ def exchange_sso_to_refresh_token_via_device_flow(
                         if error == "slow_down":
                             interval = min(8.0, interval + 1.0)
                             continue
-                        last_err = f"token 错误: {error or f'HTTP {code}'}"
+                        err_desc = str((err or {}).get("error_description") or "").strip()
+                        body_preview = (getattr(r, "text", None) or "")[:200]
+                        last_err = (
+                            f"token 错误: {error or f'HTTP {code}'}"
+                            + (f" ({err_desc})" if err_desc else "")
+                            + (f" body={body_preview}" if body_preview and not err_desc else "")
+                        )
+                        if error == "invalid_grant" and "access denied" in err_desc.lower():
+                            log(
+                                "[Debug] token Access denied：会话/权限可能未就绪，"
+                                "将换新 device_code 重试"
+                            )
+                            sleep_with_cancel(min(6.0, 2.0 * attempt + 1.0), cancel_callback)
                         break
                     except Exception as exc:
                         last_err = f"token 轮询异常: {exc}"
@@ -4207,10 +4301,11 @@ def exchange_sso_to_refresh_token_via_device_flow(
 
             raise RuntimeError(f"Device Flow 失败: {last_err or 'unknown'}")
         finally:
-            try:
-                session.close()
-            except Exception:
-                pass
+            if own_session:
+                try:
+                    session.close()
+                except Exception:
+                    pass
 
 
 def fetch_xai_oauth_refresh_token(
@@ -4220,26 +4315,53 @@ def fetch_xai_oauth_refresh_token(
     cancel_callback=None,
     fallback_browser=True,
 ):
-    """优先纯 HTTP Authorization Code + PKCE；失败再回退浏览器 OAuth consent。"""
+    """优先 Device Flow（与 2api 一致）；失败再回退浏览器 OAuth consent。"""
     token = _normalize_sso_token(sso)
     if not token:
         raise ValueError("账号缺少 sso cookie，无法获取 Refresh Token")
 
-    # API 建号路径：纯 HTTP，不依赖浏览器 cookie 注入。
-    # Authorization Code Flow 能携带 grok-build referrer，优先于旧 Device Flow。
+    # CreateSession 同会话若已换到 RT，直接复用。
     try:
-        if log_callback:
-            log_callback("[*] 获取 Refresh Token：优先 Authorization Code + PKCE...")
-        return exchange_sso_to_refresh_token_via_authorization_code(
-            token,
-            log_callback=log_callback,
-            cancel_callback=cancel_callback,
-        )
-    except Exception as oauth_exc:
-        if not fallback_browser:
-            raise RuntimeError(f"HTTP OAuth 获取 Refresh Token 失败: {oauth_exc}") from oauth_exc
-        if log_callback:
-            log_callback(f"[!] HTTP OAuth 失败，回退浏览器 OAuth: {oauth_exc}")
+        cached_rt = str(getattr(promote_sso_session_cookies, "_last_refresh_token", "") or "").strip()
+        if cached_rt:
+            if log_callback:
+                log_callback(
+                    f"[*] 复用 CreateSession 同会话已取得的 refresh_token，长度={len(cached_rt)}"
+                )
+            try:
+                delattr(promote_sso_session_cookies, "_last_refresh_token")
+            except Exception:
+                promote_sso_session_cookies._last_refresh_token = ""
+            return cached_rt
+    except Exception:
+        pass
+
+    # API 建号路径：纯 HTTP Device Flow；若测试/浏览器流程已有浏览器会话，则走页面 OAuth。
+    browser_ready = _get_browser() is not None
+    if not browser_ready:
+        try:
+            if log_callback:
+                log_callback("[*] 获取 Refresh Token：优先 Device Flow（对齐 grokcli-2api）...")
+            promo_cookies = None
+            try:
+                last = getattr(promote_sso_session_cookies, "_last_promo", None)
+                if isinstance(last, dict) and last.get("cookies"):
+                    promo_cookies = last.get("cookies")
+            except Exception:
+                promo_cookies = None
+            return exchange_sso_to_refresh_token_via_device_flow(
+                token,
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+                browser_cookies=promo_cookies,
+            )
+        except Exception as device_exc:
+            if not fallback_browser:
+                raise RuntimeError(f"Device Flow 获取 Refresh Token 失败: {device_exc}") from device_exc
+            if log_callback:
+                log_callback(f"[!] Device Flow 失败，回退浏览器 OAuth: {device_exc}")
+    elif log_callback:
+        log_callback("[*] 检测到已有浏览器会话，跳过 Device Flow，走 OAuth 页面")
 
     browser = _get_browser()
     page = _get_page()
@@ -8268,6 +8390,219 @@ def encode_create_session_request(email, password, turnstile_token, castle_reque
     return req
 
 
+def _set_sso_cookie_on_session(session, jwt_token):
+    """把 session JWT 挂到多个相关域，供 AuthManagement / OIDC 读取。"""
+    if not session or not jwt_token:
+        return
+    domains = (
+        "accounts.x.ai",
+        ".x.ai",
+        "auth.x.ai",
+        ".grok.com",
+        "grok.com",
+        "auth.grokusercontent.com",
+    )
+    for domain in domains:
+        try:
+            session.cookies.set("sso", jwt_token, domain=domain)
+        except Exception:
+            continue
+    try:
+        session.cookies.set("sso", jwt_token)
+    except Exception:
+        pass
+    for domain in ("accounts.x.ai", ".x.ai", ".grok.com"):
+        try:
+            session.cookies.set("sso-rw", jwt_token, domain=domain)
+        except Exception:
+            continue
+
+
+def create_cookie_setter_link(
+    success_url,
+    *,
+    error_url="https://accounts.x.ai/sign-in",
+    referer="https://accounts.x.ai/sign-in",
+    session=None,
+    proxies=None,
+    log_callback=None,
+):
+    """AuthManagement/CreateCookieSetterLink → 多域 set-cookie 跳转 URL。"""
+    if requests is None:
+        return {"ok": False, "error": "curl_cffi 未安装", "cookie_setter_url": ""}
+    success_url = str(success_url or "").strip()
+    if not success_url:
+        return {"ok": False, "error": "success_url 为空", "cookie_setter_url": ""}
+    proxies = proxies if proxies is not None else get_proxies()
+    own = session is None
+    if own:
+        sk = {"impersonate": "chrome131", "timeout": 30}
+        if proxies:
+            sk["proxies"] = proxies
+        session = requests.Session(**sk)
+    try:
+        msg = _grpc_encode_string(1, success_url) + _grpc_encode_string(2, error_url)
+        headers = {
+            "content-type": "application/grpc-web+proto",
+            "x-grpc-web": "1",
+            "x-user-agent": "connect-es/2.1.1",
+            "accept": "*/*",
+            "origin": "https://accounts.x.ai",
+            "referer": referer,
+            "user-agent": get_user_agent(),
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty",
+        }
+        resp = session.post(
+            "https://accounts.x.ai/auth_mgmt.AuthManagement/CreateCookieSetterLink",
+            data=_grpc_frame_request(msg),
+            headers=headers,
+            timeout=30,
+        )
+        try:
+            parsed = _grpc_parse_response(resp.content or b"")
+        except Exception:
+            parsed = {"messages": [], "trailers": {}, "grpc_status": None}
+        grpc_status = parsed.get("grpc_status")
+        try:
+            grpc_status = int(grpc_status) if grpc_status is not None else None
+        except Exception:
+            pass
+        urls = []
+        for msg_fields in parsed.get("messages") or []:
+            for f in msg_fields or []:
+                if f.get("type") != "string":
+                    continue
+                val = str(f.get("value") or "")
+                if "http://" in val or "https://" in val or "set-cookie" in val:
+                    urls.append(val)
+        cookie_setter = next((u for u in urls if "set-cookie" in u), None) or (
+            urls[0] if urls else ""
+        )
+        ok = grpc_status in (None, 0) and bool(cookie_setter)
+        if log_callback:
+            log_callback(
+                f"[*] CreateCookieSetterLink HTTP {resp.status_code} "
+                f"grpc={grpc_status} setter={'yes' if cookie_setter else 'no'}"
+            )
+        return {
+            "ok": ok,
+            "error": None if ok else "CreateCookieSetterLink failed",
+            "grpc_status": grpc_status,
+            "cookie_setter_url": cookie_setter,
+            "raw_urls": urls,
+        }
+    finally:
+        if own:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+
+def _export_session_cookie_list(session):
+    """导出 curl_cffi/requests cookie jar 为 [{name,value,domain,path}, ...]。"""
+    out = []
+    if not session:
+        return out
+    try:
+        jar = session.cookies
+        if hasattr(jar, "jar"):
+            for c in jar.jar:
+                out.append(
+                    {
+                        "name": getattr(c, "name", "") or "",
+                        "value": getattr(c, "value", "") or "",
+                        "domain": getattr(c, "domain", "") or ".x.ai",
+                        "path": getattr(c, "path", "/") or "/",
+                    }
+                )
+        elif hasattr(jar, "items"):
+            for name, value in jar.items():
+                out.append({"name": name, "value": value, "domain": ".x.ai", "path": "/"})
+    except Exception:
+        pass
+    return [c for c in out if c.get("name") and c.get("value") is not None]
+
+
+def promote_sso_session_cookies(
+    sso,
+    *,
+    session=None,
+    proxies=None,
+    success_url=None,
+    log_callback=None,
+    cancel_callback=None,
+):
+    """CreateSession 后把 session JWT 推广到 OAuth 相关域（CreateCookieSetterLink + 跳转）。"""
+    sso = str(sso or "").strip()
+    empty = {"ok": False, "cookie_setter_url": "", "cookies": [], "final_url": ""}
+    if not sso or requests is None:
+        return empty
+    proxies = proxies if proxies is not None else get_proxies()
+    own = session is None
+    if own:
+        sk = {"impersonate": "chrome131", "timeout": 30}
+        if proxies:
+            sk["proxies"] = proxies
+        session = requests.Session(**sk)
+    try:
+        _set_sso_cookie_on_session(session, sso)
+        success_url = str(success_url or "").strip() or "https://accounts.x.ai/account"
+        raise_if_cancelled(cancel_callback)
+        csl = create_cookie_setter_link(
+            success_url,
+            session=session,
+            proxies=proxies,
+            log_callback=log_callback,
+        )
+        setter = str(csl.get("cookie_setter_url") or "").strip()
+        if not setter:
+            return {
+                "ok": False,
+                "cookie_setter_url": "",
+                "cookies": _export_session_cookie_list(session),
+                "final_url": "",
+            }
+        raise_if_cancelled(cancel_callback)
+        try:
+            resp = session.get(
+                setter,
+                headers={
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "user-agent": get_user_agent(),
+                    "upgrade-insecure-requests": "1",
+                },
+                allow_redirects=True,
+                timeout=45,
+            )
+            final_url = str(getattr(resp, "url", "") or setter)
+            status = int(getattr(resp, "status_code", 0) or 0)
+            if log_callback:
+                log_callback(
+                    f"[*] CookieSetter 完成 HTTP {status} "
+                    f"url={final_url[:120]} cookies={len(_export_session_cookie_list(session))}"
+                )
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] CookieSetter 跟随跳转失败: {exc}")
+            final_url = setter
+        cookies = _export_session_cookie_list(session)
+        return {
+            "ok": True,
+            "cookie_setter_url": setter,
+            "cookies": cookies,
+            "final_url": final_url,
+        }
+    finally:
+        if own:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+
 def obtain_sso_via_create_session(
     email,
     password,
@@ -8367,10 +8702,54 @@ def obtain_sso_via_create_session(
                     f"[*] CreateSession HTTP {resp.status_code} grpc={grpc_status} "
                     f"jwt={'yes' if (token or session_jwt) else 'no'}"
                 )
-            if token:
-                return token
-            if session_jwt and session_jwt.startswith("eyJ") and session_jwt.count(".") >= 2:
-                return session_jwt
+            sso = token or (
+                session_jwt
+                if session_jwt and session_jwt.startswith("eyJ") and session_jwt.count(".") >= 2
+                else ""
+            )
+            if sso:
+                try:
+                    promo = promote_sso_session_cookies(
+                        sso,
+                        session=session,
+                        proxies=proxies,
+                        log_callback=log_callback,
+                        cancel_callback=cancel_callback,
+                    )
+                    if isinstance(promo, dict) and promo.get("ok"):
+                        promo["cookies"] = promo.get("cookies") or _export_session_cookie_list(
+                            session
+                        )
+                        promote_sso_session_cookies._last_promo = promo
+                        try:
+                            if log_callback:
+                                log_callback(
+                                    "[*] CreateSession 同会话立即 Device Flow 换 Refresh Token..."
+                                )
+                            rt = exchange_sso_to_refresh_token_via_device_flow(
+                                sso,
+                                log_callback=log_callback,
+                                cancel_callback=cancel_callback,
+                                browser_cookies=promo.get("cookies"),
+                                session=session,
+                            )
+                            if rt:
+                                promote_sso_session_cookies._last_refresh_token = rt
+                                if log_callback:
+                                    log_callback(
+                                        f"[*] CreateSession 同会话 Device Flow 成功，"
+                                        f"refresh_token 长度={len(rt)}"
+                                    )
+                        except Exception as rt_exc:
+                            if log_callback:
+                                log_callback(
+                                    f"[Debug] CreateSession 同会话 Device Flow 失败"
+                                    f"（将在后续步骤重试）: {rt_exc}"
+                                )
+                except Exception as exc:
+                    if log_callback:
+                        log_callback(f"[Debug] CookieSetter 推广会话失败（仍返回 sso）: {exc}")
+                return sso
             sleep_with_cancel(0.5 * attempt, cancel_callback)
     return ""
 
@@ -8528,6 +8907,24 @@ def create_xai_account_via_http(
             raise RuntimeError(
                 f"create_account HTTP {resp.status_code}: {rsc_body[:300]}"
             )
+        # 优先走 RSC set-cookie JWT 链路（真实浏览器种 cookie 路径）；
+        # 只有链路上没有 sso 时才 CreateSession 密码登录兜底。
+        if not sso:
+            try:
+                sso = extract_sso_via_set_cookie_chain(
+                    rsc_body,
+                    session=session,
+                    proxies=proxies,
+                    log_callback=log_callback,
+                )
+                if sso and log_callback:
+                    log_callback(f"[*] RSC set-cookie 链路拿到 sso len={len(sso)}")
+            except Exception as hop_exc:
+                if log_callback:
+                    log_callback(f"[Debug] RSC set-cookie 链路失败: {hop_exc}")
+        # 账号刚创建时 CreateSession 偶发不可见，给一点传播时间。
+        if (not sso) and allow_create_session_fallback:
+            sleep_with_cancel(2.0, cancel_callback)
         # create_account → CreateSession（优先用预解的 sign-in token，避免再等一轮 Solver）
         if (not sso) and allow_create_session_fallback:
             sitekey = str(config.get("turnstile_sitekey") or "0x4AAAAAAAhr9JGVDZbrZOo0")
