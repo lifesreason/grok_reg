@@ -1476,6 +1476,102 @@ def test_exchange_xai_oauth_code_for_token_posts_pkce_form(monkeypatch):
     assert calls[0][1]["data"]["redirect_uri"] == reg.XAI_GROK_OAUTH_REDIRECT_URI
 
 
+def test_exchange_sso_to_refresh_token_uses_authorization_code_flow(monkeypatch):
+    calls = []
+
+    class CookieJar:
+        def __init__(self):
+            self.values = []
+
+        def set(self, *args, **kwargs):
+            self.values.append((args, kwargs))
+
+    class FakeResponse:
+        def __init__(self, url, status_code=200, text="", payload=None):
+            self.url = url
+            self.status_code = status_code
+            self.text = text
+            self.content = text.encode()
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            assert kwargs["impersonate"] == "chrome131"
+            self.cookies = CookieJar()
+
+        def get(self, url, **kwargs):
+            calls.append(("get", url, kwargs))
+            if url == "https://accounts.x.ai/":
+                return FakeResponse(url)
+            return FakeResponse("https://auth.x.ai/oauth2/consent?state=state")
+
+        def post(self, url, **kwargs):
+            calls.append(("post", url, kwargs))
+            if "/oauth2/consent" in url:
+                return FakeResponse(
+                    url,
+                    text='1:{"code":"authorization-code","success":true}',
+                )
+            return FakeResponse(
+                url,
+                payload={"refresh_token": "refresh-token", "access_token": "access-token"},
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(reg.requests, "Session", FakeSession)
+    monkeypatch.setattr(reg, "get_proxies", lambda: {})
+    monkeypatch.setattr(reg, "sleep_with_cancel", lambda *args, **kwargs: None)
+
+    refresh = reg.exchange_sso_to_refresh_token_via_authorization_code("sso-token")
+
+    assert refresh == "refresh-token"
+    authorize = next(call for call in calls if call[0] == "get" and "/oauth2/authorize?" in call[1])
+    assert "referrer=grok-build" in authorize[1]
+    assert "plan=generic" in authorize[1]
+    assert "conversations%3Aread" in authorize[1]
+    consent = next(call for call in calls if call[0] == "post" and "/oauth2/consent" in call[1])
+    assert consent[2]["headers"]["Next-Action"] == reg.XAI_GROK_OAUTH_NEXT_ACTION_ID
+    token = next(call for call in calls if call[0] == "post" and call[1].endswith("/oauth2/token"))
+    assert "grant_type=authorization_code" in token[2]["data"]
+    assert "code=authorization-code" in token[2]["data"]
+
+
+def test_fetch_refresh_token_does_not_start_device_flow_first(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        reg,
+        "exchange_sso_to_refresh_token_via_authorization_code",
+        lambda sso, **kwargs: calls.append("authorization_code") or "refresh-token",
+    )
+    monkeypatch.setattr(
+        reg,
+        "exchange_sso_to_refresh_token_via_device_flow",
+        lambda *args, **kwargs: calls.append("device_flow") or "bad-refresh-token",
+    )
+
+    assert reg.fetch_xai_oauth_refresh_token("sso-token") == "refresh-token"
+    assert calls == ["authorization_code"]
+
+
+def test_resolve_browser_executable_falls_back_from_stale_configured_path(monkeypatch):
+    monkeypatch.setenv("CHROME_BIN", "/usr/bin/browser")
+
+    def fake_which(name):
+        if name == "/usr/bin/google-chrome-stable":
+            return name
+        return None
+
+    monkeypatch.setattr(reg.shutil, "which", fake_which)
+
+    assert reg.resolve_browser_executable() == "/usr/bin/google-chrome-stable"
+
+
 def test_xai_oauth_consent_click_script_has_deep_fallbacks():
     script = reg.build_xai_oauth_consent_click_script()
 
@@ -2160,6 +2256,10 @@ def test_browser_options_apply_configured_proxy(monkeypatch):
             self.base_timeout = base
             return self
 
+        def set_browser_path(self, path):
+            self.browser_path = path
+            return self
+
         def set_argument(self, key, value=None):
             self.arguments.append((key, value))
             return self
@@ -2170,6 +2270,7 @@ def test_browser_options_apply_configured_proxy(monkeypatch):
 
     monkeypatch.setattr(reg, "ChromiumOptions", FakeOptions)
     monkeypatch.setenv("GROK_REG_IN_DOCKER", "1")
+    monkeypatch.setattr(reg, "resolve_browser_executable", lambda: "/usr/bin/browser")
     monkeypatch.setitem(reg.config, "proxy", "http://127.0.0.1:7890")
 
     options = reg.create_browser_options()
@@ -2606,6 +2707,10 @@ def test_docker_visible_browser_keeps_linux_startup_flags(monkeypatch):
         def set_timeouts(self, base=1):
             return self
 
+        def set_browser_path(self, path):
+            self.browser_path = path
+            return self
+
         def set_argument(self, key, value=None):
             self.arguments.append((key, value))
             return self
@@ -2616,6 +2721,7 @@ def test_docker_visible_browser_keeps_linux_startup_flags(monkeypatch):
     monkeypatch.setattr(reg, "ChromiumOptions", FakeOptions)
     monkeypatch.setenv("GROK_REG_IN_DOCKER", "1")
     monkeypatch.setenv("GROK_REG_HEADLESS", "0")
+    monkeypatch.setattr(reg, "resolve_browser_executable", lambda: "/usr/bin/browser")
 
     options = reg.create_browser_options()
 

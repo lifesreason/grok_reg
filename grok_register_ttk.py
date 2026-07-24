@@ -24,6 +24,7 @@ import subprocess
 import hashlib
 import base64
 import urllib.parse
+import shutil
 
 try:
     import tkinter as tk
@@ -174,11 +175,18 @@ DEFAULT_CONFIG = {
 XAI_GROK_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 XAI_GROK_OAUTH_AUTHORIZE_URL = "https://auth.x.ai/oauth2/authorize"
 XAI_GROK_OAUTH_TOKEN_URL = "https://auth.x.ai/oauth2/token"
-XAI_GROK_OAUTH_SCOPE = "openid profile email offline_access grok-cli:access api:access"
+XAI_GROK_OAUTH_SCOPE = (
+    "openid profile email offline_access grok-cli:access api:access "
+    "conversations:read conversations:write"
+)
 XAI_GROK_OAUTH_REDIRECT_URI = "http://127.0.0.1:56121/callback"
-# 计费 API 通道（API Key）；OAuth/Device Flow 账号应走 cli-chat-proxy
+XAI_GROK_OAUTH_REFERRER = "grok-build"
+XAI_GROK_OAUTH_PLAN = "generic"
+XAI_GROK_OAUTH_NEXT_ACTION_ID = "4005315a1d7e426de592990bb54bb37471f39dd6d2"
+XAI_GROK_OAUTH_VERSION = "0.2.93"
+# 计费 API 通道（API Key）；OAuth 账号应走 cli-chat-proxy
 XAI_GROK_API_BASE_URL = "https://api.x.ai/v1"
-# grok-cli / Device Flow OAuth 实际聊天代理（对齐 grokcli-2api 导出）
+# grok-cli OAuth 实际聊天代理（对齐 grokcli-2api 导出）
 XAI_GROK_CLI_CHAT_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 CPA_DEFAULT_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 CPA_CLIENT_HEADERS = {
@@ -2143,15 +2151,43 @@ def add_token_to_grok2api_pools(raw_token, email="", log_callback=None):
                 log_callback(f"[Debug] 写入 grok2api 远端池失败: {exc}")
 
 
+def resolve_browser_executable():
+    """Resolve CHROME_BIN while tolerating old images without /usr/bin/browser."""
+    configured = os.environ.get("CHROME_BIN", "").strip()
+    candidates = [
+        configured,
+        "/usr/bin/browser",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+    ]
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    return ""
+
+
 def create_browser_options():
     if ChromiumOptions is None:
         raise RuntimeError("DrissionPage 未安装，无法启动浏览器自动化")
     options = ChromiumOptions()
     options.auto_port()
     options.set_timeouts(base=1)
-    browser_path = os.environ.get("CHROME_BIN", "").strip()
+    browser_path = resolve_browser_executable()
     if browser_path:
         options.set_browser_path(browser_path)
+    elif _env_truthy("GROK_REG_IN_DOCKER"):
+        configured = os.environ.get("CHROME_BIN", "").strip() or "(empty)"
+        raise RuntimeError(
+            "Docker 中找不到可执行浏览器；"
+            f"CHROME_BIN={configured}，请重建镜像或安装 google-chrome/chromium"
+        )
     proxy = normalize_proxy_for_runtime(config.get("proxy", ""))
     if proxy:
         options.set_argument("--proxy-server", proxy)
@@ -2763,8 +2799,8 @@ def build_xai_oauth_authorize_url(state, code_challenge, nonce, redirect_uri=Non
         "nonce": nonce,
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
-        "plan": "generic",
-        "referrer": "sub2api",
+        "plan": XAI_GROK_OAUTH_PLAN,
+        "referrer": XAI_GROK_OAUTH_REFERRER,
     }
     return f"{XAI_GROK_OAUTH_AUTHORIZE_URL}?{urllib.parse.urlencode(params)}"
 
@@ -2781,6 +2817,23 @@ def parse_xai_oauth_callback_url(url):
         state = state or (fragment_values.get("state") or [""])[0].strip()
         error = error or (fragment_values.get("error") or [""])[0].strip()
     return {"code": code, "state": state, "error": error, "url": str(url or "")}
+
+
+def parse_xai_oauth_consent_code(body):
+    """Extract an authorization code from a Next.js text/x-component response."""
+    for line in str(body or "").splitlines():
+        start = line.find("{")
+        if start < 0:
+            continue
+        try:
+            payload = json.loads(line[start:])
+        except Exception:
+            continue
+        if isinstance(payload, dict) and payload.get("code"):
+            if payload.get("success") is False:
+                return ""
+            return str(payload["code"]).strip()
+    return ""
 
 
 def build_xai_oauth_consent_click_script():
@@ -3476,6 +3529,8 @@ def exchange_xai_oauth_code_for_token(code, code_verifier, redirect_uri=None):
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
             "User-Agent": "sub2api-grok-oauth/1.0",
+            "X-Grok-Client-Version": XAI_GROK_OAUTH_VERSION,
+            "Accept": "*/*",
         },
         timeout=60,
     )
@@ -3784,6 +3839,153 @@ def import_accounts_to_cpa(accounts, settings=None, log_callback=None):
     }
 
 
+# 纯 HTTP Authorization Code + PKCE 是获取 xAI Refresh Token 的首选路径。
+# Device Flow 曾经可用，但当前 token 交换经常返回 invalid_grant，且生成的 token
+# 不带 grok-build referrer claim，不能稳定用于 cli-chat-proxy。
+def exchange_sso_to_refresh_token_via_authorization_code(
+    sso,
+    log_callback=None,
+    cancel_callback=None,
+):
+    """Exchange an authenticated xAI SSO cookie for a refresh token without a browser."""
+    if requests is None:
+        raise RuntimeError("curl_cffi 未安装，无法 OAuth 授权码流程")
+    token = _normalize_sso_token(sso)
+    if not token:
+        raise ValueError("账号缺少 sso cookie，无法 OAuth 授权码流程")
+
+    proxies = get_proxies()
+    proxy_kw = {"proxies": proxies} if proxies else {}
+    timeout = 20
+    client_id = XAI_GROK_OAUTH_CLIENT_ID
+    redirect_uri = XAI_GROK_OAUTH_REDIRECT_URI
+
+    def log(message):
+        if log_callback:
+            log_callback(message)
+
+    verifier = _base64_urlsafe_no_padding(secrets.token_bytes(32))
+    challenge = _base64_urlsafe_no_padding(hashlib.sha256(verifier.encode("ascii")).digest())
+    state = secrets.token_hex(32)
+    nonce = secrets.token_hex(16)
+    authorize_url = build_xai_oauth_authorize_url(
+        state, challenge, nonce, redirect_uri=redirect_uri
+    )
+
+    session = requests.Session(impersonate="chrome131")
+    try:
+        for domain in (".x.ai", "accounts.x.ai", "auth.x.ai"):
+            session.cookies.set("sso", token, domain=domain)
+            session.cookies.set("sso-rw", token, domain=domain)
+
+        raise_if_cancelled(cancel_callback)
+        account_response = session.get(
+            "https://accounts.x.ai/",
+            impersonate="chrome131",
+            timeout=timeout,
+            allow_redirects=True,
+            **proxy_kw,
+        )
+        account_url = str(getattr(account_response, "url", "") or "")
+        if "sign-in" in account_url or "sign-up" in account_url:
+            raise RuntimeError(f"sso 无效（校验落到登录页）: {account_url[:160]}")
+
+        log(
+            f"[*] Authorization Code Flow: sso 有效，"
+            f"referrer={XAI_GROK_OAUTH_REFERRER}"
+        )
+        authorize_response = session.get(
+            authorize_url,
+            impersonate="chrome131",
+            timeout=timeout,
+            allow_redirects=True,
+            **proxy_kw,
+        )
+        consent_url = str(getattr(authorize_response, "url", "") or "")
+        if "/oauth2/consent" not in consent_url:
+            raise RuntimeError(f"authorize 未进入 consent: {consent_url[:240]}")
+
+        consent_payload = json.dumps(
+            [{
+                "action": "allow",
+                "clientId": client_id,
+                "redirectUri": redirect_uri,
+                "scope": XAI_GROK_OAUTH_SCOPE,
+                "state": state,
+                "codeChallenge": challenge,
+                "codeChallengeMethod": "S256",
+                "nonce": nonce,
+                "principalType": "User",
+                "principalId": "",
+                "referrer": XAI_GROK_OAUTH_REFERRER,
+            }],
+            separators=(",", ":"),
+        )
+        consent_response = session.post(
+            consent_url,
+            data=consent_payload,
+            headers={
+                "Content-Type": "text/plain;charset=UTF-8",
+                "Accept": "text/x-component",
+                "Origin": "https://accounts.x.ai",
+                "Referer": consent_url,
+                "Next-Action": XAI_GROK_OAUTH_NEXT_ACTION_ID,
+            },
+            impersonate="chrome131",
+            timeout=timeout,
+            allow_redirects=True,
+            **proxy_kw,
+        )
+        status = int(getattr(consent_response, "status_code", 0) or 0)
+        if status < 200 or status >= 300:
+            raise RuntimeError(
+                f"OAuth consent HTTP {status}: "
+                f"{str(getattr(consent_response, 'text', '') or '')[:240]}"
+            )
+        code = parse_xai_oauth_consent_code(getattr(consent_response, "text", ""))
+        if not code:
+            raise RuntimeError(
+                "OAuth consent 未返回 authorization code: "
+                f"{str(getattr(consent_response, 'text', '') or '')[:240]}"
+            )
+
+        token_response = session.post(
+            XAI_GROK_OAUTH_TOKEN_URL,
+            data=urllib.parse.urlencode({
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "client_id": client_id,
+                "code_verifier": verifier,
+            }),
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": f"grok-shell/{XAI_GROK_OAUTH_VERSION} (linux; x86_64)",
+                "X-Grok-Client-Version": XAI_GROK_OAUTH_VERSION,
+                "Accept": "*/*",
+            },
+            impersonate="chrome131",
+            timeout=timeout,
+            **proxy_kw,
+        )
+        status = int(getattr(token_response, "status_code", 0) or 0)
+        if status < 200 or status >= 300:
+            detail = str(getattr(token_response, "text", "") or "")[:300]
+            raise RuntimeError(f"OAuth token HTTP {status}: {detail}")
+        data = token_response.json() if hasattr(token_response, "json") else {}
+        refresh_token = str((data or {}).get("refresh_token") or "").strip()
+        if not refresh_token:
+            raise RuntimeError(f"OAuth token 缺少 refresh_token: {str(data)[:240]}")
+        log(f"[*] Authorization Code Flow 成功，refresh_token 长度={len(refresh_token)}")
+        return refresh_token
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+
+# Device Flow 保留为兼容接口，但不再作为默认路径。
 # 并发注册时 Device Flow 全局串行，避免 xAI rate_limited（对齐 2api）
 _DEVICE_FLOW_LOCK = threading.RLock()
 _DEVICE_FLOW_LAST_TS = 0.0
@@ -4012,23 +4214,24 @@ def exchange_sso_to_refresh_token_via_device_flow(
 
 
 def fetch_xai_oauth_refresh_token(sso, timeout=90, log_callback=None, cancel_callback=None):
-    """优先 Device Flow（与 2api 一致）；失败再回退浏览器 OAuth consent。"""
+    """优先纯 HTTP Authorization Code + PKCE；失败再回退浏览器 OAuth consent。"""
     token = _normalize_sso_token(sso)
     if not token:
         raise ValueError("账号缺少 sso cookie，无法获取 Refresh Token")
 
-    # API 建号路径：纯 HTTP，不依赖浏览器 cookie 注入
+    # API 建号路径：纯 HTTP，不依赖浏览器 cookie 注入。
+    # Authorization Code Flow 能携带 grok-build referrer，优先于旧 Device Flow。
     try:
         if log_callback:
-            log_callback("[*] 获取 Refresh Token：优先 Device Flow（对齐 grokcli-2api）...")
-        return exchange_sso_to_refresh_token_via_device_flow(
+            log_callback("[*] 获取 Refresh Token：优先 Authorization Code + PKCE...")
+        return exchange_sso_to_refresh_token_via_authorization_code(
             token,
             log_callback=log_callback,
             cancel_callback=cancel_callback,
         )
-    except Exception as device_exc:
+    except Exception as oauth_exc:
         if log_callback:
-            log_callback(f"[!] Device Flow 失败，回退浏览器 OAuth: {device_exc}")
+            log_callback(f"[!] HTTP OAuth 失败，回退浏览器 OAuth: {oauth_exc}")
 
     browser = _get_browser()
     page = _get_page()
@@ -8927,11 +9130,13 @@ def start_browser(log_callback=None):
         except Exception as exc:
             last_exc = exc
             if log_callback:
+                resolved_browser = resolve_browser_executable()
                 log_callback(f"[Debug] 浏览器启动失败(第{attempt}/4次): {exc}")
                 log_callback(
                     "[Debug] 浏览器启动环境: "
                     f"DISPLAY={os.environ.get('DISPLAY', '') or '(empty)'}，"
                     f"CHROME_BIN={os.environ.get('CHROME_BIN', '') or '(empty)'}，"
+                    f"解析路径={resolved_browser or '(missing)'}，"
                     f"模式={'headless' if should_run_headless() else 'visible'}，"
                     f"代理={normalize_proxy_for_runtime(config.get('proxy', '')) or '直连'}"
                 )

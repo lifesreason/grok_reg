@@ -53,6 +53,9 @@ RUN apt-get update \
 
 ENV CHROME_BIN=/usr/bin/browser
 
+# Fail the image build early instead of retrying browser startup at runtime.
+RUN test -x /usr/bin/browser
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir --no-compile -r requirements.txt
 
